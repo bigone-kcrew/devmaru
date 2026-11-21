@@ -1,0 +1,10 @@
+{
+ "max_apps": 5,
+ "default_days": 30,
+ "max_days": 365,
+ "notify_url": "",
+ "notify_token_file": "",
+ "retain_days": 90,
+ "dump_days": 7,
+ "warn_days": 14
+}

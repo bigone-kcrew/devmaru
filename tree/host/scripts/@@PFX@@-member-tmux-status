@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/opt/@@PFX@@/config/dev-container.env"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-member-tmux-status"
+  exit 1
+fi
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: @@PFX@@-member-tmux-status"
+  exit 1
+fi
+
+source "$CONFIG_FILE"
+
+printf '%-18s %-18s %-10s %-6s %s\n' \
+  "USER" "CONTAINER" "STATE" "TMUX" "SESSIONS"
+
+printf '%-18s %-18s %-10s %-6s %s\n' \
+  "------------------" "------------------" "----------" "------" "--------"
+
+TOTAL=0
+BUSY=0
+
+shopt -s nullglob
+
+for user_path in "$USER_ROOT_BASE"/*; do
+  [[ -d "$user_path" ]] || continue
+
+  username="$(basename "$user_path")"
+
+  excluded=0
+  for excluded_user in ${UPDATE_EXCLUDE_USERS:-}; do
+    if [[ "$username" == "$excluded_user" ]]; then
+      excluded=1
+      break
+    fi
+  done
+
+  (( excluded == 1 )) && continue
+
+  id "$username" >/dev/null 2>&1 || continue
+
+  container="dev-${username}"
+  TOTAL=$((TOTAL + 1))
+
+  if ! docker container inspect "$container" >/dev/null 2>&1; then
+    printf '%-18s %-18s %-10s %-6s %s\n' \
+      "$username" "$container" "MISSING" "-" "-"
+    continue
+  fi
+
+  state="$(docker inspect "$container" --format '{{.State.Status}}')"
+
+  if [[ "$state" != "running" ]]; then
+    printf '%-18s %-18s %-10s %-6s %s\n' \
+      "$username" "$container" "$state" "0" "-"
+    continue
+  fi
+
+  uid="$(id -u "$username")"
+  gid="$(id -g "$username")"
+
+  sessions="$(
+    docker exec "$container" \
+      setpriv \
+      --reuid="$uid" \
+      --regid="$gid" \
+      --init-groups \
+      -- env \
+      HOME="/home/$username" \
+      USER="$username" \
+      LOGNAME="$username" \
+      tmux list-sessions -F '#S' 2>/dev/null || true
+  )"
+
+  if [[ -n "$sessions" ]]; then
+    count="$(printf '%s\n' "$sessions" | sed '/^$/d' | wc -l)"
+    names="$(printf '%s\n' "$sessions" | paste -sd ',' -)"
+    BUSY=$((BUSY + 1))
+  else
+    count=0
+    names="-"
+  fi
+
+  printf '%-18s %-18s %-10s %-6s %s\n' \
+    "$username" "$container" "$state" "$count" "$names"
+done
+
+echo
+echo "Members: $TOTAL"
+echo "Busy:    $BUSY"
+
+if (( BUSY > 0 )); then
+  echo "RESULT: ACTIVE TMUX EXISTS"
+else
+  echo "RESULT: NO ACTIVE TMUX"
+fi

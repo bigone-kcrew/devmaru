@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+
+import asyncio
+import json
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiohttp
+
+ROOT = Path("/opt/@@PFX@@/api-catalog")
+
+CATALOG = ROOT / "data/catalog.json"
+LATEST = ROOT / "data/health-latest.json"
+STATE = ROOT / "data/health-state.json"
+HISTORY = ROOT / "data/health-history.ndjson"
+
+MAX_CONCURRENT = 25
+PER_HOST = 6
+TIMEOUT_SECONDS = 15
+RETRIES = 1
+
+HISTORY_WINDOW = 5
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/152.0.0.0 Safari/537.36"
+)
+
+
+def atomic_write_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        delete=False,
+    ) as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        tmp = Path(f.name)
+
+    tmp.chmod(0o644)
+    tmp.replace(path)
+
+
+def append_history(obj):
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+
+    with HISTORY.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                obj,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        f.write("\n")
+
+    HISTORY.chmod(0o644)
+
+
+def load_catalog():
+    obj = json.loads(CATALOG.read_text(encoding="utf-8"))
+    return obj["entries"], obj["source"]
+
+
+def classify_http(status):
+    if 200 <= status < 400:
+        return "OBSERVED_OK"
+
+    if status == 401:
+        return "OBSERVED_AUTH_REQUIRED"
+
+    if status == 403:
+        return "OBSERVED_FORBIDDEN"
+
+    if status == 404:
+        return "OBSERVED_NOT_FOUND"
+
+    if status == 429:
+        return "OBSERVED_RATE_LIMITED"
+
+    if status >= 500:
+        return "OBSERVED_SERVER_ERROR"
+
+    return "OBSERVED_HTTP_ERROR"
+
+
+async def check_one(session, sem, entry):
+    url = entry["url"]
+
+    result = {
+        "id": entry["id"],
+        "name": entry["name"],
+        "url": url,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "observation": "UNKNOWN",
+        "http_status": 0,
+        "transport_reachable": False,
+        "final_url": None,
+        "redirected": False,
+        "error_type": None,
+        "error_message": None,
+        "response_time_ms": None,
+    }
+
+    async with sem:
+        last_error = None
+
+        for attempt in range(RETRIES + 1):
+            start = asyncio.get_running_loop().time()
+
+            try:
+                async with session.get(
+                    url,
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(
+                        total=TIMEOUT_SECONDS
+                    ),
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": (
+                            "text/html,application/xhtml+xml,"
+                            "application/json;q=0.9,*/*;q=0.8"
+                        ),
+                        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+                    },
+                ) as response:
+                    elapsed = (
+                        asyncio.get_running_loop().time() - start
+                    ) * 1000
+
+                    final_url = str(response.url)
+
+                    result.update({
+                        "observation": classify_http(response.status),
+                        "http_status": response.status,
+                        "transport_reachable": True,
+                        "final_url": final_url,
+                        "redirected": final_url != url,
+                        "response_time_ms": round(elapsed, 1),
+                    })
+
+                    return result
+
+            except asyncio.TimeoutError:
+                last_error = (
+                    "TIMEOUT",
+                    f"{TIMEOUT_SECONDS}s timeout",
+                    "OBSERVED_TIMEOUT",
+                )
+
+            except aiohttp.ClientConnectorCertificateError as e:
+                last_error = (
+                    "TLS_ERROR",
+                    str(e)[:200],
+                    "OBSERVED_TLS_ERROR",
+                )
+
+            except aiohttp.ClientConnectorError as e:
+                last_error = (
+                    "CONNECTION_ERROR",
+                    str(e)[:200],
+                    "OBSERVED_CONNECTION_ERROR",
+                )
+
+            except aiohttp.InvalidURL as e:
+                last_error = (
+                    "INVALID_URL",
+                    str(e)[:200],
+                    "OBSERVED_INVALID_URL",
+                )
+
+            except aiohttp.ClientSSLError as e:
+                last_error = (
+                    "TLS_ERROR",
+                    str(e)[:200],
+                    "OBSERVED_TLS_ERROR",
+                )
+
+            except aiohttp.ClientError as e:
+                last_error = (
+                    "CLIENT_ERROR",
+                    str(e)[:200],
+                    "OBSERVED_CLIENT_ERROR",
+                )
+
+            except Exception as e:
+                last_error = (
+                    "UNKNOWN_ERROR",
+                    str(e)[:200],
+                    "OBSERVED_UNKNOWN_ERROR",
+                )
+
+            if attempt < RETRIES:
+                await asyncio.sleep(1.0)
+
+        result["error_type"] = last_error[0]
+        result["error_message"] = last_error[1]
+        result["observation"] = last_error[2]
+
+    return result
+
+
+def load_recent_history():
+    if not HISTORY.exists():
+        return []
+
+    lines = HISTORY.read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    rows = []
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    return rows
+
+
+def derive_state(entries, current_run):
+    history = load_recent_history()
+
+    runs = history[-(HISTORY_WINDOW - 1):] + [current_run]
+
+    observations_by_id = {}
+
+    for run in runs:
+        for item in run.get("results", []):
+            observations_by_id.setdefault(
+                item["id"], []
+            ).append(item["observation"])
+
+    states = []
+
+    for entry in entries:
+        obs = observations_by_id.get(entry["id"], [])
+        recent = obs[-HISTORY_WINDOW:]
+
+        ok_count = sum(
+            x in {
+                "OBSERVED_OK",
+                "OBSERVED_AUTH_REQUIRED",
+                "OBSERVED_FORBIDDEN",
+                "OBSERVED_RATE_LIMITED",
+            }
+            for x in recent
+        )
+
+        failure_count = len(recent) - ok_count
+
+        if not recent:
+            state = "UNKNOWN"
+
+        elif recent[-1] in {
+            "OBSERVED_OK",
+            "OBSERVED_AUTH_REQUIRED",
+            "OBSERVED_FORBIDDEN",
+            "OBSERVED_RATE_LIMITED",
+        }:
+            state = "OBSERVED_AVAILABLE"
+
+        elif len(recent) == 1:
+            state = "UNKNOWN"
+
+        elif failure_count >= 3 and ok_count == 0:
+            state = "REPEATED_FAILURE"
+
+        elif failure_count >= 2:
+            state = "UNSTABLE"
+
+        else:
+            state = "UNKNOWN"
+
+        states.append({
+            "id": entry["id"],
+            "name": entry["name"],
+            "state": state,
+            "recent_observations": recent,
+            "sample_count": len(recent),
+        })
+
+    return states
+
+
+async def main_async():
+    entries, source = load_catalog()
+
+    connector = aiohttp.TCPConnector(
+        limit=MAX_CONCURRENT,
+        limit_per_host=PER_HOST,
+        ttl_dns_cache=300,
+    )
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+    async with aiohttp.ClientSession(
+        connector=connector
+    ) as session:
+        tasks = [
+            check_one(session, sem, entry)
+            for entry in entries
+        ]
+
+        results = []
+
+        for i, coro in enumerate(
+            asyncio.as_completed(tasks),
+            start=1,
+        ):
+            result = await coro
+            results.append(result)
+
+            if i % 25 == 0 or i == len(tasks):
+                print(f"PROGRESS={i}/{len(tasks)}")
+
+    results.sort(key=lambda x: x["id"])
+
+    by_observation = {}
+
+    for x in results:
+        key = x["observation"]
+        by_observation[key] = (
+            by_observation.get(key, 0) + 1
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    run_record = {
+        "schema_version": 2,
+        "generated_at": now,
+        "catalog_commit": source["commit"],
+        "catalog_entry_count": len(entries),
+        "checked_count": len(results),
+        "summary": {
+            "by_observation": dict(
+                sorted(by_observation.items())
+            ),
+        },
+        "results": results,
+    }
+
+    atomic_write_json(LATEST, run_record)
+
+    states = derive_state(entries, run_record)
+
+    state_counts = {}
+
+    for x in states:
+        state_counts[x["state"]] = (
+            state_counts.get(x["state"], 0) + 1
+        )
+
+    state_obj = {
+        "schema_version": 1,
+        "generated_at": now,
+        "catalog_commit": source["commit"],
+        "history_window": HISTORY_WINDOW,
+        "summary": dict(sorted(state_counts.items())),
+        "results": states,
+    }
+
+    atomic_write_json(STATE, state_obj)
+
+    append_history(run_record)
+
+    print("===== API CATALOG HEALTH =====")
+    print(f"CATALOG_COMMIT={source['commit']}")
+    print(f"CHECKED={len(results)}")
+    print("OBSERVATIONS=")
+    for k, v in sorted(by_observation.items()):
+        print(f"  {k}={v}")
+
+    print("STATES=")
+    for k, v in sorted(state_counts.items()):
+        print(f"  {k}={v}")
+
+    print("RESULT=PASS")
+
+
+def main():
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

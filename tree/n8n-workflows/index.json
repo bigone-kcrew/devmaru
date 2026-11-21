@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "workflows": [
+    {
+      "name": "member-onboarding",
+      "file": "member-onboarding.json",
+      "id": "dmOnboardNotify01",
+      "title": "회원 온보딩 알림(메일)",
+      "description": "회원을 등록하면 안내 메일(초기 비밀번호·Paseo 링크·QR, 선택: n8n 초대 링크)을 보냅니다. MAIL_MODE=n8n 일 때 사용합니다.",
+      "needs": [
+        "SMTP 자격증명",
+        "n8n API 키(선택)"
+      ],
+      "token": "/etc/@@PFX@@/secrets/onboarding-notify-token",
+      "webhook": "@@PFX@@-member-onboarding"
+    },
+    {
+      "name": "ops-notify",
+      "file": "ops-notify.json",
+      "id": "dmOpsNotify00001",
+      "title": "운영 알림 → 텔레그램",
+      "description": "앱 만료·공개 종료 같은 운영 알림을 텔레그램 채팅으로 전달합니다. app-sync 의 notify_url 과 연결됩니다.",
+      "needs": [
+        "Telegram API 자격증명",
+        "채팅 ID"
+      ],
+      "token": "/etc/@@PFX@@/apps/notify.token",
+      "webhook": "@@PFX@@-ops-notify",
+      "app_config": {
+        "notify_url": "http://127.0.0.1:5678/webhook/@@PFX@@-ops-notify",
+        "notify_token_file": "/etc/@@PFX@@/apps/notify.token"
+      }
+    }
+  ]
+}

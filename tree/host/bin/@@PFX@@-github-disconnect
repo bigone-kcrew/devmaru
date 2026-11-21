@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -eq 0 ]]; then
+  echo "ERROR: run as the member user, not root." >&2
+  exit 1
+fi
+
+YES=0
+
+case "${1:-}" in
+  "")
+    ;;
+  --yes)
+    YES=1
+    ;;
+  *)
+    echo "Usage: @@PFX@@-github-disconnect [--yes]" >&2
+    exit 1
+    ;;
+esac
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "ERROR: GitHub CLI (gh) is not installed." >&2
+  exit 1
+fi
+
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "GitHub is not currently connected."
+  exit 0
+fi
+
+LOGIN="$(gh api user --jq '.login' 2>/dev/null || echo unknown)"
+
+echo "===== @@BRAND@@ GitHub Disconnect ====="
+echo "Account: $LOGIN"
+echo
+echo "This removes the GitHub login from this @@BRAND@@ member environment."
+echo "It does NOT delete repositories or files."
+
+if [[ $YES -ne 1 ]]; then
+  read -r -p "Disconnect GitHub account '$LOGIN'? [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      echo "Cancelled."
+      exit 0
+      ;;
+  esac
+fi
+
+gh auth logout --hostname github.com
+
+echo
+echo "GitHub disconnected."

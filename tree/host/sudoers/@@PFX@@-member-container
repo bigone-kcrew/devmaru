@@ -1,0 +1,3 @@
+# @@BRAND@@ 회원은 SSH 로그인 뒤 자기 개발환경(dev-<ID>)으로 들어가는 이 한 명령만 root 로 실행할 수 있다.
+# (-c <명령> 은 개발환경 안에서 회원 권한으로 실행할 명령 — member-shell 이 SUDO_USER 로 대상 컨테이너를 정한다)
+%@@PFX@@ ALL=(root) NOPASSWD: /opt/@@PFX@@/scripts/@@PFX@@-member-shell, /opt/@@PFX@@/scripts/@@PFX@@-member-shell -c *

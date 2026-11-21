@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# @@PFX@@-update — 새 릴리스를 받아 같은 설정으로 다시 적용한다(모든 단계는 다시 실행해도 안전하다).
+#   sudo @@PFX@@-update --check              새 릴리스가 있는지와 변경 내역만 보여 준다(아무것도 바꾸지 않는다)
+#   sudo @@PFX@@-update                      최신 릴리스를 받아 변경 내역을 보여 주고, 확인 뒤 적용한다
+#   sudo @@PFX@@-update --yes                확인 질문 없이 적용(자동화)
+#   sudo @@PFX@@-update [릴리스 tarball 주소]  지정한 릴리스를 받는다(주소를 생략하면 최신 릴리스)
+# 하는 일: 새 킷 받기·sha256 검증 → 변경 내역 표시 → 렌더링·배포 → 서비스 재적용 → (Golden 버전이 바뀌었으면) 이미지 새로 빌드.
+# 실행 중인 회원 컨테이너는 바뀌지 않는다. 새 Golden 을 쓰려면 이어서 @@PFX@@-member-update-all 을 실행한다.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "실패: root 로 실행하세요(sudo)" >&2; exit 1; }
+SITE=/etc/@@PFX@@/site.env; [ -r "$SITE" ] || { echo "실패: $SITE 없음 — 설치되지 않았습니다" >&2; exit 1; }
+CHECK=0; YES=0; FORCE=0; URL=""
+for a in "$@"; do
+  case "$a" in
+    --check) CHECK=1;; --yes|-y) YES=1;; --force) FORCE=1;;
+    -h|--help) sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -*) echo "실패: 알 수 없는 옵션: $a" >&2; exit 2;;
+    *) URL="$a";;
+  esac
+done
+OLD=$(cat /opt/devmaru-kit/VERSION 2>/dev/null || echo 0.0.0)
+SRC=$(cat /opt/devmaru-kit/SOURCE_URL 2>/dev/null || true)
+API="${DEVMARU_API:-https://gitlab.aigov.go.kr/api/v4/projects/bigone-kised%2Fdevmaru}"
+if [ -z "$URL" ]; then
+  LATEST=$(curl -fsS -m 20 "$API/releases?per_page=1" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["tag_name"].lstrip("v"))' 2>/dev/null || true)
+  if [ -n "$LATEST" ]; then URL="$API/packages/generic/devmaru-kit/$LATEST/devmaru-kit-$LATEST.tar.gz"
+  elif [ -n "$SRC" ]; then URL="$SRC"; echo "경고: 최신 버전을 조회하지 못해 설치 때 쓴 주소를 사용합니다 — $SRC"
+  else echo "실패: 릴리스 주소를 알 수 없습니다 — sudo @@PFX@@-update <주소>" >&2; exit 1; fi
+fi
+echo "안내: 현재 버전 $OLD · 받을 릴리스 $URL"
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+curl -fsSL "$URL" -o "$T/kit.tar.gz"; curl -fsSL "$URL.sha256" -o "$T/kit.sha256"
+( cd "$T" && sed "s#  .*#  kit.tar.gz#" kit.sha256 | sha256sum -c - >/dev/null ) || { echo "실패: sha256 불일치" >&2; exit 1; }
+NEW=$(tar -xzOf "$T/kit.tar.gz" --wildcards --no-wildcards-match-slash '*/VERSION' 2>/dev/null | head -1 | tr -d '[:space:]')
+[ -n "$NEW" ] || { echo "실패: 받은 릴리스의 버전을 읽지 못했습니다" >&2; exit 1; }
+if [ "$NEW" = "$OLD" ] && [ "$FORCE" = 0 ]; then echo "안내: 이미 최신 버전($OLD)입니다. 다시 적용하려면 --force"; exit 0; fi
+echo "안내: $OLD → $NEW"
+echo
+echo "================ 변경 내역 ($OLD 이후) ================"
+tar -xzOf "$T/kit.tar.gz" --wildcards '*/CHANGELOG.md' 2>/dev/null | python3 -c '
+import re, sys
+old, new = sys.argv[1], sys.argv[2]
+key = lambda v: tuple(int(x) for x in v.split(".")[:3])
+text = sys.stdin.read()
+parts = re.split(r"(?m)^(?=## )", text)
+shown = 0
+for p in parts:
+    m = re.match(r"## \[?(\d+\.\d+\.\d+)", p)
+    if m and key(old) < key(m.group(1)) <= key(new):
+        print(p.rstrip() + "\n"); shown += 1
+if not shown:
+    print("(이 릴리스에 변경 내역이 없습니다)")
+' "$OLD" "$NEW"
+echo "========================================================"
+[ "$CHECK" = 1 ] && { echo "안내: --check 이므로 여기까지만 보여 줍니다. 적용하려면 sudo @@PFX@@-update"; exit 0; }
+if [ "$YES" = 0 ] && [ -t 0 ]; then
+  read -r -p "이 변경을 적용할까요? (y/n) [y]: " A; case "${A:-y}" in y|Y|yes) ;; *) echo "취소했습니다"; exit 1;; esac
+fi
+DEVMARU_URL="$URL" DEVMARU_LOCAL="$T/kit.tar.gz" bash <(tar -xzOf "$T/kit.tar.gz" --wildcards '*/install.sh') --config "$SITE" --yes --skip-dns
+echo "안내: 완료 ($OLD → $NEW). 회원 컨테이너에 새 Golden 을 적용하려면: sudo @@PFX@@-member-update-all"

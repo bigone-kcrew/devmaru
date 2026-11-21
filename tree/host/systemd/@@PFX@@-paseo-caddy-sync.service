@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync Paseo direct-connect Caddy blocks with member container IPs
+After=docker.service caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/@@PFX@@-paseo-caddy-sync
+Nice=19

@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/opt/@@PFX@@/config/dev-container.env"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-dev-container-create <username>"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-dev-container-create <username>"
+  exit 1
+fi
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "ERROR: config file not found or unreadable: $CONFIG_FILE"
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+required_vars=(
+  GOLDEN_IMAGE
+  DEV_NETWORK
+  AI_GROUP
+  USER_ROOT_BASE
+  SHARED_PATH
+  TERM_DEFAULT
+  SECCOMP_PROFILE
+  APPARMOR_PROFILE
+  CATALOG_ENV_FILE
+)
+
+for var in "${required_vars[@]}"; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "ERROR: required config variable is missing: $var"
+    exit 1
+  fi
+done
+
+if [[ ! -r "$CATALOG_ENV_FILE" ]]; then
+  echo "ERROR: catalog credential file not found or unreadable: $CATALOG_ENV_FILE"
+  exit 1
+fi
+
+USERNAME="$1"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+CONTAINER_NAME="dev-${USERNAME}"
+USER_ROOT="${USER_ROOT_BASE}/${USERNAME}"
+WORKSPACE="${USER_ROOT}/workspace"
+AGENT_CONFIG="${USER_ROOT}/agent-config"
+# /tmp 를 컨테이너 레이어(SSD) 대신 회원 루트(HDD) 아래 둔다.
+# 2026-09-22: 한 멤버 컨테이너의 /tmp 가 14GB 로 SSD 를 먹고 있었다.
+USER_TMP="${USER_ROOT}/tmp"
+USER_HOME="/home/${USERNAME}"
+
+if ! id "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: Linux user does not exist: $USERNAME"
+  exit 1
+fi
+
+if ! getent group "$AI_GROUP" >/dev/null 2>&1; then
+  echo "ERROR: group does not exist: $AI_GROUP"
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: Docker daemon is not available"
+  exit 1
+fi
+
+API_CATALOG_ROOT="/opt/@@PFX@@/api-catalog"
+
+if [[ ! -r "$API_CATALOG_ROOT/data/catalog.json" ]]; then
+  echo "ERROR: API catalog missing: $API_CATALOG_ROOT/data/catalog.json"
+  exit 1
+fi
+
+if [[ ! -x "$API_CATALOG_ROOT/bin/api-catalog-search" ]]; then
+  echo "ERROR: API catalog search helper missing: $API_CATALOG_ROOT/bin/api-catalog-search"
+  exit 1
+fi
+
+if ! docker image inspect "$GOLDEN_IMAGE" >/dev/null 2>&1; then
+  echo "ERROR: Golden Image not found: $GOLDEN_IMAGE"
+  exit 1
+fi
+
+if ! docker network inspect "$DEV_NETWORK" >/dev/null 2>&1; then
+  echo "ERROR: Docker network not found: $DEV_NETWORK"
+  exit 1
+fi
+
+if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  echo "ERROR: container already exists: $CONTAINER_NAME"
+  exit 1
+fi
+
+if [[ ! -d "$USER_HOME" ]]; then
+  echo "ERROR: user home does not exist: $USER_HOME"
+  exit 1
+fi
+
+# root 가 멤버가 쓸 수 있는 트리 안 경로를 docker bind 소스로 쓴다. 멤버가 workspace·tmp·홈을
+# 심볼릭 링크(예: /)로 바꿔 두면 호스트 경로가 마운트된다 — 심링크가 아니고, 상위 구성요소까지
+# 풀었을 때 자기 자신인 디렉터리만 받는다 (agent-config 는 아래에서 이미 같은 이유로 -L 을 막는다).
+safe_dir() { [[ -d "$1" && ! -L "$1" && "$(realpath -e -- "$1")" == "$1" ]]; }
+
+if [[ ! -d "$USER_ROOT" ]]; then
+  echo "ERROR: user data directory does not exist: $USER_ROOT"
+  exit 1
+fi
+
+if [[ ! -d "$WORKSPACE" ]]; then
+  echo "ERROR: workspace does not exist: $WORKSPACE"
+  exit 1
+fi
+
+for _d in "$USER_ROOT" "$USER_HOME" "$WORKSPACE"; do
+  safe_dir "$_d" || { echo "ERROR: bind 소스가 심볼릭 링크이거나 실제 경로가 다르다: $_d"; exit 1; }
+done
+
+if [[ ! -d "$AGENT_CONFIG" || -L "$AGENT_CONFIG" ]]; then
+  echo "ERROR: agent-config does not exist or is invalid: $AGENT_CONFIG"
+  exit 1
+fi
+
+if [[ ! -d "$USER_HOME/.@@PFX@@/agent-config" ]]; then
+  echo "ERROR: agent-config mount point does not exist: $USER_HOME/.@@PFX@@/agent-config"
+  exit 1
+fi
+
+if [[ ! -d "$SHARED_PATH" ]]; then
+  echo "ERROR: shared directory does not exist: $SHARED_PATH"
+  exit 1
+fi
+
+MEMBER_TOOLS_DIR="/opt/@@PFX@@/member-tools/bin"
+
+MEMBER_TOOLS=(
+  @@PFX@@-github-connect
+  @@PFX@@-github-status
+  @@PFX@@-github-disconnect
+)
+
+for tool in "${MEMBER_TOOLS[@]}"; do
+  if [[ ! -x "$MEMBER_TOOLS_DIR/$tool" ]]; then
+    echo "ERROR: member tool missing or not executable: $MEMBER_TOOLS_DIR/$tool"
+    exit 1
+  fi
+done
+
+USER_UID="$(id -u "$USERNAME")"
+USER_GID="$(id -g "$USERNAME")"
+@@PFX_UP@@_GID="$(getent group "$AI_GROUP" | cut -d: -f3)"
+
+echo "Creating dev container..."
+echo "  user:      $USERNAME"
+echo "  uid:gid:   ${USER_UID}:${USER_GID}"
+echo "  image:     $GOLDEN_IMAGE"
+echo "  container: $CONTAINER_NAME"
+echo "  home:         $USER_HOME"
+echo "  workspace:    $WORKSPACE"
+echo "  agent-config: $AGENT_CONFIG"
+
+# memory bearer 는 있는 회원에게만 마운트한다. 없으면 빈 문자열이라 인자가 사라진다.
+MEMORY_BEARER="/opt/@@PFX@@/config/memory/bearer.${USERNAME}"
+if [[ -r "$MEMORY_BEARER" ]]; then
+  MEMORY_BEARER_MOUNT="-v ${MEMORY_BEARER}:/opt/@@PFX@@/memory-bearer:ro"
+else
+  MEMORY_BEARER_MOUNT=""
+fi
+
+# /tmp 는 매 생성마다 비운다. 컨테이너 레이어에 있을 때 재생성이 자동으로
+# 비워 주던 성질을 그대로 유지한다 -- 바인드로 옮기면서 그것까지 잃지 않는다.
+if [[ "${DEV_TMP_ON_HDD:-1}" == "1" ]]; then
+  rm -rf "${USER_TMP}"
+  mkdir "${USER_TMP}"   # -p 없이: 그 사이 심링크가 생기면 실패한다
+  safe_dir "${USER_TMP}" || { echo "ERROR: tmp 가 심볼릭 링크로 바뀌었다: ${USER_TMP}"; exit 1; }
+  chown -h "${USER_UID}:${USER_GID}" "${USER_TMP}"
+  chmod 1777 "${USER_TMP}"
+  TMP_MOUNT="-v ${USER_TMP}:/tmp"
+else
+  TMP_MOUNT=""
+fi
+
+# Paseo 로컬 음성 모델(약 985MB)을 홈(SSD) 대신 회원 루트(HDD)에 둔다 (2026-10-01).
+# opt-in: <회원 루트>/home-cache/paseo-models 가 있는 회원만 ~/.paseo/models 에 바인드한다.
+# 없는 회원은 아무 일도 일어나지 않는다. 마운트 지점(홈의 .paseo/models)이 없으면 건너뛰고 경고한다
+# (호스트 홈에 Docker 가 root 소유 디렉터리를 만들어 버리는 것을 막는다).
+MODELS_SRC="${USER_ROOT}/home-cache/paseo-models"
+MODELS_MOUNT=""
+if [[ -d "$MODELS_SRC" && ! -L "$MODELS_SRC" ]]; then
+  if [[ -d "$USER_HOME/.paseo/models" && ! -L "$USER_HOME/.paseo/models" ]]; then
+    MODELS_MOUNT="-v ${MODELS_SRC}:${USER_HOME}/.paseo/models"
+  else
+    echo "WARNING: paseo models mount point missing, skipping: $USER_HOME/.paseo/models" >&2
+  fi
+fi
+
+MEMBERS_MOUNT=""
+# shellcheck disable=SC1091
+. /opt/@@PFX@@/scripts/@@PFX@@-access-lib.sh; acc_load
+if [[ $WORKSPACE_OTHERS = read ]]; then
+  for _o in $(acc_members); do
+    [[ $_o = "$USERNAME" ]] && continue
+    safe_dir "${USER_ROOT_BASE}/${_o}/workspace" && MEMBERS_MOUNT+=" -v ${USER_ROOT_BASE}/${_o}/workspace:/members/${_o}:ro"
+  done
+fi
+
+docker create -it \
+  --init \
+  --stop-timeout 30 \
+  --name "$CONTAINER_NAME" \
+  --hostname "$CONTAINER_NAME" \
+  --restart unless-stopped \
+  --memory "${DEV_MEMORY_LIMIT:-4g}" \
+  --memory-swap "${DEV_MEMORY_SWAP:-4g}" \
+  --cpus "${DEV_CPU_LIMIT:-6}" \
+  --network "$DEV_NETWORK" \
+  --security-opt "seccomp=${SECCOMP_PROFILE}" \
+  --security-opt "apparmor=${APPARMOR_PROFILE}" \
+  --env-file "$CATALOG_ENV_FILE" \
+  -e AI_USER="$USERNAME" \
+  -e AI_UID="$USER_UID" \
+  -e AI_GID="$USER_GID" \
+  -e @@PFX_UP@@_GID="$@@PFX_UP@@_GID" \
+  -e TERM="$TERM_DEFAULT" \
+  -e TZ="${DEV_TZ:-@@TZ@@}" \
+  -v "${USER_HOME}:${USER_HOME}" \
+  -v "${AGENT_CONFIG}:${USER_HOME}/.@@PFX@@/agent-config" \
+  -v "${WORKSPACE}:/workspace" \
+  ${TMP_MOUNT} \
+  ${MODELS_MOUNT} \
+  -v "${SHARED_PATH}:/shared" \
+  ${MEMBERS_MOUNT} \
+  -v "/opt/@@PFX@@/managed-mcp:/opt/@@PFX@@/managed-mcp:ro" \
+  ${MEMORY_BEARER_MOUNT} \
+  -v "/opt/@@PFX@@/managed-mcp/bin/@@PFX@@-mcp-sync:/usr/local/bin/@@PFX@@-mcp-sync:ro" \
+  -v "$API_CATALOG_ROOT/data:/opt/@@PFX@@/api-catalog/data:ro" \
+  -v "$API_CATALOG_ROOT/bin/api-catalog-search:/usr/local/bin/api-catalog-search:ro" \
+  -v "${MEMBER_TOOLS_DIR}/@@PFX@@-github-connect:/usr/local/bin/@@PFX@@-github-connect:ro" \
+  -v "${MEMBER_TOOLS_DIR}/@@PFX@@-github-status:/usr/local/bin/@@PFX@@-github-status:ro" \
+  -v "${MEMBER_TOOLS_DIR}/@@PFX@@-github-disconnect:/usr/local/bin/@@PFX@@-github-disconnect:ro" \
+  "$GOLDEN_IMAGE" \
+  >/dev/null
+
+echo "Container created: $CONTAINER_NAME"
+
+# DB 를 가진 회원이면 db-clients 네트워크에 연결한다.
+#
+# 이 연결은 컨테이너에 매여 있어 재생성 때마다 사라진다. 예전에는 관리자가 손으로
+# 다시 걸어야 했고, 2026-09-23 롤아웃에서 그것을 빠뜨려 회원 전원이 DB 에 닿지
+# 못했다. 생성 시점에 함께 처리해 재발을 막는다.
+#
+# postgres 가 없거나 꺼져 있으면 경고만 내고 넘어간다 -- DB 는 부수 기능이므로
+# 개발환경 생성 자체를 막지 않는다.
+DB_NETWORK="${DEV_DB_NETWORK:-db-clients}"
+
+if docker network inspect "$DB_NETWORK" >/dev/null 2>&1; then
+  if docker container inspect postgres >/dev/null 2>&1; then
+    has_role="$(
+      docker exec -i postgres psql -U postgres -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = '${USERNAME}' AND rolcanlogin" \
+        2>/dev/null | tr -d '[:space:]'
+    )"
+
+    if [[ "$has_role" == "1" ]]; then
+      if docker network connect "$DB_NETWORK" "$CONTAINER_NAME" 2>/dev/null; then
+        echo "Connected to $DB_NETWORK: $CONTAINER_NAME"
+      else
+        echo "WARNING: failed to connect $CONTAINER_NAME to $DB_NETWORK" >&2
+      fi
+    else
+      echo "Skipped $DB_NETWORK: no PostgreSQL login role for $USERNAME"
+    fi
+  else
+    echo "WARNING: postgres container not found; skipped $DB_NETWORK" >&2
+  fi
+else
+  echo "WARNING: network not found: $DB_NETWORK; skipped" >&2
+fi

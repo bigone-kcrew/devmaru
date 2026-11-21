@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+curl_hdr() { local v=${2//\\/\\\\}; v=${v//\"/\\\"}; printf 'header = "%s: %s"\n' "$1" "$v"; }   # 비밀 헤더를 argv(ps)에 싣지 않으려 curl -K 로 넘긴다
+# @@PFX@@-db-policy (root/docker) — 멤버 DB 공동 규칙을 지킨다. 멤버가 CREATEDB 로 만든 DB 는 기본이 PUBLIC CONNECT 열림이라 주기적으로 닫는다.
+#   규칙: ① 멤버 role 의 연결 수 20 제한(무제한이면 설정) ② 멤버가 소유한 DB 의 PUBLIC CONNECT 회수 ③ 현황을 /var/lib/@@PFX@@/db-policy.json 에 기록(OPS 표시용)
+#   사용: @@PFX@@-db-policy [--check]    --check: 바꾸지 않고 위반만 출력
+set -uo pipefail
+PG="${PG_CONTAINER:-postgres}"; USERS="${AI_DB_USERS:-/srv/@@PFX@@/users}"; LIMIT="${AI_DB_CONNLIMIT:-20}"; OUT="${AI_DB_OUT:-/var/lib/@@PFX@@/db-policy.json}"; CHECK=0
+[ "${1:-}" = "--check" ] && CHECK=1
+CFG="${AI_DB_CONFIG:-/etc/@@PFX@@/apps/config.json}"; DUMPDIR="${AI_DB_DUMPDIR:-/srv/@@PFX@@/backups/retired-db}"; STATE="${AI_DB_STATE:-/var/lib/@@PFX@@/db-retire.state}"
+cfgv(){ jq -r --arg k "$1" --arg d "$2" '.[$k] // $d' "$CFG" 2>/dev/null || echo "$2"; }
+RETAIN="${AI_DB_RETAIN_DAYS:-$(cfgv retain_days 90)}"; DUMPKEEP="${AI_DB_DUMP_DAYS:-$(cfgv dump_days 7)}"; WARN_DAYS=7
+case $RETAIN in ''|*[!0-9]*) RETAIN=90;; esac; [ "$RETAIN" -ge 30 ] || RETAIN=30   # 설정 실수(0·오타)로 보관 기간이 줄어 일찍 지워지지 않게 하한을 둔다
+case $DUMPKEEP in ''|*[!0-9]*) DUMPKEEP=7;; esac; [ "$DUMPKEEP" -ge 1 ] || DUMPKEEP=1
+LOCKF="${AI_DB_LOCK:-/run/@@PFX@@-db-policy.lock}"
+if ( : >>"$LOCKF" ) 2>/dev/null; then exec 9>>"$LOCKF"; flock -n 9 || { echo "이미 실행 중 — 건너뜀"; exit 0; }; fi
+safe_name(){ [[ $1 =~ ^[A-Za-z0-9_]{1,63}$ ]]; }   # 멤버가 CREATEDB 로 만든 DB 이름은 믿지 않는다 — 셸·SQL·경로에 넣기 전에 이 모양만 통과시킨다
+PROTECTED_DBS="${AI_DB_PROTECTED_DBS:-postgres n8n mem0 mem0_app template0 template1}"; PROTECTED_ROLES="${AI_DB_PROTECTED_ROLES:-postgres n8n mem0 mem0_app}"
+in_list(){ local p; for p in $2; do [ "$1" = "$p" ] && return 0; done; return 1; }
+TODAY_S=$(date -d "${AI_DB_TODAY:-today}" +%s); NOTES=""
+notify_add(){ NOTES="${NOTES}${NOTES:+
+}$1"; }
+PQ="${STATE}.pending"   # 전송에 실패한 알림 대기열(삭제는 이미 일어났으니 다시 계산되지 않는다 — 파일로 남겨 다음 주기에 다시 보낸다)
+notify_send(){ [ "$CHECK" = 0 ] || return 0
+  local url tok code body="$NOTES"
+  [ -s "$PQ" ] && body="$(cat "$PQ")${body:+
+}$body"
+  [ -n "$body" ] || { flush_marks; return 0; }
+  url=$(cfgv notify_url ""); [ -n "$url" ] || { flush_marks; return 0; }   # 알림이 꺼져 있으면 기록만 한다(나중에 켜도 옛 알림이 쏟아지지 않게)
+  tok=$(cat "$(cfgv notify_token_file /dev/null)" 2>/dev/null || true)
+  code=$(jq -n --arg t "$body" '{text:$t}' | curl -s -m 5 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -K <(curl_hdr X-Token "$tok") -d @- "$url" || echo 000)
+  if [ "$code" = 200 ]; then rm -f "$PQ"; flush_marks
+  else echo "알림 전송 실패(HTTP $code) — 대기열에 남겨 다음 주기에 다시 보냄" >&2
+    mkdir -p "$(dirname "$PQ")"; printf '%s\n' "$body" | tail -n 50 > "$PQ.tmp" && mv "$PQ.tmp" "$PQ"; flush_marks   # 대기열에 안전하게 넣었으니 기록도 남긴다(다시 알림이 두 번 가지 않게)
+  fi; }
+seen(){ grep -qxF "$1" "$STATE" 2>/dev/null; }
+PENDING=""
+mark(){ [ "$CHECK" = 0 ] && PENDING="${PENDING}${PENDING:+ }$1"; true; }   # 알림을 보낸 뒤에만 기록한다(전송이 실패하면 다음 주기에 다시 알린다)
+flush_marks(){ [ -n "$PENDING" ] || return 0; mkdir -p "$(dirname "$STATE")"; for m_ in $PENDING; do echo "$m_" >> "$STATE"; done; PENDING=""; }
+q(){ docker exec "$PG" psql -U postgres -tAc "$1"; }
+x(){ docker exec "$PG" psql -U postgres -v ON_ERROR_STOP=1 -c "$1" >/dev/null; }
+q 'select 1' >/dev/null 2>&1 || { echo "postgres 응답 없음" >&2; exit 1; }
+mem=""; for d in "$USERS"/*/; do m=$(basename "$d"); [[ $m =~ ^[a-z][a-z0-9_-]{1,31}$ ]] || continue; [ "$(q "select count(*) from pg_roles where rolname='$m'")" = 1 ] && mem="$mem $m"; done
+fix=0
+for m in $mem; do
+  cl=$(q "select rolconnlimit from pg_roles where rolname='$m'")
+  if [ "$cl" = "-1" ]; then echo "위반: role $m 연결 수 무제한"; fix=$((fix+1)); [ $CHECK = 0 ] && x "ALTER ROLE \"$m\" CONNECTION LIMIT $LIMIT" && echo "  → CONNECTION LIMIT $LIMIT"; fi
+  nopen=$(q "select count(*) from pg_database where not datistemplate and datdba=(select oid from pg_roles where rolname='$m') and (datacl is null or datacl::text like '%=Tc/%')")
+  if [ "${nopen:-0}" != 0 ]; then
+    echo "위반: 멤버 $m 소유 DB $nopen 개가 PUBLIC CONNECT 열림"; fix=$((fix+1))
+    if [ $CHECK = 0 ]; then
+      if docker exec -i "$PG" psql -U postgres -q -v ON_ERROR_STOP=1 -v m="$m" >/dev/null <<'SQL'
+select format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', datname) from pg_database where not datistemplate and datdba=(select oid from pg_roles where rolname=:'m') and (datacl is null or datacl::text like '%=Tc/%')
+\gexec
+SQL
+      then echo "  → 회수"; else echo "  → 회수 실패" >&2; fi
+    fi
+  fi
+done
+[ $fix = 0 ] && echo "위반 없음(멤버: ${mem# })"
+# ---- 보관(retired) 정리: 삭제된 멤버의 DB 를 RETAIN 일 보관한 뒤 덤프를 뜨고 정리한다. 덤프는 DUMPKEEP 일 뒤 지운다. ----
+still_retired(){ [ ! -d "$USERS/$1" ] && [ "$(q "select count(*) from pg_roles where rolname='$1' and shobj_description(oid,'pg_authid') like 'retired:%'")" = 1 ]; }   # 같은 ID 로 다시 만들어졌거나 보관 표시가 풀렸으면 지우지 않는다
+purge_role(){ local r=$1 db f tmp ts ok=1
+  safe_name "$r" && ! in_list "$r" "$PROTECTED_ROLES" || { echo "보호되었거나 이름 규칙 밖의 role — 자동 정리하지 않음: $r" >&2; return 1; }
+  ts=$(date -d "${AI_DB_TODAY:-today}" +%Y%m%d-%H%M%S)
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    if ! safe_name "$db" || in_list "$db" "$PROTECTED_DBS"; then echo "이름 규칙 밖이거나 보호된 DB — 자동 정리하지 않음(관리자 확인 필요): role $r" >&2; ok=0; continue; fi
+    still_retired "$r" || { echo "보관 상태가 바뀌었다(멤버 홈 생김 또는 표시 해제) — 중단: $r" >&2; ok=0; break; }
+    [ "$(q "select count(*) from pg_database where datname='$db' and datdba=(select oid from pg_roles where rolname='$r')")" = 1 ] || { echo "소유자가 달라졌다 — 건너뜀: $db" >&2; ok=0; continue; }
+    f="$DUMPDIR/$r/$db-$ts.dump"; tmp="$f.part"; mkdir -p "$DUMPDIR/$r"; chmod 700 "$DUMPDIR" "$DUMPDIR/$r" 2>/dev/null || true
+    if docker exec -u postgres "$PG" pg_dump -U postgres -Fc -d "$db" > "$tmp" && [ -s "$tmp" ] && docker exec -i -u postgres "$PG" pg_restore -l < "$tmp" >/dev/null 2>&1; then
+      mv -f "$tmp" "$f"; chmod 600 "$f"; echo "덤프: $f ($(du -h "$f" | cut -f1)) — $DUMPKEEP 일 뒤 삭제"
+      still_retired "$r" || { echo "덤프 뒤 보관 상태가 바뀌었다 — DB 를 지우지 않음: $r" >&2; ok=0; break; }
+      x "DROP DATABASE \"$db\"" && echo "DB 삭제: $db" || { echo "DB 삭제 실패: $db" >&2; ok=0; }
+    else rm -f "$tmp"; echo "덤프 실패 — 삭제하지 않음: $db" >&2; ok=0; fi
+  done < <(q "select datname from pg_database where not datistemplate and datdba=(select oid from pg_roles where rolname='$r')")
+  if [ $ok = 1 ] && still_retired "$r"; then x "DROP ROLE \"$r\"" && echo "role 삭제: $r" || { echo "role 삭제 실패(다른 DB 에 권한·소유물이 남음): $r" >&2; ok=0; }; else ok=0; fi
+  [ $ok = 1 ]; }
+while IFS= read -r r; do
+  [ -n "$r" ] || continue; safe_name "$r" || { echo "이름 규칙 밖의 보관 role — 건너뜀" >&2; continue; }
+  since=$(q "select substr(shobj_description(oid,'pg_authid'),9) from pg_roles where rolname='$r'")
+  s_s=$(date -d "$since" +%s 2>/dev/null) || { echo "보관 날짜 형식 이상 — 건너뜀: $r ($since)"; continue; }
+  age=$(( (TODAY_S - s_s) / 86400 ))
+  if [ -d "$USERS/$r" ]; then echo "보관 표시가 있지만 멤버 홈이 있음 — 건너뜀: $r"; continue; fi
+  if [ $age -ge $RETAIN ]; then
+    if [ $CHECK = 1 ]; then echo "정리 대상: $r (보관 ${age}일)"; else
+      if purge_role "$r"; then notify_add "[멤버 DB 삭제] $r (보관 ${age}일 경과 · 덤프는 ${DUMPKEEP}일 뒤 삭제)"; mark "$r:purged"; else fk="$r:purgefail:$(date -d "${AI_DB_TODAY:-today}" +%F)"; seen "$fk" || { notify_add "[멤버 DB 정리 실패] $r — 덤프 또는 삭제가 실패하거나 자동 정리 대상이 아니라 그대로 두었습니다. 관리자 확인 필요"; mark "$fk"; }; fi; fi
+  else
+    left=$((RETAIN - age)); seen "$r:retired" || { notify_add "[멤버 DB 보관 시작] $r — ${RETAIN}일 보관 후 덤프 떠서 삭제(${left}일 남음). 같은 ID 로 다시 만들면 복구됩니다"; mark "$r:retired"; }
+    [ $left -le $WARN_DAYS ] && ! seen "$r:warn" && { notify_add "[멤버 DB 삭제 임박] $r — ${left}일 뒤 삭제됩니다"; mark "$r:warn"; }
+  fi
+done < <(q "select rolname from pg_roles where shobj_description(oid,'pg_authid') like 'retired:%'")
+# 덤프 정리: 파일 이름의 날짜 기준 DUMPKEEP 일이 지난 것만 지운다(이름 형식이 아닌 파일은 건드리지 않는다)
+if [ -d "$DUMPDIR" ]; then
+  for f in "$DUMPDIR"/*/*.dump; do [ -e "$f" ] || continue
+    d=$(basename "$f" | sed -n 's/.*-\([0-9]\{8\}\)-[0-9]\{6\}\.dump$/\1/p'); [ -n "$d" ] || continue
+    fs=$(date -d "$d" +%s 2>/dev/null) || continue
+    if [ $(( (TODAY_S - fs) / 86400 )) -ge $DUMPKEEP ]; then
+      if [ $CHECK = 1 ]; then echo "덤프 삭제 대상: $(basename "$f")"; else rm -f "$f" && echo "덤프 삭제: $(basename "$f")" && notify_add "[멤버 DB 덤프 삭제] $(basename "$f") (${DUMPKEEP}일 경과)"; fi
+    fi
+  done
+  [ $CHECK = 0 ] && find "$DUMPDIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+fi
+if [ $CHECK = 0 ]; then
+  list=$(echo $mem | tr ' ' ',')
+  ret=$(q "select coalesce(json_agg(json_build_object('role',r.rolname,'since',substr(shobj_description(r.oid,'pg_authid'),9),'dbs',coalesce((select json_agg(json_build_object('name',d.datname,'bytes',pg_database_size(d.datname))) from pg_database d where d.datdba=r.oid and not d.datistemplate),'[]'::json))),'[]'::json) from pg_roles r where shobj_description(r.oid,'pg_authid') like 'retired:%'")
+  dumps="[]"; if [ -d "$DUMPDIR" ]; then dumps=$(for f in "$DUMPDIR"/*/*.dump; do [ -e "$f" ] || continue; d=$(basename "$f" | sed -n 's/.*-\([0-9]\{8\}\)-[0-9]\{6\}\.dump$/\1/p'); [ -n "$d" ] && jq -n --arg n "$(basename "$f")" --arg d "$d" --argjson b "$(stat -c %s "$f")" '{name:$n,date:$d,bytes:$b}'; done | jq -s '.' 2>/dev/null || echo "[]"); fi
+  mkdir -p "$(dirname "$OUT")"
+  base=$(q "select json_build_object('generated', extract(epoch from now())::bigint, 'limit', $LIMIT,
+       'roles', coalesce((select json_agg(json_build_object('name',rolname,'connlimit',rolconnlimit,'createdb',rolcreatedb)) from pg_roles where rolname = any(string_to_array('$list', ','))),'[]'::json),
+       'databases', coalesce((select json_agg(json_build_object('name',d.datname,'owner',pg_get_userbyid(d.datdba),'bytes',pg_database_size(d.datname),'open',(d.datacl is null or d.datacl::text like '%=Tc/%'))) from pg_database d where not d.datistemplate and pg_get_userbyid(d.datdba) = any(string_to_array('$list', ','))),'[]'::json),
+       'retain_days', $RETAIN, 'dump_days', $DUMPKEEP)")
+  [ -n "$ret" ] || ret='[]'
+  printf '%s' "$base" | jq --argjson ret "$ret" --argjson dumps "$dumps" '. + {retired:$ret, dumps:$dumps}' > "$OUT.tmp" && chmod 644 "$OUT.tmp" && mv -f "$OUT.tmp" "$OUT"
+fi
+notify_send
+exit 0

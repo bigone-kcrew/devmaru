@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE_ROOT="/workspace"
+CREATE_CMD="@@PFX@@-workspace-create"
+SESSION_PREFIX="p"
+
+usage() {
+  cat <<USAGE
+Usage:
+  tmx
+  tmx <project-name> [--no-git]
+
+Behavior:
+  Existing project:
+    Open or switch to its AI workstation tmux session.
+
+  Missing project:
+    Create it with @@PFX@@-workspace-create, then open the session.
+
+Windows:
+  1 claude
+  2 codex
+  3 antigravity
+  4 shell
+
+Examples:
+  tmx my-project
+  tmx research-demo --no-git
+USAGE
+}
+
+list_projects() {
+  echo "Personal projects:"
+  if [[ -d "$WORKSPACE_ROOT" ]]; then
+    find "$WORKSPACE_ROOT" \
+      -mindepth 1 -maxdepth 1 -type d \
+      -printf '  %f\n' 2>/dev/null | sort
+  fi
+
+  echo
+  echo "Personal tmux sessions:"
+  tmux list-sessions -F '  #{session_name}' 2>/dev/null \
+    | grep -E "^  ${SESSION_PREFIX}-" \
+    || echo "  (none)"
+
+  echo
+  usage
+}
+
+create_workstation() {
+  local session="$1"
+  local project_dir="$2"
+
+  tmux new-session -d \
+    -s "$session" \
+    -n claude \
+    -c "$project_dir" \
+    "bash -lc 'claude; exec bash'"
+
+  tmux new-window \
+    -t "${session}:" \
+    -n codex \
+    -c "$project_dir" \
+    "bash -lc 'codex; exec bash'"
+
+  tmux new-window \
+    -t "${session}:" \
+    -n antigravity \
+    -c "$project_dir" \
+    "bash -lc 'agy; exec bash'"
+
+  tmux new-window \
+    -t "${session}:" \
+    -n shell \
+    -c "$project_dir"
+
+  tmux select-window -t "${session}:1"
+}
+
+if [[ $# -eq 0 ]]; then
+  list_projects
+  exit 0
+fi
+
+if [[ $# -gt 2 ]]; then
+  usage
+  exit 1
+fi
+
+PROJECT="$1"
+OPTION="${2:-}"
+
+if [[ ! "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "ERROR: invalid project name: $PROJECT" >&2
+  echo "Allowed: letters, numbers, dot, underscore, hyphen." >&2
+  exit 1
+fi
+
+if [[ -n "$OPTION" && "$OPTION" != "--no-git" ]]; then
+  echo "ERROR: unknown option: $OPTION" >&2
+  usage
+  exit 1
+fi
+
+PROJECT_DIR="${WORKSPACE_ROOT}/${PROJECT}"
+SESSION="${SESSION_PREFIX}-${PROJECT}"
+
+if [[ -e "$PROJECT_DIR" && ! -d "$PROJECT_DIR" ]]; then
+  echo "ERROR: project path exists but is not a directory: $PROJECT_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "Project does not exist. Creating: $PROJECT"
+
+  if [[ "$OPTION" == "--no-git" ]]; then
+    "$CREATE_CMD" "$PROJECT" --no-git
+  else
+    "$CREATE_CMD" "$PROJECT"
+  fi
+elif [[ "$OPTION" == "--no-git" ]]; then
+  echo "ERROR: --no-git is only valid when creating a new project." >&2
+  exit 1
+fi
+
+if ! tmux has-session -t "=${SESSION}" 2>/dev/null; then
+  create_workstation "$SESSION" "$PROJECT_DIR"
+fi
+
+if [[ -n "${TMUX:-}" ]]; then
+  exec tmux switch-client -t "=${SESSION}"
+fi
+
+exec tmux attach-session -t "=${SESSION}"

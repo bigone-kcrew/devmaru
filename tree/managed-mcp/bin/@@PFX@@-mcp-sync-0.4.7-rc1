@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -u
+
+warn() {
+  echo "경고: $*" >&2
+}
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  warn "@@PFX@@-mcp-sync는 root가 아닌 회원 계정으로 실행해야 합니다."
+  exit 0
+fi
+
+echo "===== @@BRAND@@ MCP 동기화 ====="
+
+register_stdio_mcp() {
+  local name="$1"
+  local server="$2"
+
+  if [[ ! -f "$server" ]]; then
+    warn "$name MCP 서버를 찾을 수 없습니다: $server"
+    return
+  fi
+
+  if command -v claude >/dev/null 2>&1; then
+    if claude mcp get "$name" >/dev/null 2>&1; then
+      echo "Claude MCP: $name 이미 등록됨"
+    elif claude mcp add \
+      --scope user \
+      "$name" \
+      -- node "$server" >/dev/null 2>&1
+    then
+      echo "Claude MCP: $name 등록 완료"
+    else
+      warn "Claude MCP: $name 등록 실패"
+    fi
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    if codex mcp get "$name" >/dev/null 2>&1; then
+      echo "Codex MCP: $name 이미 등록됨"
+    elif codex mcp add \
+      "$name" \
+      -- node "$server" >/dev/null 2>&1
+    then
+      echo "Codex MCP: $name 등록 완료"
+    else
+      warn "Codex MCP: $name 등록 실패"
+    fi
+  fi
+}
+
+register_http_mcp() {
+  local name="$1"
+  local url="$2"
+
+  if command -v claude >/dev/null 2>&1; then
+    if claude mcp get "$name" >/dev/null 2>&1; then
+      echo "Claude MCP: $name 이미 등록됨"
+    elif claude mcp add \
+      --scope user \
+      --transport http \
+      "$name" \
+      "$url" >/dev/null 2>&1
+    then
+      echo "Claude MCP: $name 등록 완료"
+    else
+      warn "Claude MCP: $name 등록 실패"
+    fi
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    if codex mcp get "$name" >/dev/null 2>&1; then
+      echo "Codex MCP: $name 이미 등록됨"
+    elif codex mcp add \
+      "$name" \
+      --url "$url" >/dev/null 2>&1
+    then
+      echo "Codex MCP: $name 등록 완료"
+    else
+      warn "Codex MCP: $name 등록 실패"
+    fi
+  fi
+}
+
+sync_antigravity_mcp() {
+  local config_dir="${HOME}/.gemini/config"
+  local config="${config_dir}/mcp_config.json"
+  local work
+  local desired
+  local merged
+  local name
+  local current
+  local expected
+
+  if ! command -v agy >/dev/null 2>&1; then
+    warn "Antigravity CLI를 찾을 수 없어 건너뜁니다."
+    return 0
+  fi
+
+  mkdir -p "$config_dir"
+  chmod 0700 "$config_dir"
+
+  work="$(mktemp "${config_dir}/.mcp_config.work.XXXXXX")"
+  merged="$(mktemp "${config_dir}/.mcp_config.merged.XXXXXX")"
+
+  if [[ ! -e "$config" || ! -s "$config" ]]; then
+    printf '%s\n' '{"mcpServers":{}}' > "$work"
+  else
+    if ! jq -e '
+      type == "object" and
+      (
+        (.mcpServers == null) or
+        ((.mcpServers | type) == "object")
+      )
+    ' "$config" >/dev/null 2>&1
+    then
+      warn "Antigravity MCP 설정이 유효한 JSON/object가 아니어서 기존 파일을 보존합니다: $config"
+      rm -f "$work" "$merged"
+      return 1
+    fi
+
+    cp "$config" "$work"
+  fi
+
+  desired="$(
+    jq -cn '
+      {
+        "kordoc": {
+          "command": "node",
+          "args": [
+            "/opt/@@PFX@@/managed-mcp/kordoc/server.mjs"
+          ]
+        },
+
+        "markitdown": {
+          "command": "node",
+          "args": [
+            "/opt/@@PFX@@/managed-mcp/markitdown/server.mjs"
+          ]
+        },
+
+        "crawl4ai": {
+          "command": "node",
+          "args": [
+            "/opt/@@PFX@@/managed-mcp/crawl4ai/server.mjs"
+          ]
+        },
+
+        "korean-law": {
+          "serverUrl": "http://korean-law-gateway:3000/mcp"
+        }
+      }
+    '
+  )"
+
+  for name in kordoc markitdown crawl4ai korean-law; do
+    current="$(
+      jq -c \
+        --arg name "$name" \
+        '.mcpServers[$name] // null' \
+        "$work"
+    )"
+
+    expected="$(
+      jq -c \
+        --arg name "$name" \
+        '.[$name]' \
+        <<<"$desired"
+    )"
+
+    if [[ "$current" == "null" ]]; then
+      echo "Antigravity MCP: $name 등록 예정"
+    elif [[ "$current" == "$expected" ]]; then
+      echo "Antigravity MCP: $name 이미 등록됨"
+    else
+      warn "Antigravity MCP: $name 이름의 기존 사용자 설정이 있어 덮어쓰지 않습니다."
+    fi
+  done
+
+  if ! jq \
+    --argjson desired "$desired" \
+    '
+      .mcpServers = (.mcpServers // {}) |
+
+      reduce ($desired | to_entries[]) as $item (
+        .;
+        if .mcpServers[$item.key] == null then
+          .mcpServers[$item.key] = $item.value
+        else
+          .
+        end
+      )
+    ' "$work" > "$merged"
+  then
+    warn "Antigravity MCP 설정 merge에 실패했습니다."
+    rm -f "$work" "$merged"
+    return 1
+  fi
+
+  chmod 0600 "$merged"
+  mv "$merged" "$config"
+  rm -f "$work"
+
+  chmod 0600 "$config"
+
+  echo "Antigravity MCP 동기화 완료"
+}
+
+register_stdio_mcp \
+  "kordoc" \
+  "/opt/@@PFX@@/managed-mcp/kordoc/server.mjs"
+
+register_stdio_mcp \
+  "markitdown" \
+  "/opt/@@PFX@@/managed-mcp/markitdown/server.mjs"
+
+register_stdio_mcp \
+  "crawl4ai" \
+  "/opt/@@PFX@@/managed-mcp/crawl4ai/server.mjs"
+
+register_http_mcp \
+  "korean-law" \
+  "http://korean-law-gateway:3000/mcp"
+
+echo
+if ! sync_antigravity_mcp; then
+  warn "Antigravity MCP 동기화에 실패했습니다."
+  exit 1
+fi
+
+echo
+echo "@@BRAND@@ MCP 동기화가 완료되었습니다."

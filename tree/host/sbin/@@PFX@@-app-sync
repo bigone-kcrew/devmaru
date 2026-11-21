@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""@@PFX@@-app-sync (root) — @@PFX@@-app-sync.timer 가 1분마다 부른다. 멤버가 ~/.@@PFX@@/apps/<이름>.app 에 적은 «동적 앱 공개 요청»을 규칙으로 검사해
+<이름>.@@DOMAIN@@ Caddy 블록(/etc/caddy/apps.d)을 만들고, 정적 공개 목록과 함께 /var/lib/@@PFX@@/published.json(OPS 표시용)을 쓴다.
+관리자 승인 대신 규칙 자동 승인: 이름 규칙·예약어·선점 · 멤버별 포트 대역 · 멤버당 앱 수 · 만료(기본 30·최대 365일, 관리자가 지정한 «운영 앱» 은 만료 없음 · 만료 14일 전 관리자 알림) · 허용 IP 전용은 항상.
+멤버 폴더는 setpriv 로 멤버 권한으로 내려가 @@PFX@@-app-sync-member 로만 읽고 쓴다(root 가 직접 만지지 않는다).
+사용: @@PFX@@-app-sync [--list | --kill <이름> | --unkill <이름> | --keep <이름> | --unkeep <이름>]"""
+import base64, fcntl, hashlib, json, os, pwd, re, secrets, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error, shlex
+import bcrypt
+
+E = os.environ
+USERS = E.get('AI_APP_USERS', '/srv/@@PFX@@/users'); HOMES = E.get('AI_APP_HOMES', '/home'); CADDY = E.get('AI_APP_CADDY', '/etc/caddy')
+STATE = E.get('AI_APP_STATE', '/etc/@@PFX@@/apps'); OUT = E.get('AI_APP_OUT', '/var/lib/@@PFX@@/published.json')
+MEMBER = E.get('AI_APP_MEMBER', '/usr/local/libexec/@@PFX@@-app-sync-member'); DRY = E.get('AI_APP_DRY') == '1'
+LOCK = E.get('AI_APP_LOCK', '/run/@@PFX@@-paseo-caddy.lock'); RUNLOCK = E.get('AI_APP_RUNLOCK', '/run/@@PFX@@-app-sync.lock')
+NOW = int(E.get('AI_APP_NOW', time.time())); DOMAIN = '@@DOMAIN@@'; NET = '@@PFX@@-dev-net'; STATIC_PORT = 18090
+SITE_ROOT = E.get('AI_SITE_ROOT', '/srv/@@PFX@@/site'); V3_OUT = E.get('AI_SITE3_OUT', '/var/lib/@@PFX@@/site-v3.json')   # 정적 공개 상태(v2 사본·v3 요약)
+NAME = re.compile(r'^[a-z][a-z0-9-]{1,30}$')
+DIR_RE = re.compile(r'^/(workspace|shared/workspaces)/[A-Za-z0-9_-]+/app(/[A-Za-z0-9._-]+)*$')   # 앱 소스 폴더(위치 규칙)
+FIXED_RESERVED = 'www mail smtp imap pop ftp sftp ns ns1 ns2 admin root paseo ops portal static assets api app apps test docs dev staging demo status monitor grafana'.split()
+CFG = {'max_apps': 5, 'default_days': 30, 'max_days': 365, 'warn_days': 14, 'port_base': 8100, 'port_block': 10, 'notify_url': '', 'notify_token_file': ''}
+events = []
+
+
+def log(*a):
+    print(*a, file=sys.stderr)
+
+
+def load_json(p, default):
+    try:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def load_registry(p):
+    """레지스트리는 «없을 때만» 빈 값으로 시작한다. 있는데 읽히지 않으면(깨짐·권한) 덮어쓰지 않고 멈춘다 — keep·killed·비밀번호 해시가 한 번에 사라지는 것을 막는다."""
+    if not os.path.exists(p):
+        return {'apps': {}, 'meta': {}}
+    try:
+        with open(p, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except (OSError, ValueError):
+        pass
+    sys.exit(f'레지스트리를 읽을 수 없습니다({p}) — 덮어쓰지 않고 중단합니다. 직전본은 {p}.prev')
+
+
+def save_json(p, obj, mode):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    if p.endswith('registry.json') and os.path.exists(p):
+        shutil.copy2(p, p + '.prev')
+    os.replace(tmp, p)
+
+
+def members():
+    sd = os.path.join(CADDY, 'sites.d')
+    out = []
+    if os.path.isdir(sd):
+        for fn in sorted(os.listdir(sd)):
+            m = fn[:-6] if fn.endswith('.caddy') else ''
+            if NAME.match(m) and os.path.isdir(os.path.join(USERS, m, 'workspace')):
+                out.append(m)
+    return out
+
+
+def run_member(m, args, inp=None):
+    cmd = [MEMBER] + args
+    if os.geteuid() == 0:
+        try:
+            pw = pwd.getpwnam(m)
+        except KeyError:
+            return None
+        cmd = ['setpriv', f'--reuid={pw.pw_uid}', f'--regid={pw.pw_gid}', '--init-groups', '--'] + cmd
+    try:
+        r = subprocess.run(cmd, input=inp, capture_output=True, text=True, timeout=40)
+    except Exception as e:
+        log(f'멤버 실행 실패 {m}: {e}')
+        return None
+    if r.returncode:
+        log(f'멤버 실행 오류 {m} {args[0]}: {r.stderr.strip()[:200]}')
+        return None
+    return r.stdout
+
+
+def container_ip(m):
+    t = E.get('AI_APP_TEST_IPS')
+    if t:
+        return json.loads(t).get(m)
+    try:
+        r = subprocess.run(['docker', 'inspect', '-f', '{{index .NetworkSettings.Networks "%s" "IPAddress"}}' % NET, f'dev-{m}'], capture_output=True, text=True, timeout=10)
+        ip = r.stdout.strip()
+        return ip if re.fullmatch(r'[0-9]+(\.[0-9]+){3}', ip) else None
+    except Exception:
+        return None
+
+
+def proxy_ip():
+    """앱 앞단 Caddy(호스트)가 컨테이너에 접속할 때 앱이 보는 주소 = 앱 망(NET)의 게이트웨이. 못 읽으면 None(그때는 안내문을 다시 쓰지 않는다)."""
+    t = E.get('AI_APP_TEST_GATEWAY')
+    if t:
+        return t
+    try:
+        r = subprocess.run(['docker', 'network', 'inspect', NET, '-f', '{{range .IPAM.Config}}{{.Gateway}} {{end}}'], capture_output=True, text=True, timeout=10)
+        for g in r.stdout.split():
+            if re.fullmatch(r'[0-9]+(\.[0-9]+){3}', g):
+                return g
+    except Exception:
+        pass
+    return None
+
+
+def started_at(m):
+    t = E.get('AI_APP_TEST_STARTED')
+    if t:
+        return json.loads(t).get(m)
+    try:
+        r = subprocess.run(['docker', 'inspect', '-f', '{{.State.StartedAt}}', f'dev-{m}'], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def listening(m, ip, port):
+    t = E.get('AI_APP_TEST_LISTEN')
+    if t:
+        return bool(json.loads(t).get(f'{m}:{port}'))
+    try:
+        socket.create_connection((ip, port), 1).close()
+        return True
+    except OSError:
+        return False
+
+
+def start_app(m, name, cmd, wdir=''):
+    """컨테이너가 (재)시작된 뒤 앱이 안 떠 있으면 멤버가 적어 둔 시작 명령을 «멤버 권한으로 컨테이너 안에서» 실행한다. 멤버가 이미 가진 권한 이상을 주지 않는다."""
+    if DRY:
+        with open(os.path.join(STATE, 'start.log'), 'a') as f:
+            f.write(f'{m} {name} {cmd}' + (f' @{wdir}' if wdir else '') + '\n')
+        return True
+    try:
+        pw = pwd.getpwnam(m)
+        c = f'dev-{m}'
+        if subprocess.run(['docker', 'exec', c, 'id', m], capture_output=True, timeout=15).returncode:
+            return False   # 컨테이너 안 멤버 환경이 아직 준비 안 됨 — 다음 분에 다시
+        cd = shlex.quote(wdir) if wdir and DIR_RE.match(wdir) else '"$HOME"'   # --dir 로 등록한 앱 폴더에서 시작(없으면 홈)
+        script = f'cd {cd} && {cmd} >> "$HOME/.@@PFX@@/apps/{name}.log" 2>&1'
+        r = subprocess.run(['docker', 'exec', '-d', c, 'setpriv', f'--reuid={pw.pw_uid}', f'--regid={pw.pw_gid}', '--init-groups', '--', 'env',
+                            f'HOME=/home/{m}', f'USER={m}', f'LOGNAME={m}', 'bash', '-lc', script], capture_output=True, timeout=20)
+        return r.returncode == 0
+    except Exception as e:
+        log(f'앱 시작 실패 {m}/{name}: {e}')
+        return False
+
+
+def reserved_names(mem):
+    names = set(FIXED_RESERVED) | set(mem)
+    try:
+        for fn in os.listdir(USERS):
+            names.add(fn)
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(CADDY, 'Caddyfile'), encoding='utf-8') as f:
+            for line in f:
+                if re.match(r'^[^\s#].*\{\s*$', line):
+                    for h in re.findall(r'([a-z0-9-]+)\.' + re.escape(DOMAIN), line):
+                        names.add(h)
+    except OSError:
+        pass
+    sd = os.path.join(CADDY, 'members.d')
+    if os.path.isdir(sd):
+        for fn in os.listdir(sd):
+            names.add(fn.replace('.caddy', ''))
+    return names
+
+
+def member_ports(m):
+    p = os.path.join(STATE, 'ports', m)
+    try:
+        lo, hi = map(int, open(p).read().split())
+        return lo, hi
+    except (OSError, ValueError):
+        pass
+    used = set()
+    d = os.path.join(STATE, 'ports')
+    if os.path.isdir(d):
+        for fn in os.listdir(d):
+            try:
+                used.add(int(open(os.path.join(d, fn)).read().split()[0]))
+            except (OSError, ValueError, IndexError):
+                pass
+    lo = CFG['port_base']
+    while lo in used:
+        lo += CFG['port_block']
+    hi = lo + CFG['port_block'] - 1
+    if hi > 8999:
+        return None
+    os.makedirs(d, exist_ok=True)
+    open(p, 'w').write(f'{lo} {hi}\n')
+    return lo, hi
+
+
+def block_text(name, m, ip, port, access, pwhash):
+    auth = f'\t\tbasic_auth {{\n\t\t\tapp {pwhash}\n\t\t}}\n' if access == 'basic' else ''
+    return (f'# @@PFX@@-app-sync: {name} (멤버 {m}) — 자동 생성, 직접 수정하지 말 것\n{name}.{DOMAIN} {{\n\timport access_log\n\timport geo_allow\n\thandle @allowed {{\n'
+            f'\t\trequest_body {{\n\t\t\tmax_size 10MB\n\t\t}}\n\t\theader {{\n\t\t\tX-Robots-Tag "noindex, nofollow"\n\t\t\tX-Content-Type-Options nosniff\n\t\t\t-Server\n\t\t}}\n'
+            f'{auth}\t\treverse_proxy {ip}:{port}\n\t}}\n\trespond 403\n}}\n')
+
+
+def validate(caddyfile):
+    """검증용 복사본으로 caddy validate 를 돈다. 복사본은 로그 파일 경로만 임시 폴더로 바꾼다 —
+    validate 는 로그 파일을 실제로 열어 보는데, 서비스 샌드박스(ProtectSystem=strict)에서는 /var/log/caddy 가 읽기 전용이라 실패하고
+    샌드박스 밖(비-root 시험)에서는 권한이 없다. 운영 Caddyfile 자체는 바꾸지 않는다."""
+    tmpd = tempfile.mkdtemp(prefix='@@PFX@@-app-validate-')
+    f = os.path.join(CADDY, 'Caddyfile.validate')   # import 경로는 /etc/caddy 기준 절대경로라 같은 폴더에 둘 필요는 없지만 상대 import 대비
+    try:
+        txt = open(caddyfile, encoding='utf-8').read().replace('/var/log/caddy/', tmpd + '/')
+        open(f, 'w', encoding='utf-8').write(txt)
+        env = dict(E, XDG_DATA_HOME=tmpd + '/xdg', XDG_CONFIG_HOME=tmpd + '/xdgc')
+        r = subprocess.run(['caddy', 'validate', '--config', f, '--adapter', 'caddyfile'], capture_output=True, text=True, env=env, timeout=60)
+        return r.returncode == 0, (r.stderr or r.stdout)[-400:]
+    finally:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def apply_blocks(desired):
+    ad = os.path.join(CADDY, 'apps.d')
+    os.makedirs(ad, exist_ok=True)
+    cur = {}
+    for fn in os.listdir(ad):
+        if fn.endswith('.caddy'):
+            cur[fn[:-6]] = open(os.path.join(ad, fn), encoding='utf-8').read()
+    cf = os.path.join(CADDY, 'Caddyfile')
+    imp = f'import {ad}/*.caddy'
+    has_import = imp in open(cf, encoding='utf-8').read()
+    if cur == desired and has_import:
+        return True, ''
+    try:
+        lk = open(LOCK, 'a')
+    except OSError:   # 비-root 시험에서 /run 에 못 쓰는 경우
+        lk = None
+    if lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+    ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}'   # 실제 시각(시험용 NOW 와 무관) + pid: 같은 초에 두 번 돌아도 겹치지 않게
+    bk = os.path.join(STATE, 'backups')
+    os.makedirs(bk, exist_ok=True)
+    shutil.copytree(ad, os.path.join(bk, f'apps.d.{ts}'))
+    shutil.copy2(cf, cf + f'.bak.pre-app-sync-{ts}')
+    for old in sorted(os.listdir(bk))[:-20]:
+        shutil.rmtree(os.path.join(bk, old), ignore_errors=True)
+    olds = sorted(x for x in os.listdir(CADDY) if x.startswith('Caddyfile.bak.pre-app-sync-'))[:-20]
+    for x in olds:
+        os.unlink(os.path.join(CADDY, x))
+    for n in cur:
+        if n not in desired:
+            os.unlink(os.path.join(ad, n + '.caddy'))
+    for n, t in desired.items():
+        if cur.get(n) != t:
+            tmp = os.path.join(ad, n + '.caddy.new')
+            open(tmp, 'w', encoding='utf-8').write(t)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, os.path.join(ad, n + '.caddy'))
+    if not has_import:
+        with open(cf, 'a', encoding='utf-8') as f:
+            f.write(f'\n# 멤버 동적 앱 공개(@@PFX@@-app-sync) — <앱>.{DOMAIN}, 허용 IP 만, 규칙 자동 승인\n{imp}\n')
+    def rollback():
+        for fn in os.listdir(ad):
+            os.unlink(os.path.join(ad, fn))
+        for n, t in cur.items():
+            open(os.path.join(ad, n + '.caddy'), 'w', encoding='utf-8').write(t)
+        shutil.copy2(cf + f'.bak.pre-app-sync-{ts}', cf)
+    try:
+        ok, err = validate(cf)
+    except Exception as e:   # 시간 초과 같은 예외에서도 검증 안 된 블록을 디스크에 남기지 않는다
+        ok, err = False, f'validate 예외: {e}'
+    if not ok:
+        rollback()
+        return False, err
+    if not DRY:
+        try:
+            subprocess.run(['systemctl', 'reload', 'caddy'], check=True, timeout=60)
+        except Exception as e:
+            rollback()
+            return False, f'reload 실패(블록을 되돌림): {e}'
+    return True, ''
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):   # 멤버 앱이 root 를 다른 주소(호스트 안쪽 등)로 보내지 못하게 따라가지 않는다
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _deadline(*a):
+    raise TimeoutError('deadline')
+
+
+def http_code(url, headers=None):
+    """멤버 앱 상태 점검. 소켓 timeout 은 «연산마다» 라서 한 바이트씩 천천히 보내는 앱이 root 실행 전체를 붙잡을 수 있다 — 전체 시한(5초)을 둔다."""
+    old = signal.signal(signal.SIGALRM, _deadline)
+    signal.alarm(5)
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with _OPENER.open(req, timeout=3) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+NOTIFY_PREFIXES = ('[앱 정리]', '[앱 공개 종료]', '[앱 만료]', '[앱 만료 예정]', '[앱 중단', '[Caddy 검증 실패')   # 삭제·종료·오류 관련만 알린다(새 공개·자동 시작은 OPS 탭에서 본다). config 의 notify_all=true 이면 전부
+
+
+RETRY_SKIP = '[앱 만료 예정]'   # 만료 예정은 warned 표시로 따로 다시 보낸다
+QUEUE_MAX = 50
+
+
+def notify(cfg, reg):
+    sel = events if cfg.get('notify_all') else [e for e in events if e.startswith(tuple(cfg.get('notify_prefixes') or NOTIFY_PREFIXES))]
+    queued = list(reg['meta'].get('notify_queue') or [])
+    if not sel and not queued:
+        return True
+    if not cfg.get('notify_url') or DRY:
+        return False
+    sel = queued + sel
+    try:
+        tok = open(cfg['notify_token_file']).read().strip() if cfg.get('notify_token_file') else ''
+        req = urllib.request.Request(cfg['notify_url'], data=json.dumps({'text': '\n'.join(sel)}, ensure_ascii=False).encode(), headers={'Content-Type': 'application/json', 'X-Token': tok})
+        _OPENER.open(req, timeout=5).read()
+        reg['meta'].pop('notify_queue', None)
+        return True
+    except Exception as e:
+        log(f'알림 실패(다음 분에 다시): {e}')
+        reg['meta']['notify_queue'] = [x for x in sel if not x.startswith(RETRY_SKIP)][-QUEUE_MAX:]
+        return False
+
+
+def main():
+    args = sys.argv[1:]
+    cfg = dict(CFG, **load_json(os.path.join(STATE, 'config.json'), {}))
+    rl = open(RUNLOCK, 'a')   # 관리자 명령(--kill·--keep 등)과 타이머 실행이 같은 레지스트리를 서로 덮어쓰지 않게 읽기 전에 잠근다(타이머는 바쁘면 건너뛰고, 관리자 명령은 기다린다)
+    if args[:1] != ['--list']:
+        try:
+            fcntl.flock(rl, fcntl.LOCK_EX | (0 if args else fcntl.LOCK_NB))
+        except OSError:
+            return 0
+    T0 = time.time()
+    reg = load_registry(os.path.join(STATE, 'registry.json'))
+    reg.setdefault('apps', {}); reg.setdefault('meta', {})
+    if args[:1] == ['--list']:
+        for n, a in sorted(reg['apps'].items()):
+            print(f"{n:20} {a['member']:10} {a['state']:9} port {a['port']} {a['access']:6} 만료 {'운영(없음)' if a.get('keep') else time.strftime('%Y-%m-%d', time.localtime(a['expires']))}")
+        return 0
+    if args[:1] in (['--kill'], ['--unkill']) and len(args) == 2:
+        a = reg['apps'].get(args[1])
+        if not a:
+            sys.exit('없는 앱 이름')
+        a['state'] = 'killed' if args[0] == '--kill' else 'active'
+        if args[0] == '--unkill':
+            a['reqhash'] = ''
+        save_json(os.path.join(STATE, 'registry.json'), reg, 0o600)
+        events.append(f"[앱 {'중단' if args[0] == '--kill' else '중단 해제'}] {args[1]} (멤버 {a['member']})")
+    elif args[:1] in (['--keep'], ['--unkeep']) and len(args) == 2:
+        a = reg['apps'].get(args[1])
+        if not a:
+            sys.exit('없는 앱 이름')
+        if args[0] == '--keep':
+            a['keep'] = True; a['keep_at'] = NOW
+            events.append(f"[앱 운영 지정] {args[1]} (멤버 {a['member']} — 만료 없음)")
+        else:
+            a.pop('keep', None); a.pop('keep_at', None); a['warned'] = 0
+            a['expires'] = NOW + cfg['default_days'] * 86400
+            events.append(f"[앱 운영 해제] {args[1]} (멤버 {a['member']} — 만료 {cfg['default_days']}일 뒤로 다시 시작)")
+        save_json(os.path.join(STATE, 'registry.json'), reg, 0o600)
+    elif args:
+        sys.exit(__doc__)
+    mem = members()
+    resv = reserved_names(mem)
+    status = {}      # (member, name) -> (sig, text)
+    requested = set()
+    read_ok = set()
+    gw = proxy_ip()
+    accepted = {}
+    port_used = {}
+    present = {}   # 멤버별 실제로 있는 .ports · *.status (None=확인 못 함 → 서명만 본다)
+    for m in mem:
+        rng = member_ports(m)
+        raw = run_member(m, ['read', os.path.join(HOMES, m)])
+        if raw is None or rng is None:
+            continue
+        lo, hi = rng
+        read_ok.add(m)
+        pr = run_member(m, ['present', os.path.join(HOMES, m)])
+        present[m] = set(json.loads(pr)) if pr else None   # 멤버를 지웠다 같은 ID 로 다시 만들면 서명만 남고 파일은 없다
+        ptxt = f'앱 공개 규칙: 포트 {lo}-{hi} 중에서 고르고(앱은 0.0.0.0 으로 띄움) · 이름은 소문자로 시작하는 영문 소문자·숫자·하이픈 2~31자 · 멤버당 최대 {cfg["max_apps"]}개 · 기본 {cfg["default_days"]}일(최대 {cfg["max_days"]}일) 뒤 만료\n' + (f'서버 프록시 주소: {gw} — 앱은 접속 상대 주소(peer)가 이 주소일 때만 X-Forwarded-For(접속자 IP)·X-Forwarded-Proto 를 믿고, 다른 주소에서 온 접속의 X-Forwarded-*·X-Real-IP·Forwarded·True-Client-IP 는 모두 무시한다(같은 망의 컨테이너는 Caddy 를 거치지 않고 앱 포트에 직접 접속할 수 있고, 이때 헤더는 위조될 수 있다)\n' if gw else '')
+        psig = 'v2|' + hashlib.sha256(ptxt.encode()).hexdigest()   # v2: 쓰기 실패를 성공으로 기록하던 옛 버전의 기록을 무효화
+        if gw and (reg['meta'].get('ports_' + m) != psig or (present[m] is not None and '.ports' not in present[m])):   # 프록시 주소를 못 읽은 회차에는 건드리지 않는다(안내문이 깜빡이지 않게)
+            if run_member(m, ['write', os.path.join(HOMES, m), '.ports'], ptxt) is not None:   # 실패하면 다음 분에 다시 시도
+                reg['meta']['ports_' + m] = psig
+        for r in sorted(json.loads(raw), key=lambda x: x['name']):
+            n = r['name']
+            if not NAME.fullmatch(n):   # 멤버 uid 헬퍼가 준 값이라도 root 쪽에서 한 번 더 확인한다
+                continue
+            requested.add(n)
+            cur = reg['apps'].get(n)
+            err = None
+            if not r['ok']:
+                err = r['error']
+            elif n in resv:
+                err = '예약된 이름이라 쓸 수 없습니다'
+            elif cur and cur['member'] != m:
+                err = '이미 다른 멤버가 쓰고 있는 이름입니다'
+            elif cur and cur['state'] == 'killed':
+                status[(m, n)] = ('killed', '관리자가 중단했습니다. 관리자에게 문의하세요.\n')
+                continue
+            elif r['port'] is None or not lo <= r['port'] <= hi:
+                err = f'port 는 {lo}-{hi} 범위만 쓸 수 있습니다'
+            elif r['access'] not in ('public', 'basic'):
+                err = 'access 는 public 또는 basic'
+            elif r.get('dir') and not DIR_RE.match(r['dir']):
+                err = 'dir 은 /workspace/<프로젝트>/app 아래만 쓸 수 있습니다'
+            elif not 1 <= (r['days'] or cfg['default_days']) <= cfg['max_days']:
+                err = f'days 는 1~{cfg["max_days"]}'
+            elif r['port'] in port_used and port_used[r['port']] != n:
+                err = f'같은 포트를 앱 {port_used[r["port"]]} 이 쓰고 있습니다'
+            elif not cur and sum(1 for a_ in reg['apps'].values() if a_['member'] == m) >= cfg['max_apps']:   # 이번 실행에서 통과한 것만이 아니라 이미 등록된 앱도 센다
+                err = f'멤버당 앱은 최대 {cfg["max_apps"]}개입니다'
+            if err:
+                status[(m, n)] = ('err:' + err, f'공개 못 함: {err}\n')
+                continue
+            days = r['days'] or cfg['default_days']
+            rh = hashlib.sha256(json.dumps([r['port'], r['access'], days, r['start'], r['renewed']] + ([r['dir']] if r.get('dir') else [])).encode()).hexdigest()
+            port_used[r['port']] = n
+            accepted[(m, n)] = r
+            if not cur:
+                cur = reg['apps'][n] = {'member': m, 'created': NOW, 'expires': NOW + days * 86400, 'reqhash': rh, 'pwhash': '', 'state': 'active'}
+                events.append(f"[새 앱 공개] {n}.{DOMAIN} (멤버 {m}, {'로그인 없음' if r['access'] == 'public' else 'Caddy 로그인'}, {days}일)")
+            elif cur['reqhash'] != rh:
+                if cur.get('days') != days or cur.get('renewed') != r['renewed']:   # 기간·연장 표시가 바뀐 때만 새로 센다(포트·시작 명령만 바꿔 만료를 되살리지 못하게)
+                    cur['expires'] = NOW + days * 86400
+                cur['reqhash'] = rh
+                if cur['state'] == 'expired':
+                    cur['state'] = 'active'
+            cur.update(port=r['port'], access=r['access'], days=days, renewed=r['renewed'], start=r['start'], dir=r.get('dir', ''))
+            if r['access'] == 'basic' and not cur['pwhash']:
+                pw = secrets.token_urlsafe(12)
+                cur['pwhash'] = base64.b64encode(bcrypt.hashpw(pw.encode(), bcrypt.gensalt(10))).decode()
+                if run_member(m, ['write', os.path.join(HOMES, m), f'{n}.secret'], f'사용자 이름: app\n암호: {pw}\n') is None:
+                    cur['pwhash'] = ''   # 비밀번호를 멤버에게 못 전했으면 해시도 남기지 않는다(다음 분에 새로 만든다)
+    # 요청이 사라진 앱: 이름을 돌려준다
+    for n in [n for n in reg['apps'] if n not in requested and reg['apps'][n]['member'] in read_ok]:
+        if reg['apps'][n]['state'] != 'killed':
+            events.append(f"[앱 공개 종료] {n} (멤버 {reg['apps'][n]['member']}가 요청 파일을 지움)")
+            del reg['apps'][n]
+    # 멤버가 삭제돼 홈·workspace 가 없어진 앱: 레지스트리에서 정리한다(블록은 아래 apply 에서 desired 에 없어 함께 사라진다)
+    for n in [n for n, a_ in reg['apps'].items() if os.path.isdir(USERS) and not os.path.isdir(os.path.join(USERS, a_['member']))]:
+        events.append(f"[앱 정리] {n} (멤버 {reg['apps'][n]['member']} 삭제됨)")
+        del reg['apps'][n]
+    desired = {}
+    summary_apps = []
+    warn = []
+    for n, a in sorted(reg['apps'].items()):
+        m = a['member']
+        if (m, n) not in accepted:
+            st_ = 'killed' if a['state'] == 'killed' else ('invalid' if m in read_ok else a['state'])
+            summary_apps.append(dict(name=n, dir=a.get('dir', ''), member=m, state=st_, url=f'https://{n}.{DOMAIN}', port=a.get('port'), access=a.get('access'), expires=a['expires'], keep=bool(a.get('keep')), http=None))
+            continue
+        if a['state'] != 'killed' and not a.get('keep') and a['expires'] <= NOW:
+            if a['state'] != 'expired':
+                events.append(f'[앱 만료] {n} (멤버 {m})')
+            a['state'] = 'expired'
+        elif a['state'] == 'expired':
+            a['state'] = 'active'
+        keep = bool(a.get('keep'))
+        left = (a['expires'] - NOW + 86399) // 86400
+        soon = (not keep) and a['state'] in ('active', 'down') and 0 < a['expires'] - NOW <= cfg['warn_days'] * 86400 and (a.get('days') or cfg['default_days']) > cfg['warn_days']
+        if soon and a.get('warned') != a['expires']:
+            warn.append(n)
+            events.append(f"[앱 만료 예정] {n} (멤버 {m}) — {left}일 뒤({time.strftime('%Y-%m-%d', time.localtime(a['expires']))}) 만료. 연장은 멤버가 @@PFX@@-app renew {n}, 운영 앱은 관리자가 @@PFX@@-app-keep {n}")
+        ip = container_ip(m) if a['state'] in ('active', 'down') else None
+        if a['state'] == 'active' and not ip:
+            a['state'] = 'down'
+        elif a['state'] == 'down' and ip:
+            a['state'] = 'active'
+        if a['state'] == 'active':
+            desired[n] = block_text(n, m, ip, a['port'], a['access'], a['pwhash'])
+            sa = started_at(m)
+            if a.get('start') and sa and a.get('cstart') != sa and not listening(m, ip, a['port']):
+                if start_app(m, n, a['start'], a.get('dir', '')):
+                    a['cstart'] = sa
+                    events.append(f'[앱 자동 시작] {n} (멤버 {m}, 컨테이너 재시작 뒤)')
+            elif sa and a.get('cstart') != sa and listening(m, ip, a['port']):
+                a['cstart'] = sa   # 이미 떠 있으면 시작 안 함
+        url = f'https://{n}.{DOMAIN}'
+        exp = time.strftime('%Y-%m-%d', time.localtime(a['expires']))
+        sig = f"{a['state']}|{a['port']}|{a['access']}|{a['expires']}|{bool(a.get('start'))}|{keep}|{soon}"
+        if a['state'] == 'active':
+            txt = (f'공개됨: {url}  (허용 IP 에서만 열림)\n접속 제한: ' + ('없음(로그인 없음)' if a['access'] == 'public' else f'Caddy 로그인 — 사용자 이름·암호는 @@PFX@@-app password {n}') +
+                   (('\n운영 앱: 만료 없음(관리자 지정)' if keep else f'\n만료: {exp}  (연장: @@PFX@@-app renew {n})' + (f' — {left}일 남았습니다' if soon else '')) +
+                    f'\n앱은 컨테이너 안에서 0.0.0.0:{a["port"]} 로 떠 있어야 합니다.\n') +
+                   ('시작 명령 등록됨 — 컨테이너가 다시 만들어지면 자동으로 다시 시작합니다(로그: @@PFX@@-app log ' + n + ').\n' if a.get('start') else
+                    '시작 명령이 없습니다 — 컨테이너가 다시 만들어지면 앱이 꺼집니다(@@PFX@@-app publish 때 --start 로 등록).\n'))
+        elif a['state'] == 'expired':
+            txt = f'만료됨({exp}). 다시 공개하려면: @@PFX@@-app renew {n}\n'
+        elif a['state'] == 'killed':
+            txt = '관리자가 중단했습니다. 관리자에게 문의하세요.\n'
+        else:
+            txt = '컨테이너가 꺼져 있어 잠시 공개를 멈췄습니다(켜지면 자동 재개).\n'
+        status[(m, n)] = (sig, txt)
+        summary_apps.append(dict(name=n, dir=a.get('dir', ''), member=m, state=a['state'], url=url, port=a['port'], access=a['access'], created=a['created'], expires=a['expires'],
+                                 days_left=(None if keep else max(0, (a['expires'] - NOW) // 86400)), keep=keep, http=(http_code(f"http://{container_ip(m)}:{a['port']}/", {'Host': f'{n}.{DOMAIN}'}) if a['state'] == 'active' and not E.get('AI_APP_NOHEALTH') else None)))
+    ok, err = apply_blocks(desired)
+    sigerr = hashlib.sha256(err.encode()).hexdigest() if not ok else ''
+    if not ok:
+        log('Caddy 검증 실패:', err)
+        if reg['meta'].get('apply_err') != sigerr:   # 같은 오류를 1분마다 알리지 않는다
+            events.append(f'[Caddy 검증 실패 — 앱 블록 변경을 되돌림] {err.strip()[-200:]}')
+    reg['meta']['apply_err'] = sigerr
+    if not ok:
+        for n in desired:
+            m = reg['apps'][n]['member']
+            status[(m, n)] = ('apply-error', '서버 설정 검증이 실패해 아직 공개되지 않았습니다. 자동으로 다시 시도하며, 계속되면 관리자에게 알려 주세요.\n')
+    save_json(os.path.join(STATE, 'registry.json'), reg, 0o600)   # 상태 파일 쓰기가 오래 걸려도 여기까지의 결정(만료·비밀번호·keep)은 먼저 저장한다
+    wrote = {}
+    for (m, n), (sig, txt) in status.items():
+        k = f'status_{m}/{n}'
+        if reg['meta'].get(k) != sig or (present.get(m) is not None and f'{n}.status' not in present[m]):
+            if wrote.get(m, 0) >= 10 or time.time() - T0 > 70:   # 한 멤버가 요청 파일을 수천 개 만들어도 한 번에 쓰는 수를 제한한다(나머지는 다음 분)
+                continue
+            wrote[m] = wrote.get(m, 0) + 1
+            if run_member(m, ['write', os.path.join(HOMES, m), f'{n}.status'], txt) is not None:
+                reg['meta'][k] = sig
+    static = []
+    v3 = load_json(V3_OUT, {})   # @@PFX@@-site-sync3 요약(없으면 v2 만 쓰는 중)
+    shared_static = [dict(project=x.get('project'), owner=x.get('owner'), url=x.get('url')) for x in v3.get('shared', [])]
+    for m in mem:
+        raw = run_member(m, ['static', os.path.join(USERS, m, 'workspace')])
+        v3m = v3.get('members', {}).get(m)   # v3 로 전환한 멤버면 v3 상태가 정본
+        for s in json.loads(raw) if raw else []:
+            if s['off']:
+                st = 'off'
+            elif v3m is not None:
+                st = 'shared' if s['project'] in v3m.get('projects', []) else 'pending'
+            else:
+                st = 'shared' if os.path.isdir(os.path.join(SITE_ROOT, m, s['project'])) else 'pending'   # v2: 사본이 있으면 공개 중
+            if E.get('AI_APP_NOHEALTH') or st != 'shared':
+                code = None
+            elif v3m is not None:
+                code = http_code(f"http://127.0.0.1:{v3m['port']}/{s['project']}/", {'Host': f'{m}.{DOMAIN}'})
+            else:
+                code = http_code(f"http://127.0.0.1:{STATIC_PORT}/{s['project']}/", {'X-Member': m, 'Host': f'{m}.{DOMAIN}'})
+            static.append(dict(member=m, project=s['project'], files=s['files'], bytes=s['bytes'], state=st, url=f"https://{m}.{DOMAIN}/{s['project']}/", http=code))
+            k = f"static_{m}/{s['project']}"
+            if st == 'shared' and reg['meta'].get(k) != 'shared' and reg['meta'].get('init'):   # 처음 설치 직후에는 기존 공개분을 알리지 않는다
+                events.append(f"[새 정적 공개] {m}.{DOMAIN}/{s['project']}/ (파일 {s['files']}개)")
+            reg['meta'][k] = st
+    reg['meta']['init'] = True
+    save_json(os.path.join(STATE, 'registry.json'), reg, 0o600)
+    save_json(OUT, dict(generated=NOW, apps=summary_apps, static=static, shared_static=shared_static, limits={m: member_ports(m) for m in mem}, policy=dict(max_apps=cfg['max_apps'], default_days=cfg['default_days'], max_days=cfg['max_days'], warn_days=cfg['warn_days'])), 0o644)
+    saved_q = reg['meta'].get('notify_queue')
+    sent = notify(cfg, reg)
+    q0 = reg['meta'].get('notify_queue')
+    if sent and warn:   # 알림이 실제로 나간 뒤에만 «알림 완료» 로 기록한다(실패하면 다음 분에 다시 보낸다)
+        for n in warn:
+            reg['apps'][n]['warned'] = reg['apps'][n]['expires']
+        save_json(os.path.join(STATE, 'registry.json'), reg, 0o600)
+    elif q0 != saved_q:   # 대기열이 바뀌었으면(실패로 쌓였거나 전송돼 비워짐) 저장한다
+        save_json(os.path.join(STATE, 'registry.json'), reg, 0o600)
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

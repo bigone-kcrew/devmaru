@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""@@BRAND@@ member/runtime command dispatcher.
+
+Install this file root-owned and expose aliases by basename. It deliberately
+does not grant Docker or Caddy access; project commands use the member's own
+rootless socket and Caddy commands validate/queue manifests only.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+DB_HELPER = Path("/srv/@@PFX@@/admin-harness/bin/@@PFX@@-member-db-add")
+REQUEST_ROOT = Path("/srv/@@PFX@@/member-requests/caddy")
+PROJECT_ROOT = Path("/home")
+FORBIDDEN = re.compile(r"(?im)^\s*(privileged|network_mode\s*:\s*host|pid\s*:\s*host|ipc\s*:\s*host|cap_add|devices)\s*[:=]|/var/run/docker.sock|/etc/caddy")
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def root_only() -> None:
+    if os.geteuid() != 0:
+        die("run as root: sudo <command> ...")
+
+
+def user_info(user: str) -> tuple[int, Path]:
+    import pwd
+    try:
+        entry = pwd.getpwnam(user)
+    except KeyError:
+        die(f"unknown user: {user}")
+    return entry.pw_uid, Path(entry.pw_dir)
+
+
+def run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, check=check, text=True, capture_output=capture)
+
+
+def psql(query: str) -> str:
+    result = run(["docker", "exec", "postgres", "psql", "-U", "postgres", "-tAc", query], capture=True)
+    return result.stdout.strip()
+
+
+def member_status(args: list[str]) -> None:
+    root_only()
+    if len(args) != 1:
+        die("usage: @@PFX@@-member-status <username>", 2)
+    user = args[0]
+    uid, home = user_info(user)
+    db = f"{user}_db"
+    role = psql(f"select count(*) from pg_roles where rolname='{user}'")
+    database = psql(f"select count(*) from pg_database where datname='{db}'")
+    print(f"member={user} uid={uid} home={home}")
+    print(f"postgres_role={'present' if role == '1' else 'missing'} db={db}={'present' if database == '1' else 'missing'}")
+    rootless_status([user])
+
+
+def rootless_status(args: list[str]) -> None:
+    root_only()
+    if len(args) != 1:
+        die("usage: @@PFX@@-member-rootless-status <username>", 2)
+    user = args[0]
+    uid, home = user_info(user)
+    socket = Path(f"/run/user/{uid}/docker.sock")
+    data = Path(f"/srv/@@PFX@@/nvme/members/{user}/docker")
+    print(f"member={user} uid={uid}")
+    print(f"data_root={data} exists={'yes' if data.exists() else 'no'}")
+    print(f"socket={socket} exists={'yes' if socket.exists() else 'no'}")
+    if shutil.which("loginctl"):
+        run(["loginctl", "show-user", user, "-p", "Linger"], check=False)
+    if socket.exists():
+        result = run(["runuser", "-u", user, "--", "env", f"HOME={home}", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"DOCKER_HOST=unix://{socket}", "docker", "info", "--format", "{{.Driver}} {{.ServerVersion}}"], check=False, capture=True)
+        print(result.stdout.strip() or result.stderr.strip())
+
+
+def rootless_disable(args: list[str]) -> None:
+    root_only()
+    if len(args) != 2 or args[1] != "--yes":
+        die("usage: @@PFX@@-member-rootless-disable <username> --yes", 2)
+    user = args[0]
+    uid, _ = user_info(user)
+    run(["systemctl", "--user", "-M", f"{user}@", "disable", "--now", "docker.service"], check=False)
+    print(f"rootless Docker disabled for {user}; data was not removed")
+
+
+def project_command(name: str, args: list[str]) -> None:
+    if len(args) != 2:
+        die(f"usage: {name} <username> <project>", 2)
+    user, project = args
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", project):
+        die("invalid project name")
+    uid, home = user_info(user)
+    if os.geteuid() != 0 and os.geteuid() != uid:
+        die("a member may operate only its own project")
+    # 🔴 2026-09-30: home(=/etc/passwd 의 pw_dir)은 SSD 다. 호스트 레벨(rootless
+    # docker 오케스트레이션)에서 도는 함수라 컨테이너의 /workspace 가 안 보인다 —
+    # 호스트의 실제 HDD 경로를 직접 쓴다(컨테이너 안에서 /workspace 로 보이는 곳).
+    root = Path(f"/srv/@@PFX@@/users/{user}") / "workspace" / "projects" / project
+    compose = root / "compose.member.yml"
+    if not root.is_dir() or not compose.is_file():
+        die(f"missing project or compose.member.yml: {root}")
+    text = compose.read_text(errors="replace")
+    if FORBIDDEN.search(text):
+        die("project contract rejects privileged/host access/docker socket settings")
+    socket = f"unix:///run/user/{uid}/docker.sock"
+    env = ["env", f"HOME={home}", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"DOCKER_HOST={socket}"]
+    # A member invoking their own command cannot use runuser (it requires
+    # root).  Root administration may still target a member explicitly.
+    if os.geteuid() == uid:
+        cmd = env + ["docker", "compose", "-f", str(compose)]
+    else:
+        cmd = ["runuser", "-u", user, "--"] + env + ["docker", "compose", "-f", str(compose)]
+    action = {"@@PFX@@-project-build": "build", "@@PFX@@-project-up": "up", "@@PFX@@-project-down": "down", "@@PFX@@-project-status": "ps", "@@PFX@@-project-logs": "logs"}[name]
+    if action == "up":
+        cmd += ["up", "-d"]
+    elif action == "down":
+        cmd += ["down"]
+    elif action == "build":
+        cmd += ["build"]
+    elif action == "logs":
+        cmd += ["logs", "--no-color", "--tail=100"]
+    else:
+        cmd += ["ps"]
+    run(cmd)
+
+
+def load_manifest(path: Path) -> dict:
+    if yaml is None:
+        die("PyYAML is required for Caddy manifest validation")
+    if not path.is_file():
+        die(f"manifest not found: {path}")
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as exc:
+        die(f"invalid YAML: {exc}")
+    if not isinstance(data, dict):
+        die("manifest must be a YAML object")
+    required = ("version", "request_id", "owner", "project", "hostname", "path", "upstream", "auth", "expires_at", "reason")
+    missing = [key for key in required if not data.get(key)]
+    if missing:
+        die("missing fields: " + ", ".join(missing))
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", str(data["request_id"])):
+        die("invalid request_id")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", str(data["owner"])):
+        die("invalid owner")
+    if not str(data["path"]).startswith(f"/member/{data['owner']}/"):
+        die("path must begin with /member/<owner>/")
+    if not re.fullmatch(r"https?://127\.0\.0\.1:[0-9]{2,5}", str(data["upstream"])):
+        die("upstream must be an http(s) loopback address")
+    try:
+        expiry = dt.date.fromisoformat(str(data["expires_at"]))
+    except ValueError:
+        die("expires_at must be YYYY-MM-DD")
+    if expiry <= dt.date.today():
+        die("expires_at must be in the future")
+    if any(re.search(r"(?i)(token|secret|password|private.?key)", str(value)) for value in data.values()):
+        die("manifest must not contain secret-like field names or values")
+    return data
+
+
+def caddy_request(args: list[str]) -> None:
+    if len(args) not in (2, 3) or args[0] not in ("validate", "submit"):
+        die("usage: @@PFX@@-caddy-request validate|submit <manifest>", 2)
+    action, raw = args[0], Path(args[1])
+    data = load_manifest(raw)
+    print(json.dumps({"valid": True, "request_id": data["request_id"], "owner": data["owner"], "hostname": data["hostname"], "path": data["path"]}, ensure_ascii=False))
+    if action == "submit":
+        dest = REQUEST_ROOT / "pending"
+        if not dest.is_dir():
+            die(f"request queue is not provisioned: {dest}")
+        out = dest / f"{data['request_id']}.yaml"
+        if out.exists():
+            die(f"request already exists: {out}")
+        shutil.copyfile(raw, out)
+        os.chmod(out, 0o640)
+        print(f"submitted={out}")
+
+
+def caddy_approve(args: list[str]) -> None:
+    root_only()
+    if len(args) not in (2, 3) or args[1] not in ("--plan", "--apply"):
+        die("usage: sudo @@PFX@@-caddy-approve <request_id> --plan|--apply", 2)
+    request_id, mode = args[0], args[1]
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", request_id):
+        die("invalid request_id")
+    path = REQUEST_ROOT / "pending" / f"{request_id}.yaml"
+    data = load_manifest(path)
+    print(f"request={request_id} mode={mode}")
+    print(f"would route {data['hostname']}{data['path']} -> {data['upstream']}")
+    if mode == "--plan":
+        print("PLAN ONLY: no Caddyfile or service state changed")
+        return
+    die("Caddy import/reload gate is not installed; --apply is intentionally blocked")
+
+
+def main() -> None:
+    name = Path(sys.argv[0]).name
+    args = sys.argv[1:]
+    if name == "@@PFX@@-member-status":
+        member_status(args)
+    elif name == "@@PFX@@-member-rootless-status":
+        rootless_status(args)
+    elif name == "@@PFX@@-member-rootless-disable":
+        rootless_disable(args)
+    elif name in {"@@PFX@@-project-build", "@@PFX@@-project-up", "@@PFX@@-project-down", "@@PFX@@-project-status", "@@PFX@@-project-logs"}:
+        project_command(name, args)
+    elif name == "@@PFX@@-caddy-request":
+        caddy_request(args)
+    elif name == "@@PFX@@-caddy-approve":
+        caddy_approve(args)
+    else:
+        die(f"unknown command alias: {name}", 2)
+
+
+if __name__ == "__main__":
+    main()

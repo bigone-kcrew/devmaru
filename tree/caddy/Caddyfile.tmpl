@@ -1,0 +1,86 @@
+# @@BRAND@@ Caddy — 설치기가 이 파일 뒤에 선택한 모듈(caddy/modules/*.caddy)을 이어 붙여 /etc/caddy/Caddyfile 을 만든다.
+# 인증서는 호스트마다 Caddy 가 HTTP-01 로 받는다(와일드카드 없음). DNS A 레코드가 이 서버를 가리켜야 한다.
+(access_log) {
+	log {
+		output file /var/log/caddy/access.log {
+			mode 644
+			roll_size 50MiB
+			roll_keep 10
+			roll_keep_for 720h
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				request>uri regexp \?.* ""
+				resp_headers>Set-Cookie delete
+				resp_headers>Location delete
+			}
+		}
+	}
+}
+
+# 국가·대역 제한 스니펫(geo_allow) — 기본은 제한 없음. 멤버 사이트·Paseo 블록이 import 한다. 제한하려면 이 파일에 remote_ip 규칙을 넣는다.
+import /etc/caddy/geo-allow.caddy
+
+@@DOMAIN@@ {
+	import access_log
+	handle_path /assets/* {
+		root * /srv/@@PFX@@/public/assets
+		file_server
+	}
+	respond "@@BRAND@@ Caddy OK" 200
+}
+
+@@PORTAL_HOST@@ {
+	import access_log
+	# /ops 는 관리자 대역만(site.env 의 ADMIN_CIDRS)
+	@ops_denied {
+		path /ops /ops/*
+		not remote_ip @@ADMIN_CIDRS@@
+	}
+	handle @ops_denied {
+		respond "Forbidden" 403
+	}
+	@ops_no_slash path /ops
+	redir @ops_no_slash /ops/ 308
+
+	handle_path /ops/* {
+		root * /srv/@@PFX@@/admin-ops/site
+		header {
+			Cache-Control "no-store"
+			X-Robots-Tag "noindex, nofollow, noarchive"
+		}
+		file_server
+	}
+
+	@skills_no_slash path /skills
+	redir @skills_no_slash /skills/ 308
+	handle_path /skills/* {
+		root * /srv/@@PFX@@/public/skills
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+
+	@tools_no_slash path /tools
+	redir @tools_no_slash /tools/ 308
+	handle_path /tools/* {
+		root * /srv/@@PFX@@/public/tools
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+
+	# 공용 정적 프로젝트(@@PFX@@-site-shared-caddy 가 만든다) — 포털보다 먼저 맞춘다
+	import /etc/caddy/@@PFX@@-shared.caddy
+
+	handle {
+		root * /srv/@@PFX@@/public/portal
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+}
+
+# 멤버·프로젝트별 블록(생성기가 만든다)
+import /etc/caddy/members.d/*.caddy
+import /etc/caddy/sites.d/*.caddy
+import /etc/caddy/apps.d/*.caddy

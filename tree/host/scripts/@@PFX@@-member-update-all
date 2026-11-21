@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/opt/@@PFX@@/config/dev-container.env"
+CONTAINER_CREATE="/opt/@@PFX@@/scripts/@@PFX@@-dev-container-create"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-member-update-all [--check]"
+  exit 1
+fi
+
+MODE="update"
+
+if [[ $# -gt 1 ]]; then
+  echo "Usage: @@PFX@@-member-update-all [--check]"
+  exit 1
+fi
+
+if [[ $# -eq 1 ]]; then
+  if [[ "$1" == "--check" ]]; then
+    MODE="check"
+  else
+    echo "Usage: @@PFX@@-member-update-all [--check]"
+    exit 1
+  fi
+fi
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "ERROR: config file not found or unreadable: $CONFIG_FILE"
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+required_vars=(
+  GOLDEN_IMAGE
+  USER_ROOT_BASE
+)
+
+for var in "${required_vars[@]}"; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "ERROR: required config variable is missing: $var"
+    exit 1
+  fi
+done
+
+if [[ ! -x "$CONTAINER_CREATE" ]]; then
+  echo "ERROR: container creator not found or not executable: $CONTAINER_CREATE"
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: Docker daemon is not available"
+  exit 1
+fi
+
+if ! docker image inspect "$GOLDEN_IMAGE" >/dev/null 2>&1; then
+  echo "ERROR: Golden Image not found: $GOLDEN_IMAGE"
+  exit 1
+fi
+
+if [[ ! -d "$USER_ROOT_BASE" ]]; then
+  echo "ERROR: user root does not exist: $USER_ROOT_BASE"
+  exit 1
+fi
+
+GOLDEN_ID="$(docker image inspect "$GOLDEN_IMAGE" --format '{{.Id}}')"
+
+is_excluded_user() {
+  local username="$1"
+  local excluded_user
+
+  for excluded_user in ${UPDATE_EXCLUDE_USERS:-}; do
+    if [[ "$username" == "$excluded_user" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+declare -a MEMBERS=()
+declare -a OUTDATED_USERS=()
+
+TOTAL=0
+READY=0
+BUSY=0
+MISSING=0
+CURRENT=0
+OUTDATED=0
+
+echo "=============================================="
+echo " @@BRAND@@ Golden Image Update Preflight"
+echo "=============================================="
+echo
+echo "Target image:"
+echo "  $GOLDEN_IMAGE"
+echo "  $GOLDEN_ID"
+echo
+
+printf '%-18s %-18s %-7s %-9s %-10s %s\n' \
+  "USER" "CONTAINER" "TMUX" "STATE" "IMAGE" "RESULT"
+
+printf '%-18s %-18s %-7s %-9s %-10s %s\n' \
+  "------------------" \
+  "------------------" \
+  "-------" \
+  "---------" \
+  "----------" \
+  "------"
+
+WANT_MEMBERS_MOUNTS="$( . /opt/@@PFX@@/scripts/@@PFX@@-access-lib.sh; acc_load; if [[ $WORKSPACE_OTHERS = read ]]; then echo $(( $(acc_members | wc -l) - 1 )); else echo 0; fi )"
+
+shopt -s nullglob
+
+for user_path in "$USER_ROOT_BASE"/*; do
+  [[ -d "$user_path" ]] || continue
+
+  USERNAME="$(basename "$user_path")"
+
+  if is_excluded_user "$USERNAME"; then
+    continue
+  fi
+
+  if ! id "$USERNAME" >/dev/null 2>&1; then
+    continue
+  fi
+
+  MEMBERS+=("$USERNAME")
+  TOTAL=$((TOTAL + 1))
+
+  CONTAINER_NAME="dev-${USERNAME}"
+
+  if ! docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    printf '%-18s %-18s %-7s %-9s %-10s %s\n' \
+      "$USERNAME" "$CONTAINER_NAME" "-" "MISSING" "-" "NO CONTAINER"
+
+    MISSING=$((MISSING + 1))
+    continue
+  fi
+
+  STATE="$(docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}')"
+  IMAGE_ID="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}')"
+
+  HAVE_MEMBERS_MOUNTS="$(docker container inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$CONTAINER_NAME" | grep -c '^/members/' || true)"
+  if [[ "$IMAGE_ID" == "$GOLDEN_ID" && "$HAVE_MEMBERS_MOUNTS" != "$WANT_MEMBERS_MOUNTS" ]]; then
+    IMAGE_STATUS="MOUNTS"
+    OUTDATED=$((OUTDATED + 1))
+    OUTDATED_USERS+=("$USERNAME")
+  elif [[ "$IMAGE_ID" == "$GOLDEN_ID" ]]; then
+    IMAGE_STATUS="CURRENT"
+    CURRENT=$((CURRENT + 1))
+  else
+    IMAGE_STATUS="OLD"
+    OUTDATED=$((OUTDATED + 1))
+    OUTDATED_USERS+=("$USERNAME")
+  fi
+
+  TMUX_COUNT=0
+
+  if [[ "$STATE" == "running" ]]; then
+    USER_UID="$(id -u "$USERNAME")"
+    USER_GID="$(id -g "$USERNAME")"
+
+    TMUX_OUTPUT="$(
+      docker exec "$CONTAINER_NAME" \
+        setpriv \
+        --reuid="$USER_UID" \
+        --regid="$USER_GID" \
+        --init-groups \
+        -- env \
+        HOME="/home/$USERNAME" \
+        USER="$USERNAME" \
+        LOGNAME="$USERNAME" \
+        tmux list-sessions 2>/dev/null || true
+    )"
+
+    if [[ -n "$TMUX_OUTPUT" ]]; then
+      TMUX_COUNT="$(
+        printf '%s\n' "$TMUX_OUTPUT" \
+          | sed '/^[[:space:]]*$/d' \
+          | wc -l
+      )"
+    fi
+  fi
+
+  if (( TMUX_COUNT > 0 )); then
+    RESULT="BUSY"
+    BUSY=$((BUSY + 1))
+  else
+    RESULT="READY"
+    READY=$((READY + 1))
+  fi
+
+  printf '%-18s %-18s %-7s %-9s %-10s %s\n' \
+    "$USERNAME" \
+    "$CONTAINER_NAME" \
+    "$TMUX_COUNT" \
+    "$STATE" \
+    "$IMAGE_STATUS" \
+    "$RESULT"
+done
+
+echo
+echo "Summary:"
+echo "  members:   $TOTAL"
+echo "  ready:     $READY"
+echo "  busy:      $BUSY"
+echo "  missing:   $MISSING"
+echo "  current:   $CURRENT"
+echo "  outdated:  $OUTDATED"
+echo
+
+if (( BUSY > 0 )); then
+  echo "RESULT: BLOCKED"
+  echo "One or more members have active tmux sessions."
+  echo "No containers will be changed."
+
+  if [[ "$MODE" == "update" ]]; then
+    exit 1
+  fi
+
+  exit 0
+fi
+
+if (( MISSING > 0 )); then
+  echo "RESULT: REVIEW"
+  echo "One or more members are missing dev containers."
+  echo "No containers will be changed."
+
+  if [[ "$MODE" == "update" ]]; then
+    exit 1
+  fi
+
+  exit 0
+fi
+
+echo "RESULT: READY"
+echo "All member containers are safe for Golden Image update."
+
+if [[ "$MODE" == "check" ]]; then
+  exit 0
+fi
+
+echo
+echo "=============================================="
+echo " @@BRAND@@ Golden Image Update"
+echo "=============================================="
+
+if (( TOTAL == 0 )); then
+  echo
+  echo "No member accounts found."
+  echo "Nothing to update."
+  exit 0
+fi
+
+if (( OUTDATED == 0 )); then
+  echo
+  echo "All member containers already use:"
+  echo "  $GOLDEN_IMAGE"
+  echo
+  echo "Nothing to update."
+  exit 0
+fi
+
+echo
+echo "Updating $OUTDATED container(s)."
+echo "Linux accounts, home directories and workspaces will be preserved."
+echo
+
+UPDATED=0
+
+for USERNAME in "${OUTDATED_USERS[@]}"; do
+  CONTAINER_NAME="dev-${USERNAME}"
+
+  echo "----------------------------------------------"
+  echo "Updating: $USERNAME"
+  echo "Container: $CONTAINER_NAME"
+
+  OLD_IMAGE="$(
+    docker inspect "$CONTAINER_NAME" \
+      --format '{{.Config.Image}}'
+  )"
+
+  OLD_IMAGE_ID="$(
+    docker inspect "$CONTAINER_NAME" \
+      --format '{{.Image}}'
+  )"
+
+  echo "Old image:"
+  echo "  $OLD_IMAGE"
+  echo "  $OLD_IMAGE_ID"
+
+  echo
+  echo
+echo "[0/5] Prepare agent configuration..."
+
+if ! /opt/@@PFX@@/scripts/@@PFX@@-agent-config-provision "$USERNAME"; then
+  echo "ERROR: agent config provisioning failed for $USERNAME"
+  echo "Existing container has not been removed."
+  exit 1
+fi
+
+install -d   -o "$USERNAME"   -g "$USERNAME"   -m 0750   "/home/$USERNAME/.@@PFX@@"   "/home/$USERNAME/.@@PFX@@/agent-config"
+
+if ! /opt/@@PFX@@/scripts/@@PFX@@-agent-config-link "$USERNAME"; then
+  echo "ERROR: agent config link preparation failed for $USERNAME"
+  echo "Existing container has not been removed."
+  exit 1
+fi
+
+echo "OK"
+
+echo "[1/5] Remove old container..."
+
+  if ! docker rm -f "$CONTAINER_NAME" >/dev/null; then
+    echo "ERROR: failed to remove $CONTAINER_NAME"
+    exit 1
+  fi
+
+  echo "OK"
+
+  echo
+  echo "[2/5] Create container from Golden Image..."
+
+  if ! "$CONTAINER_CREATE" "$USERNAME"; then
+    echo
+    echo "ERROR: container creation failed for $USERNAME"
+    echo "The Linux account, home and workspace were preserved."
+    echo "Update stopped before processing additional members."
+    exit 1
+  fi
+
+  echo "OK"
+
+  echo
+  echo "[3/5] Start container..."
+
+  if ! docker start "$CONTAINER_NAME" >/dev/null; then
+    echo "ERROR: failed to start $CONTAINER_NAME"
+    echo "Update stopped before processing additional members."
+    exit 1
+  fi
+
+  echo "OK"
+
+  echo
+  echo "[4/5] Wait for member environment..."
+
+  HOST_UID="$(id -u "$USERNAME")"
+  HOST_GID="$(id -g "$USERNAME")"
+
+  READY_ENV=0
+
+  for i in $(seq 1 45); do
+    if docker exec "$CONTAINER_NAME" \
+      id "$USERNAME" >/dev/null 2>&1; then
+
+      READY_ENV=1
+      break
+    fi
+
+    sleep 2
+  done
+
+  if [[ "$READY_ENV" != "1" ]]; then
+    echo "ERROR: member environment did not initialize: $USERNAME"
+    echo "Update stopped before processing additional members."
+    exit 1
+  fi
+
+  echo "OK"
+
+  /usr/local/sbin/@@PFX@@-paseo-caddy-sync || echo "WARNING: Paseo Caddy IP sync failed (run: sudo @@PFX@@-paseo-caddy-sync)"
+
+  echo
+  echo "[5/5] Verify Golden Image and bootstrap..."
+
+  NEW_IMAGE_ID="$(
+    docker inspect "$CONTAINER_NAME" \
+      --format '{{.Image}}'
+  )"
+
+  if [[ "$NEW_IMAGE_ID" != "$GOLDEN_ID" ]]; then
+    echo "ERROR: unexpected image ID for $CONTAINER_NAME"
+    echo "Expected: $GOLDEN_ID"
+    echo "Actual:   $NEW_IMAGE_ID"
+    exit 1
+  fi
+
+if ! docker exec "$CONTAINER_NAME" \
+setpriv \
+--reuid="$HOST_UID" \
+--regid="$HOST_GID" \
+--init-groups \
+-- env \
+HOME="/home/$USERNAME" \
+USER="$USERNAME" \
+LOGNAME="$USERNAME" \
+/usr/local/bin/@@PFX@@-user-bootstrap
+then
+echo "ERROR: user bootstrap failed for $USERNAME"
+echo "Update stopped before processing additional members."
+exit 1
+fi
+
+  if ! docker exec "$CONTAINER_NAME" \
+    setpriv \
+    --reuid="$HOST_UID" \
+    --regid="$HOST_GID" \
+    --init-groups \
+    -- env \
+    HOME="/home/$USERNAME" \
+    USER="$USERNAME" \
+    LOGNAME="$USERNAME" \
+    bash -lc '
+      test -d "$HOME/.claude/skills" &&
+      test -d "$HOME/.agents/skills" &&
+      test -f "$HOME/.@@PFX@@/agent-config/CLAUDE.md" &&
+test -f "$HOME/.@@PFX@@/agent-config/AGENTS.md" &&
+test -L "$HOME/.claude/CLAUDE.md" &&
+test -L "$HOME/.codex/AGENTS.md" &&
+test -f "$HOME/.claude/CLAUDE.md" &&
+test -f "$HOME/.codex/AGENTS.md" &&
+test -r /opt/@@PFX@@/api-catalog/data/catalog.json &&
+test -x /usr/local/bin/api-catalog-search &&
+command -v claude >/dev/null &&
+      command -v codex >/dev/null &&
+      command -v paseo >/dev/null &&
+      command -v kordoc-api >/dev/null
+    '
+  then
+    echo "ERROR: bootstrap verification failed for $USERNAME"
+    echo "Update stopped before processing additional members."
+    exit 1
+  fi
+
+  echo "OK"
+
+  UPDATED=$((UPDATED + 1))
+
+  echo
+  echo "$USERNAME: PASS"
+  echo
+done
+
+echo "=============================================="
+echo " Golden Image Update Complete"
+echo "=============================================="
+echo
+echo "Target:  $GOLDEN_IMAGE"
+echo "Updated: $UPDATED"
+echo "Members: $TOTAL"
+echo
+echo "Linux accounts: preserved"
+echo "Home data:      preserved"
+echo "Workspaces:     preserved"

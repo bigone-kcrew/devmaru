@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# @@BRAND@@ 회원 SSH 진입점 — sshd 의 ForceCommand 로만 실행된다(관리자 계정 제외, sshd/10-@@PFX@@.conf).
+# 회원이 ssh 로 무엇을 하든 호스트 셸이 아니라 자기 개발환경(dev-<ID>) 안에서 실행되게 한다.
+#   대화형 로그인        → 개발환경 셸
+#   ssh 회원@서버 '명령' → 개발환경 안에서 그 명령(scp·rsync·원격 편집기 서버도 같은 방식)
+#   sftp 하위 시스템     → 호스트의 sftp-server(파일 전송만, 명령 실행 없음·회원 권한 그대로)
+set -u
+M=/opt/@@PFX@@/scripts/@@PFX@@-member-shell
+c="${SSH_ORIGINAL_COMMAND:-}"
+case "$c" in
+  "") exec sudo -n "$M" ;;
+  /usr/lib/openssh/sftp-server|internal-sftp) exec /usr/lib/openssh/sftp-server ;;
+  *) exec sudo -n "$M" -c "$c" ;;
+esac

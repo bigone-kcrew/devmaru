@@ -1,0 +1,6 @@
+
+# 모듈: files (SFTPGo 웹)
+@@FILES_HOST@@ {
+	import access_log
+	reverse_proxy 127.0.0.1:8080
+}

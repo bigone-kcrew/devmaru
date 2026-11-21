@@ -1,0 +1,10 @@
+{
+  "name": "@@@PFX@@/crawl4ai-thin-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "@@BRAND@@ thin stdio MCP adapter for the central Crawl4AI gateway",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2"
+  }
+}

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# @@PFX@@-onboarding-seal <username>... — 온보딩 폴더의 페어링 링크 파일(pairing-url.txt · pairing.json · pairing.png)을 지운다.
+#   sudo @@PFX@@-onboarding-seal alice bob
+# 페어링 링크는 데몬 고정 값이라(재발급해도 동일) 파일을 지워도 링크 자체는 무효가 되지 않는다.
+# 필요하면 @@PFX@@-paseo-pair-create + @@PFX@@-paseo-pair-qr-create 가 같은 링크를 다시 만든다. README.md 는 남긴다.
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-onboarding-seal <username>..."
+  exit 1
+fi
+if [[ $# -lt 1 ]]; then
+  echo "Usage: @@PFX@@-onboarding-seal <username>..."
+  exit 1
+fi
+
+BASE=/srv/@@PFX@@/onboarding
+rc=0
+for USERNAME in "$@"; do
+  if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+    echo "SKIP  invalid username: $USERNAME"; rc=1; continue
+  fi
+  DIR="${BASE}/${USERNAME}"
+  if [[ ! -d "$DIR" || -L "$DIR" ]]; then
+    echo "SKIP  no onboarding directory: $DIR"; rc=1; continue
+  fi
+  removed=""
+  for f in pairing-url.txt pairing.json pairing.png; do
+    if [[ -e "$DIR/$f" || -L "$DIR/$f" ]]; then
+      rm -f -- "$DIR/$f"
+      removed+=" $f"
+    fi
+  done
+  echo "OK    ${USERNAME}: removed${removed:- (nothing — already sealed)}"
+done
+exit "$rc"

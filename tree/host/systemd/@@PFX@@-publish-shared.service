@@ -1,0 +1,30 @@
+[Unit]
+Description=@@BRAND@@ shared static publish sandbox (/shared/workspaces/*/publish → @@PORTAL_HOST@@/<프로젝트>/)
+After=network.target
+
+[Service]
+Type=simple
+User=caddy
+Group=caddy
+# 공유 폴더(그룹 읽기)를 읽기 위해서만 @@PFX@@ 그룹을 준다. 멤버 workspace 는 g::--- 라 이 그룹으로 읽히지 않는다
+SupplementaryGroups=@@PFX@@
+ExecStart=/usr/bin/caddy run --config /etc/@@PFX@@/publish/publish.Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+TemporaryFileSystem=/:ro
+BindReadOnlyPaths=/usr /etc/@@PFX@@/publish
+PrivateDevices=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=64M
+TasksMax=64
+RuntimeDirectory=@@PFX@@-publish/shared
+Environment=XDG_CONFIG_HOME=/run/@@PFX@@-publish/shared/c XDG_DATA_HOME=/run/@@PFX@@-publish/shared/d AI_PUBLISH_PORT=18199
+
+[Install]
+WantedBy=multi-user.target

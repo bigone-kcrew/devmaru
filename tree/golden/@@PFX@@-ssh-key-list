@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTH_KEYS="${HOME}/.ssh/authorized_keys"
+
+case "${1:-}" in
+    -h|--help)
+        echo "사용법: @@PFX@@-ssh-key-list"
+        echo
+        echo "현재 계정에 등록된 SSH 공개키를 보여줍니다."
+        exit 0
+        ;;
+esac
+
+if [[ $# -gt 0 ]]; then
+    echo "사용법: @@PFX@@-ssh-key-list" >&2
+    exit 1
+fi
+
+if [[ ! -f "${AUTH_KEYS}" ]]; then
+    echo "등록된 SSH 키가 없습니다."
+    exit 0
+fi
+
+N=0
+
+while IFS= read -r KEY || [[ -n "${KEY}" ]]; do
+    [[ -z "${KEY}" ]] && continue
+    [[ "${KEY}" == \#* ]] && continue
+
+    TMP="$(mktemp)"
+    printf '%s\n' "${KEY}" > "${TMP}"
+
+    if INFO="$(ssh-keygen -lf "${TMP}" -E sha256 2>/dev/null)"; then
+        N=$((N + 1))
+        TYPE="$(printf '%s\n' "${KEY}" | awk '{print $1}')"
+        COMMENT="$(printf '%s\n' "${KEY}" | cut -d' ' -f3-)"
+        FP="$(printf '%s\n' "${INFO}" | awk '{print $2}')"
+
+        printf '%d. %s  %s' "${N}" "${TYPE}" "${FP}"
+        if [[ -n "${COMMENT}" && "${COMMENT}" != "${KEY}" ]]; then
+            printf '  %s' "${COMMENT}"
+        fi
+        printf '\n'
+    fi
+
+    rm -f "${TMP}"
+done < "${AUTH_KEYS}"
+
+if [[ "${N}" -eq 0 ]]; then
+    echo "유효한 SSH 키가 등록되어 있지 않습니다."
+fi

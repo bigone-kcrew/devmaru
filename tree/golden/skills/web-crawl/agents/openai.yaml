@@ -1,0 +1,3 @@
+interface:
+  display_name: "Web Crawl"
+  short_description: "웹 페이지와 사이트 내부 링크를 수집해 Markdown으로 정리합니다. 인터넷 전체 검색과 브라우저 조작은 다른 도구를 씁니다."

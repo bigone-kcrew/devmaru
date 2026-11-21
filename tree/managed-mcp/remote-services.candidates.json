@@ -1,0 +1,6 @@
+{"candidates": [
+  {"name": "alio", "title": "ALIO 공공기관 정보 RAG (외부 공개 서비스)", "url": "https://mcp.k-union.kr/alio/mcp",
+   "token_help": "https://mcp.k-union.kr/alio/ 에서 GitHub 로그인 후 토큰을 신청하고, 받은 값을 ~/.@@PFX@@/alio-token (권한 600)에 저장"},
+  {"name": "kstartup", "title": "K-Startup 지원사업 아카이브 (외부 공개 서비스)", "url": "https://mcp.k-union.kr/kstartup/mcp",
+   "token_help": "https://kstartup.k-union.kr/portal 에서 GitHub 로그인 후 토큰을 신청하고, 받은 값을 ~/.@@PFX@@/kstartup-token (권한 600)에 저장"}
+]}

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# 멤버별 Paseo 직접 연결 Caddy 블록 관리 (root).  사용: @@PFX@@-paseo-caddy add|remove <멤버>
+#   <멤버>.paseo.@@DOMAIN@@  ->  dev-<멤버> 컨테이너:6767, 접속 허용 대역 스니펫 geo_allow 사용(기본은 제한 없음)
+# 실패하면 Caddyfile·멤버 파일을 원래대로 되돌린다. CADDY_DIR=<임시 폴더> DRY=1 이면 root 없이 검증만(reload 안 함).
+set -euo pipefail
+CADDY_DIR=${CADDY_DIR:-/etc/caddy}; BASE=paseo.@@DOMAIN@@; NET=@@PFX@@-dev-net
+HERE=$(cd "$(dirname "$0")" && pwd); DRY=${DRY:-0}
+act=${1:-}; m=${2:-}
+[[ $act == add || $act == remove ]] && [[ $m =~ ^[a-z][a-z0-9-]{1,30}$ ]] || { echo "사용: $0 add|remove <멤버>" >&2; exit 2; }
+F=$CADDY_DIR/Caddyfile; MD=$CADDY_DIR/members.d; MF=$MD/$m.caddy
+mkdir -p "$MD"
+B=$F.bak.pre-paseo-caddy-$(date +%Y%m%d-%H%M%S); cp -p "$F" "$B"
+ls -t "$F".bak.pre-paseo-caddy-* 2>/dev/null | tail -n +21 | xargs -r rm -f || true   # 백업은 최근 20개만(sync 가 실패를 반복해도 쌓이지 않게)
+had=0; [[ -f $MF ]] && { had=1; cp -p "$MF" "$MF.prev"; }
+undo(){ cp -p "$B" "$F"; if ((had)); then mv -f "$MF.prev" "$MF"; else rm -f "$MF"; fi; echo "실패 — 원복함(백업: $B)" >&2; exit 1; }
+trap 'undo' ERR
+if [[ $act == add ]]; then
+  ip=$(docker inspect -f "{{index .NetworkSettings.Networks \"$NET\" \"IPAddress\"}}" "dev-$m")
+  [[ $ip =~ ^[0-9.]+$ ]] || { echo "dev-$m 의 $NET IP 를 못 찾음" >&2; false; }
+  [[ -f $CADDY_DIR/geo-allow.caddy ]] || install -m 644 "$HERE/geo-allow.caddy" "$CADDY_DIR/geo-allow.caddy"
+  printf '%s\n' "# @@PFX@@-paseo-caddy: $m (자동 생성 — 직접 수정하지 말 것)" "$m.$BASE {" "	import access_log" "	import geo_allow" "	handle @allowed {" "		reverse_proxy $ip:6767" "	}" "	respond 403" "}" > "$MF.new"
+  mv -f "$MF.new" "$MF"; chmod 644 "$MF"
+else
+  rm -f "$MF"
+fi
+grep -qF "$CADDY_DIR/geo-allow.caddy" "$F" || printf '%s\n' "" "# Paseo 직접 연결(@@PFX@@-paseo-caddy) — 멤버별 서브도메인, 허용 IP 만 허용" "import $CADDY_DIR/geo-allow.caddy" "import $MD/*.caddy" >> "$F"
+V=$F
+if ((DRY)); then V=$F.dryvalid; sed "s#/var/log/caddy/#$CADDY_DIR/#g" "$F" > "$V"; fi  # @@ADMIN_USER@@ 은 운영 로그 파일을 못 열어 검증용 복사본만 로그 경로를 바꾼다
+out=$(XDG_DATA_HOME=${TMPDIR:-/tmp}/@@PFX@@-paseo-caddy-xdg caddy validate --config "$V" --adapter caddyfile 2>&1) || { echo "$out" | grep -iE "error|invalid" | head -5 >&2; false; }
+((DRY)) && rm -f "$V"
+if ((DRY)); then trap - ERR; rm -f "$MF.prev"; echo "DRY: 검증 통과, reload 안 함($act $m, $MF)"; exit 0; fi
+systemctl reload caddy
+trap - ERR; rm -f "$MF.prev"; echo "$act $m 완료 — $m.$BASE (백업: $B)"

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# members.d 블록의 reverse_proxy IP 가 dev-<멤버> 컨테이너의 현재 @@PFX@@-dev-net IP 와 다르면 @@PFX@@-paseo-caddy add 로 다시 쓴다(root).
+# 컨테이너 재시작·재생성으로 IP 가 바뀌면 직접 연결이 끊기거나 다른 컨테이너로 가는 것을 막는다. 변화가 없으면 아무것도 하지 않는다.
+# 사용: @@PFX@@-paseo-caddy-sync [--check]   (--check: 고칠 것만 출력, 쓰지 않음)   환경: CADDY_DIR(시험용)
+set -uo pipefail
+CADDY_DIR=${CADDY_DIR:-/etc/caddy}; NET=@@PFX@@-dev-net; BIN=${AI_PASEO_CADDY:-/usr/local/sbin/@@PFX@@-paseo-caddy}
+LOCK=${AI_PASEO_LOCK:-/run/@@PFX@@-paseo-caddy.lock}
+CHECK=0; [[ ${1:-} == --check ]] && CHECK=1
+rc=0; n=0
+shopt -s nullglob
+for f in "$CADDY_DIR"/members.d/*.caddy; do
+  m=$(basename "$f" .caddy)
+  ip=$(docker inspect -f "{{index .NetworkSettings.Networks \"$NET\" \"IPAddress\"}}" "dev-$m" 2>/dev/null || true)
+  [[ $ip =~ ^[0-9]+(\.[0-9]+){3}$ ]] || { if ((CHECK)) || [ -t 2 ]; then echo "건너뜀 $m: dev-$m 이 실행 중이 아니거나 $NET IP 없음" >&2; fi; continue; }   # 타이머(비대화형)에서는 조용히
+  cur=$(grep -o 'reverse_proxy [0-9.]*' "$f" | head -1 | cut -d' ' -f2)
+  [[ $cur == "$ip" ]] && continue
+  n=$((n+1)); echo "$m: $cur -> $ip"
+  ((CHECK)) && continue
+  # 락을 잡은 뒤 IP 를 다시 확인한다(다른 실행이 이미 고쳤으면 아무것도 안 함)
+  if flock "$LOCK" bash -c 'cur=$(grep -o "reverse_proxy [0-9.]*" "$1" | head -1 | cut -d" " -f2); [[ $cur == "$2" ]] && exit 0; exec "$3" add "$4"' _ "$f" "$ip" "$BIN" "$m" >/dev/null 2>&1; then
+    logger -t @@PFX@@-paseo-caddy-sync "$m: $cur -> $ip"
+  else
+    echo "실패 $m — 수동: sudo @@PFX@@-paseo-caddy add $m" >&2; rc=1
+  fi
+done
+((n==0)) && ((CHECK)) && echo "어긋난 블록 없음"
+exit $rc

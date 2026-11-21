@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SFTPGO_API="http://127.0.0.1:8080/api/v2"
+SFTPGO_KEY_FILE="/etc/@@PFX@@/secrets/sftpgo-provisioner-api-key"
+SAMBA_CONF="/srv/@@PFX@@/samba/smb.conf"
+USER_ROOT_BASE="/srv/@@PFX@@/users"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root"
+  exit 1
+fi
+
+if [[ $# -ne 3 || "$2" != "--password-file" ]]; then
+  echo "Usage: @@PFX@@-member-storage-provision <username> --password-file <file>"
+  exit 1
+fi
+
+USERNAME="$1"
+PASSWORD_FILE="$3"
+USER_ROOT="${USER_ROOT_BASE}/${USERNAME}"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username"
+  exit 1
+fi
+
+id "$USERNAME" >/dev/null 2>&1 || {
+  echo "ERROR: Linux user does not exist: $USERNAME"
+  exit 1
+}
+
+[[ -d "$USER_ROOT" ]] || {
+  echo "ERROR: user data directory missing: $USER_ROOT"
+  exit 1
+}
+
+NO_SFTPGO=0
+if [[ ! -r "$SFTPGO_KEY_FILE" ]] && ! grep -Eq "^MODULES=.*[ '\"]files[ '\"]" /etc/@@PFX@@/site.env 2>/dev/null; then
+  echo "SKIP: files 모듈이 없어 SFTP·웹 파일 계정은 만들지 않음"; NO_SFTPGO=1
+fi
+[[ $NO_SFTPGO -eq 1 || -r "$SFTPGO_KEY_FILE" ]] || {
+  echo "ERROR: SFTPGo API key unavailable"
+  exit 1
+}
+
+[[ -f "$PASSWORD_FILE" ]] || {
+  echo "ERROR: password file missing"
+  exit 1
+}
+
+[[ "$(stat -c '%U' "$PASSWORD_FILE")" == "root" ]] || {
+  echo "ERROR: password file must be owned by root"
+  exit 1
+}
+
+[[ "$(stat -c '%a' "$PASSWORD_FILE")" == "600" ]] || {
+  echo "ERROR: password file must have mode 600"
+  exit 1
+}
+
+IFS= read -r PASSWORD < "$PASSWORD_FILE"
+[[ -n "$PASSWORD" ]] || {
+  echo "ERROR: empty password"
+  exit 1
+}
+
+SFTPGO_KEY=""; [[ $NO_SFTPGO -eq 1 ]] || SFTPGO_KEY="$(cat "$SFTPGO_KEY_FILE")"
+SHARED_RO=0; grep -qx 'SHARED_DEFAULT=ro' /etc/@@PFX@@/site.env 2>/dev/null && SHARED_RO=1   # 접근 정책: ro 면 /shared 는 읽기만
+
+PAYLOAD="$(
+  jq -n \
+    --arg username "$USERNAME" \
+    --rawfile password "$PASSWORD_FILE" \
+    --arg home "/srv/users/$USERNAME" \
+    --arg sharedro "$SHARED_RO" \
+    '{
+      status: 1,
+      username: $username,
+      password: ($password | rtrimstr("\n")),
+      home_dir: $home,
+      permissions: ({"/": ["*"]} + (if $sharedro == "1" then {"/shared": ["list","download"]} else {} end)),
+      virtual_folders: [
+        {
+          id: 1,
+          name: "Shared",
+          mapped_path: "/srv/shared",
+          virtual_path: "/shared",
+          quota_size: -1,
+          quota_files: -1
+        }
+      ]
+    }'
+)"
+
+unset PASSWORD
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"; unset SFTPGO_KEY PAYLOAD' EXIT
+if [[ $NO_SFTPGO -ne 1 ]]; then
+
+HTTP="$(
+  curl -sS -o "$TMP" -w '%{http_code}' \
+    -H "X-SFTPGO-API-KEY: $SFTPGO_KEY" \
+    "$SFTPGO_API/users/$USERNAME"
+)"
+
+if [[ "$HTTP" == "200" ]]; then
+  HTTP="$(
+    curl -sS -o "$TMP" -w '%{http_code}' \
+      -X PUT \
+      -H "X-SFTPGO-API-KEY: $SFTPGO_KEY" \
+      -H 'Content-Type: application/json' \
+      -d "$PAYLOAD" \
+      "$SFTPGO_API/users/$USERNAME"
+  )"
+
+  [[ "$HTTP" == "200" ]] || {
+    echo "ERROR: SFTPGo update failed HTTP=$HTTP"
+    exit 1
+  }
+
+  echo "PASS: SFTPGo user reconciled"
+elif [[ "$HTTP" == "404" ]]; then
+  HTTP="$(
+    curl -sS -o "$TMP" -w '%{http_code}' \
+      -X POST \
+      -H "X-SFTPGO-API-KEY: $SFTPGO_KEY" \
+      -H 'Content-Type: application/json' \
+      -d "$PAYLOAD" \
+      "$SFTPGO_API/users"
+  )"
+
+  [[ "$HTTP" == "201" ]] || {
+    echo "ERROR: SFTPGo create failed HTTP=$HTTP"
+    exit 1
+  }
+
+  echo "PASS: SFTPGo user created"
+else
+  echo "ERROR: SFTPGo lookup failed HTTP=$HTTP"
+  exit 1
+fi
+fi   # NO_SFTPGO
+
+IFS= read -r FILES_PASSWORD < "$PASSWORD_FILE"
+
+if [[ ! -f "$SAMBA_CONF" ]] || ! command -v smbpasswd >/dev/null 2>&1; then
+  echo "SKIP: Samba 모듈이 없어 Windows 네트워크 드라이브 계정은 만들지 않음"
+elif pdbedit -s "$SAMBA_CONF" -L -u "$USERNAME" >/dev/null 2>&1; then
+  printf '%s\n%s\n' "$FILES_PASSWORD" "$FILES_PASSWORD" |
+    smbpasswd -s -c "$SAMBA_CONF" "$USERNAME" >/dev/null
+  echo "PASS: Samba user reconciled"
+else
+  printf '%s\n%s\n' "$FILES_PASSWORD" "$FILES_PASSWORD" |
+    smbpasswd -s -a -c "$SAMBA_CONF" "$USERNAME" >/dev/null
+  echo "PASS: Samba user created"
+fi
+
+unset FILES_PASSWORD
+
+echo "PASS: storage provisioning complete: $USERNAME"

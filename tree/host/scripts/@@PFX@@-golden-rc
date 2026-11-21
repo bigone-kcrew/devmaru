@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""@@PFX@@-golden-rc — Golden RC 를 만들고 검증한다
+
+  @@PFX@@-golden-rc                  현재 stable 에서 patch 를 올리고, @@PFX@@-golden-check 의
+                                «새것» 을 전부 채택안으로 잡아 계획을 보여준다
+  @@PFX@@-golden-rc 0.5.0            버전을 직접 준다
+  @@PFX@@-golden-rc --with vercel    ★major 를 «근거를 확인하고» 채택에 넣는다
+  @@PFX@@-golden-rc --without codex  이번 회차에서 뺀다
+  @@PFX@@-golden-rc --plan           계획만 보고 끝낸다 (아무것도 바꾸지 않는다)
+
+**여기서 멈춘다.** stable 태그도, 포인터도, rollout 도 하지 않는다 — "RC 검증 전에 stable pointer 를 바꾸지 않는다" 를 명령 경계로 지킨다. 승격은 사람이
+결과를 보고 따로 한다.
+
+자동으로 올릴 수 있는 것은 «핀 숫자만 바꾸면 되는» 것뿐이다. superpowers · archify ·
+agent-browser · ponytail · effective-html · ui-ux-pro-max 는 artifact 를 다시 vendoring
+해야 하므로 여기서 다루지 않고 «손으로» 로 보고한다.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+_OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler())   # 조회는 https 주소만(스킴을 확인한 뒤 연다)
+
+DEV = "/opt/@@PFX@@/images/dev"
+DOCKERFILE = DEV + "/Dockerfile"
+RELEASES = DEV + "/releases"
+POINTER = "/opt/@@PFX@@/config/dev-container.env"
+CANARY = "/srv/@@PFX@@/canary"
+CHECK = "/opt/@@PFX@@/scripts/@@PFX@@-golden-check"
+
+# 핀 숫자만 바꾸면 되는 것들 — 이름은 @@PFX@@-golden-check 의 표시이름과 맞춘다
+AUTO = {
+    "Claude Code":  ["CLAUDE_CODE_VERSION"],
+    "Codex":        ["CODEX_VERSION"],
+    "Paseo":        ["PASEO_VERSION"],
+    "Vercel":       ["VERCEL_VERSION"],
+    "pnpm":         ["PNPM_VERSION"],
+    "Playwright":   ["PLAYWRIGHT_VERSION"],
+    "Bun":          ["BUN_VERSION"],
+    "uv":           ["UV_VERSION"],
+    "Antigravity":  ["ANTIGRAVITY_VERSION", "ANTIGRAVITY_URL", "ANTIGRAVITY_SHA256"],
+}
+AGY_URL = ("https://github.com/google-antigravity/antigravity-cli/releases/download/"
+           "%s/agy_cli_linux_x64.tar.gz")
+
+
+T0 = time.time()
+sys.stdout.reconfigure(line_buffering=True)   # 파일로 돌릴 때 자식 출력과 순서가 뒤섞이지 않게
+STEPS = 5  # Dockerfile · 빌드 · self-test · canary · 회차 검증
+
+
+def step(n, title):
+    print("\n[%d/%d] %s  (경과 %d분 %02d초)" % (n, STEPS, title, *divmod(int(time.time() - T0), 60)))
+
+
+def build_stage(log):
+    """docker build 로그(plain)에서 마지막 stage 의 «끝난 단계/전체» 를 뽑는다 — @@PFX@@-golden-progress 와 같은 규칙"""
+    try:
+        txt = open(log, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    ids, fin, top, total = {}, set(), -1, 0
+    for ln in txt.splitlines():
+        m = re.match(r"#(\d+) \[stage-(\d+) +(\d+)/(\d+)\]", ln)
+        if m and int(m[2]) >= top:
+            top, total = int(m[2]), int(m[4]); ids[m[1]] = top
+        m = re.match(r"#(\d+) (DONE|CACHED)", ln)
+        if m:
+            fin.add(m[1])
+    if top < 0:
+        return 0, 0
+    return sum(1 for i, x in ids.items() if x == top and i in fin), total
+
+
+def die(msg, code=1):
+    print("ERROR: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(*cmd, **kw):
+    return subprocess.run(cmd, text=True, **kw)
+
+
+def cap(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def arg(name):
+    with open(DOCKERFILE, encoding="utf-8") as fh:
+        for line in fh:
+            m = re.match(r"ARG %s=(\S+)" % re.escape(name), line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def set_arg(text, name, value):
+    pat = re.compile(r"^ARG %s=\S+$" % re.escape(name), re.M)
+    if not pat.search(text):
+        die("Dockerfile 에 ARG %s 가 없다" % name)
+    return pat.sub("ARG %s=%s" % (name, value), text, count=1)
+
+
+def current_stable():
+    with open(POINTER, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("GOLDEN_IMAGE="):
+                return line.strip().split(":", 1)[1]
+    die("포인터에서 GOLDEN_IMAGE 를 읽지 못했다")
+
+
+def next_patch(ver):
+    a, b, c = ver.split(".")
+    return "%s.%s.%d" % (a, b, int(c) + 1)
+
+
+def run_check():
+    if not os.access(CHECK, os.X_OK):
+        die("@@PFX@@-golden-check 가 설치돼 있지 않다: %s" % CHECK)
+    out = cap(CHECK, "--json")
+    if not out:
+        die("@@PFX@@-golden-check --json 이 아무것도 내지 않았다")
+    return json.loads(out)["upstream"]
+
+
+def sha256_of(url):
+    with tempfile.NamedTemporaryFile(delete=False) as fh:
+        tmp = fh.name
+    try:
+        if not url.startswith("https://"):
+            raise ValueError("https 주소만 받는다: " + url)
+        with _OPENER.open(url, timeout=120) as resp, open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        h = hashlib.sha256()
+        with open(tmp, "rb") as fh:
+            for blk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(blk)
+        return h.hexdigest(), os.path.getsize(tmp)
+    finally:
+        os.unlink(tmp)
+
+
+def main():
+    argv = sys.argv[1:]
+    plan_only = "--plan" in argv
+    assume_yes = "--yes" in argv
+    with_, without = set(), set()
+    ver = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--plan", "--yes"):
+            pass
+        elif a == "--with" and i + 1 < len(argv):
+            i += 1; with_.add(argv[i].lower())
+        elif a == "--without" and i + 1 < len(argv):
+            i += 1; without.add(argv[i].lower())
+        elif re.fullmatch(r"\d+\.\d+\.\d+", a):
+            ver = a
+        else:
+            die("모르는 인자: %s" % a)
+        i += 1
+
+    stable = current_stable()
+    ver = ver or next_patch(stable)
+    rc = "@@PFX@@-dev:%s-rc1" % ver
+    print("Golden RC — %s -> %s" % (stable, ver))
+    if ver.split(".")[1] != stable.split(".")[1]:
+        print("  minor 올림이다. 기준에 맞는지 확인했는가 —")
+        print("  «회원이 행동을 바꿔야 하는가» 가 기준이다.")
+
+    rows = run_check()
+    adopt, manual, held = [], [], []
+    for r in rows:
+        nm, st = r["name"], r["state"]
+        key = nm.lower()
+        if st in ("same", "error"):
+            continue
+        if key in without:
+            held.append((r, "--without 로 제외")); continue
+        if st == "moved":
+            manual.append((r, "commit 핀 — 릴리스가 아니면 따라가지 않는다")); continue
+        if nm not in AUTO:
+            manual.append((r, "artifact 재vendoring 이 필요하다 — 이 명령이 다루지 않는다")); continue
+        if st == "major" and key not in with_:
+            held.append((r, "★major — 노트를 읽고 --with %s 로 명시한다" % key)); continue
+        adopt.append(r)
+
+    print("\n채택 (%d)" % len(adopt))
+    for r in adopt:
+        print("  %-16s %-12s -> %s%s" % (r["name"], r["pinned"], r["latest"],
+                                         "   ★major (--with 로 명시됨)" if r["state"] == "major" else ""))
+    if not adopt:
+        print("  (없음)")
+    if held:
+        print("\n보류 (%d)" % len(held))
+        for r, why in held:
+            print("  %-16s %-12s -> %-12s %s" % (r["name"], r["pinned"], r["latest"], why))
+    if manual:
+        print("\n손으로 (%d)" % len(manual))
+        for r, why in manual:
+            print("  %-16s %s" % (r["name"], why))
+
+    if not adopt and not plan_only:
+        print("\n채택할 것이 없다. 회차 전용 변경만 있다면 Dockerfile 을 직접 고치고")
+        print("이 명령 대신 빌드부터 수행한다.")
+    if plan_only:
+        return 0
+    if os.geteuid() != 0:
+        die("여기서부터 Dockerfile 과 canary 를 건드린다. root 로 실행한다: "
+            "sudo @@PFX@@-golden-rc [버전] [옵션]   (계획만 볼 때는 --plan)")
+    if not assume_yes:
+        try:
+            if input("\n이대로 진행할까? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("중단했다. 아무것도 바꾸지 않았다."); return 0
+        except EOFError:
+            die("확인 입력을 받을 수 없다. --yes 를 주거나 대화형으로 실행한다")
+
+    # ---- 6~8단계: artifact · checksum · Dockerfile -------------------
+    step(1, "artifact · checksum · Dockerfile")
+    text = open(DOCKERFILE, encoding="utf-8").read()
+    backup = None
+    for r in adopt:
+        nm, new = r["name"], r["latest"]
+        if nm == "Antigravity":
+            url = AGY_URL % new
+            print("\n  Antigravity %s 내려받아 SHA256 을 다시 낸다" % new)
+            digest, size = sha256_of(url)
+            print("    %d bytes · %s" % (size, digest))
+            text = set_arg(text, "ANTIGRAVITY_VERSION", new)
+            text = set_arg(text, "ANTIGRAVITY_URL", url)
+            text = set_arg(text, "ANTIGRAVITY_SHA256", digest)
+        else:
+            for a in AUTO[nm]:
+                text = set_arg(text, a, new)
+    if adopt:
+        backup = DOCKERFILE + ".pre-%s" % ver
+        shutil.copy2(DOCKERFILE, backup)
+        open(DOCKERFILE, "w", encoding="utf-8").write(text)
+        print("\n  Dockerfile 갱신 (되돌리려면 %s)" % backup)
+
+    # ---- 9단계: RC build --------------------------------------------
+    log = "/tmp/build-%s-rc1.log" % ver
+    step(2, "RC 빌드 — %s  (로그 %s)" % (rc, log))
+    if os.path.exists(DEV + "/fetch-upstream.sh"):
+        if sh("bash", "./fetch-upstream.sh", cwd=DEV).returncode != 0:
+            die("업스트림 재료 내려받기 실패", 2)
+    with open(log, "w") as fh:
+        # --progress=plain: 단계 로그가 파일에 남아야 진행률을 읽을 수 있다
+        bp = subprocess.Popen(["docker", "build", "--progress=plain", "--build-arg", "INSTALL_VOICE_MODELS=" + os.environ.get("GOLDEN_VOICE", "0"), "-t", rc, "."],
+                              cwd=DEV, stdout=fh, stderr=subprocess.STDOUT, text=True)
+        last = None
+        while bp.poll() is None:
+            time.sleep(15)
+            cur = build_stage(log)
+            if cur and cur != last:
+                last = cur
+                print("    빌드 %d/%d 단계 완료 · 경과 %d분 %02d초" % (*cur, *divmod(int(time.time() - T0), 60)), flush=True)
+    p = bp
+    if p.returncode != 0:
+        print("  빌드 실패. 로그 끝:")
+        print(cap("tail", "-25", log))
+        die("RC 빌드 실패", 2)
+    print("  빌드 성공")
+
+    # 레이어 압축 해제가 끝나기 전에 docker run 을 던지면 전부 대기한다
+    sh("bash", "-lc", "while [ \"$(pgrep -x unpigz | wc -l)\" -ne 0 ]; do sleep 5; done")
+
+    # ---- 10단계: self-test ------------------------------------------
+    st = "/opt/@@PFX@@/scripts/@@PFX@@-golden-selftest"
+    if os.access(st, os.X_OK):
+        step(3, "self-test")
+        if sh(st, rc).returncode != 0:
+            die("self-test 실패", 3)
+    else:
+        print("\n  (@@PFX@@-golden-selftest 가 없어 건너뛴다)")
+
+    # ---- 11~12단계: canary ------------------------------------------
+    cr = "/opt/@@PFX@@/scripts/@@PFX@@-golden-canary"
+    if os.access(cr, os.X_OK):
+        step(4, "canary")
+        if sh(cr, rc, ver).returncode != 0:
+            die("canary 실패", 4)
+    else:
+        print("\n  (@@PFX@@-golden-canary 가 없어 건너뛴다)")
+
+    # ---- 회차 전용 검증 ---------------------------------------------
+    hook = "%s/%s.checks" % (RELEASES, ver)
+    if os.access(hook, os.X_OK):
+        step(5, "회차 전용 검증 — %s" % hook)
+        if sh(hook, rc).returncode != 0:
+            die("회차 전용 검증 실패", 5)
+    else:
+        print("\n  회차 전용 검증 파일이 없다: %s" % hook)
+        print("  이번 회차에서 «새로 물어야 할 것» 이 있다면 여기에 둔다.")
+        print("  스크립트는 시킨 것만 본다 — 2026-09-25 에 AGY 스킬이 여섯 회차 0개였던 이유다.")
+
+    print("\n  RC 준비 완료: %s" % rc)
+    print("  여기서 멈춘다. 승격은 결과를 보고 사람이 따로 한다.")
+    print("  승격 전에 이번 회차 변경 내용을 %s/%s.changes 에 적어 둔다(없으면 promote 가 멈춘다)." % (RELEASES, ver))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

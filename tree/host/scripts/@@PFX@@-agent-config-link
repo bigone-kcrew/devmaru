@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-agent-config-link <username>"
+  exit 1
+fi
+
+USERNAME="$1"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+if ! id "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: Linux user does not exist: $USERNAME"
+  exit 1
+fi
+
+USER_HOME="/home/${USERNAME}"
+SOURCE_DIR="${USER_HOME}/.@@PFX@@/agent-config"
+
+if [[ ! -d "$USER_HOME" || -L "$USER_HOME" ]]; then
+  echo "ERROR: invalid user home: $USER_HOME"
+  exit 1
+fi
+
+if [[ ! -d "$SOURCE_DIR" || -L "$SOURCE_DIR" ]]; then
+  echo "ERROR: invalid agent-config mount point: $SOURCE_DIR"
+  exit 1
+fi
+
+install -d -o "$USERNAME" -g "$USERNAME" -m 0700 \
+  "$USER_HOME/.claude" \
+  "$USER_HOME/.codex"
+
+link_one() {
+  local label="$1"
+  local target="$2"
+  local desired="$3"
+
+  if [[ -L "$target" ]]; then
+    current="$(readlink "$target")"
+
+    if [[ "$current" == "$desired" ]]; then
+      echo "KEEP   $label"
+      return 0
+    fi
+
+    echo "ERROR: existing symlink points elsewhere: $target -> $current"
+    return 1
+  fi
+
+  if [[ -e "$target" ]]; then
+    echo "SKIP   $label (existing user file)"
+    return 0
+  fi
+
+  ln -s "$desired" "$target"
+  chown -h "$USERNAME:$USERNAME" "$target"
+
+  echo "CREATE $label"
+}
+
+link_one \
+  "Claude global instructions" \
+  "$USER_HOME/.claude/CLAUDE.md" \
+  "../.@@PFX@@/agent-config/CLAUDE.md"
+
+link_one \
+  "Codex global instructions" \
+  "$USER_HOME/.codex/AGENTS.md" \
+  "../.@@PFX@@/agent-config/AGENTS.md"
+
+# Antigravity (agy): global rules are read from ~/.gemini/config/AGENTS.md. A failure here must not block container updates.
+GEMINI_DIR="$USER_HOME/.gemini"
+if [[ ! -L "$GEMINI_DIR" ]]; then
+  [[ -d "$GEMINI_DIR" ]] || install -d -o "$USERNAME" -g "$USERNAME" -m 0755 "$GEMINI_DIR"
+  [[ -d "$GEMINI_DIR/config" ]] || install -d -o "$USERNAME" -g "$USERNAME" -m 0700 "$GEMINI_DIR/config"
+  link_one \
+    "Antigravity global instructions" \
+    "$GEMINI_DIR/config/AGENTS.md" \
+    "../../.@@PFX@@/agent-config/AGENTS.md" || echo "WARN   Antigravity link skipped"
+else
+  echo "WARN   $GEMINI_DIR is a symlink - Antigravity link skipped"
+fi
+
+echo
+echo "Agent config links ready."
+echo "  Claude: $USER_HOME/.claude/CLAUDE.md"
+echo "  Codex:  $USER_HOME/.codex/AGENTS.md"

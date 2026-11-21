@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULTS_DIR="/opt/@@PFX@@/config/agent-defaults"
+USER_ROOT_BASE="/srv/@@PFX@@/users"
+AI_GROUP="@@PFX@@"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-agent-config-provision <username>"
+  exit 1
+fi
+
+USERNAME="$1"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+if ! id "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: Linux user does not exist: $USERNAME"
+  exit 1
+fi
+
+if ! getent group "$AI_GROUP" >/dev/null 2>&1; then
+  echo "ERROR: group does not exist: $AI_GROUP"
+  exit 1
+fi
+
+for file in CLAUDE.md AGENTS.md VERSION; do
+  if [[ ! -f "${DEFAULTS_DIR}/${file}" || -L "${DEFAULTS_DIR}/${file}" ]]; then
+    echo "ERROR: invalid canonical default: ${DEFAULTS_DIR}/${file}"
+    exit 1
+  fi
+done
+
+USER_ROOT="${USER_ROOT_BASE}/${USERNAME}"
+AGENT_CONFIG="${USER_ROOT}/agent-config"
+
+if [[ ! -d "$USER_ROOT" || -L "$USER_ROOT" ]]; then
+  echo "ERROR: invalid user data directory: $USER_ROOT"
+  exit 1
+fi
+
+if [[ -e "$AGENT_CONFIG" && ( ! -d "$AGENT_CONFIG" || -L "$AGENT_CONFIG" ) ]]; then
+  echo "ERROR: agent-config exists but is not a normal directory: $AGENT_CONFIG"
+  exit 1
+fi
+
+mkdir -p "$AGENT_CONFIG"
+chown "$USERNAME:$AI_GROUP" "$AGENT_CONFIG"
+chmod 2750 "$AGENT_CONFIG"
+
+setfacl \
+  -m u::rwx,u:1000:rwx,u:"$USERNAME":rwx,g::r-x,m::rwx,o::--- \
+  -m d:u::rwx,d:u:1000:rwx,d:u:"$USERNAME":rwx,d:g::r-x,d:m::rwx,d:o::--- \
+  "$AGENT_CONFIG"
+
+for file in CLAUDE.md AGENTS.md; do
+  src="${DEFAULTS_DIR}/${file}"
+  dst="${AGENT_CONFIG}/${file}"
+
+  if [[ -L "$dst" ]]; then
+    echo "ERROR: refusing existing symlink: $dst"
+    exit 1
+  fi
+
+  if [[ -e "$dst" ]]; then
+    if [[ ! -f "$dst" ]]; then
+      echo "ERROR: existing target is not a regular file: $dst"
+      exit 1
+    fi
+    echo "KEEP   $file"
+    continue
+  fi
+
+  install -o "$USERNAME" -g "$AI_GROUP" -m 0640 "$src" "$dst"
+
+  setfacl \
+    -m u::rw-,u:1000:rw-,u:"$USERNAME":rw-,g::r--,m::rw-,o::--- \
+    "$dst"
+
+  echo "CREATE $file"
+done
+
+VERSION="$(cat "${DEFAULTS_DIR}/VERSION")"
+
+echo
+echo "Agent config provisioned."
+echo "  user:    $USERNAME"
+echo "  path:    $AGENT_CONFIG"
+echo "  default: $VERSION"

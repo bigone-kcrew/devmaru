@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -u
+
+# 번들 경로·버전은 이미지에 들어 있는 번들(/opt/@@PFX@@/plugins/superpowers/v<버전>)에서 읽는다.
+# 이전에는 두 값이 스크립트에 박혀 있어 번들을 올릴 때마다 «bundle을 찾을 수 없습니다» 로 실패했다
+# (0.4.28: 번들 6.4.2 · 스크립트 v6.4.1/6.3.0 → 멤버 Claude 에서 Superpowers 가 로드되지 않음).
+PLUGIN_BASE="/opt/@@PFX@@/plugins/superpowers"
+if [[ -n "${@@PFX_UP@@_SUPERPOWERS_ROOT:-}" ]]; then
+    PLUGIN_ROOT="${@@PFX_UP@@_SUPERPOWERS_ROOT}"
+else
+    PLUGIN_ROOT="$(find "${PLUGIN_BASE}" -mindepth 1 -maxdepth 1 -type d -name 'v[0-9]*' 2>/dev/null | sort -V | tail -n 1)"
+fi
+MARKETPLACE_NAME="superpowers-dev"
+PLUGIN_ID="superpowers@superpowers-dev"
+PLUGIN_VERSION=""
+if [[ -n "${PLUGIN_ROOT}" && -f "${PLUGIN_ROOT}/.claude-plugin/plugin.json" ]]; then
+    PLUGIN_VERSION="$(jq -r '.version // empty' "${PLUGIN_ROOT}/.claude-plugin/plugin.json" 2>/dev/null)"
+fi
+
+STATE_DIR="${HOME}/.@@PFX@@/plugins"
+RESULT=0
+
+log() {
+    printf '[@@PFX@@-plugin-sync] %s\n' "$*"
+}
+
+warn() {
+    printf '[@@PFX@@-plugin-sync] 경고: %s\n' "$*" >&2
+}
+
+fail() {
+    printf '[@@PFX@@-plugin-sync] 오류: %s\n' "$*" >&2
+    RESULT=1
+}
+
+write_marker() {
+    local harness="$1"
+    local marker="${STATE_DIR}/superpowers-${harness}.json"
+    local tmp
+
+    mkdir -p "${STATE_DIR}" || return 1
+    tmp="$(mktemp "${STATE_DIR}/.superpowers-${harness}.XXXXXX")" || return 1
+
+    jq -n \
+        --arg harness "${harness}" \
+        --arg marketplace "${MARKETPLACE_NAME}" \
+        --arg plugin "${PLUGIN_ID}" \
+        --arg version "${PLUGIN_VERSION}" \
+        --arg root "${PLUGIN_ROOT}" \
+        '{
+            managedBy: "@@PFX@@",
+            harness: $harness,
+            marketplace: $marketplace,
+            plugin: $plugin,
+            version: $version,
+            root: $root
+        }' > "${tmp}" || {
+            rm -f "${tmp}"
+            return 1
+        }
+
+    chmod 0600 "${tmp}"
+    mv "${tmp}" "${marker}"
+}
+
+sync_claude() {
+    local marketplace_json
+    local marketplace_path
+    local plugin_json
+    local installed_version
+    local enabled
+
+    if ! command -v claude >/dev/null 2>&1; then
+        warn "Claude Code를 찾을 수 없어 건너뜁니다."
+        return 0
+    fi
+
+    if ! marketplace_json="$(claude plugin marketplace list --json 2>/dev/null)"; then
+        fail "Claude marketplace 설정을 읽을 수 없습니다."
+        return 1
+    fi
+
+    marketplace_path="$(
+        jq -r \
+            --arg name "${MARKETPLACE_NAME}" \
+            '[.[] | select(.name == $name)][0].path // empty' \
+            <<<"${marketplace_json}"
+    )"
+
+    if [[ -z "${marketplace_path}" ]]; then
+        log "Claude: 로컬 marketplace를 등록합니다."
+
+        if ! claude plugin marketplace add \
+            --scope user \
+            "${PLUGIN_ROOT}" >/dev/null 2>&1; then
+            fail "Claude: marketplace 등록에 실패했습니다."
+            return 1
+        fi
+
+    elif [[ "${marketplace_path}" != "${PLUGIN_ROOT}" ]]; then
+        # @@BRAND@@ 이 놓은 이전 번들 경로(/opt/@@PFX@@/plugins/superpowers/v*)만 새 번들로 옮긴다.
+        # 그 밖의 경로는 사용자 설정이므로 그대로 보존한다.
+        if [[ "${marketplace_path}" == "${PLUGIN_BASE}"/v* ]]; then
+            log "Claude: marketplace 경로를 '${marketplace_path}' 에서 '${PLUGIN_ROOT}' 로 옮깁니다."
+            if ! claude plugin marketplace remove "${MARKETPLACE_NAME}" >/dev/null 2>&1 \
+                || ! claude plugin marketplace add --scope user "${PLUGIN_ROOT}" >/dev/null 2>&1; then
+                fail "Claude: marketplace 경로 교정에 실패했습니다."
+                return 1
+            fi
+        else
+            warn "Claude: marketplace '${MARKETPLACE_NAME}'가 이미 '${marketplace_path}'를 가리키고 있습니다."
+            warn "Claude: 기존 사용자 설정을 보존하고 Superpowers 동기화를 건너뜁니다."
+            RESULT=1
+            return 1
+        fi
+    else
+        log "Claude: marketplace 설정이 이미 올바릅니다."
+    fi
+
+    if ! plugin_json="$(claude plugin list --json 2>/dev/null)"; then
+        fail "Claude plugin 설정을 읽을 수 없습니다."
+        return 1
+    fi
+
+    installed_version="$(
+        jq -r \
+            --arg id "${PLUGIN_ID}" \
+            '[.[] | select(.id == $id)][0].version // empty' \
+            <<<"${plugin_json}"
+    )"
+
+    enabled="$(
+        jq -r \
+            --arg id "${PLUGIN_ID}" \
+            '[.[] | select(.id == $id)][0].enabled // false' \
+            <<<"${plugin_json}"
+    )"
+
+    if [[ -z "${installed_version}" ]]; then
+        log "Claude: ${PLUGIN_ID}를 설치합니다."
+
+        if ! claude plugin install \
+            --scope user \
+            --yes \
+            "${PLUGIN_ID}" >/dev/null 2>&1; then
+            fail "Claude: plugin 설치에 실패했습니다."
+            return 1
+        fi
+
+    elif [[ "${installed_version}" != "${PLUGIN_VERSION}" ]]; then
+        # marketplace 는 위에서 @@BRAND@@ 번들로 맞춰졌으므로 이전 번들 버전 → 현재 번들로 갱신한다.
+        log "Claude: Superpowers ${installed_version} → ${PLUGIN_VERSION} 로 갱신합니다."
+        if ! claude plugin update "${PLUGIN_ID}" >/dev/null 2>&1; then
+            fail "Claude: plugin 갱신에 실패했습니다(설치 ${installed_version} 유지)."
+            return 1
+        fi
+    else
+        log "Claude: Superpowers ${PLUGIN_VERSION}가 이미 설치되어 있습니다."
+
+        if [[ "${enabled}" != "true" ]]; then
+            log "Claude: 사용자가 plugin을 비활성화한 상태이므로 그대로 유지합니다."
+        fi
+    fi
+
+    if ! write_marker "claude"; then
+        fail "Claude: @@BRAND@@ 관리 marker를 기록할 수 없습니다."
+        return 1
+    fi
+
+    return 0
+}
+
+sync_codex() {
+    local marketplace_json
+    local marketplace_path
+    local plugin_json
+    local installed_version
+    local enabled
+
+    if ! command -v codex >/dev/null 2>&1; then
+        warn "Codex CLI를 찾을 수 없어 건너뜁니다."
+        return 0
+    fi
+
+    if marketplace_json="$(codex plugin marketplace list --json 2>/dev/null)"; then
+        marketplace_path="$(
+            jq -r \
+                --arg name "${MARKETPLACE_NAME}" \
+                '[.marketplaces[]? | select(.name == $name)][0].root // empty' \
+                <<<"${marketplace_json}"
+        )"
+    else
+        # marketplace 원본 폴더가 사라지면(번들 버전이 바뀐 뒤) list 자체가 «failed to load marketplace» 로 실패한다.
+        # 그때는 config.toml 의 등록 경로를 직접 읽어 같은 규칙으로 교정한다.
+        marketplace_path="$(
+            awk -v name="${MARKETPLACE_NAME}" '
+                $0 == "[marketplaces." name "]" { f = 1; next }
+                /^\[/ { f = 0 }
+                f && /^source[ \t]*=/ { gsub(/^source[ \t]*=[ \t]*"|"[ \t]*$/, ""); print; exit }
+            ' "${CODEX_HOME:-${HOME}/.codex}/config.toml" 2>/dev/null
+        )"
+        if [[ -z "${marketplace_path}" ]]; then
+            fail "Codex marketplace 설정을 읽을 수 없습니다."
+            return 1
+        fi
+    fi
+
+    if [[ -z "${marketplace_path}" ]]; then
+        log "Codex: 로컬 marketplace를 등록합니다."
+
+        if ! codex plugin marketplace add \
+            "${PLUGIN_ROOT}" \
+            --json >/dev/null 2>&1; then
+            fail "Codex: marketplace 등록에 실패했습니다."
+            return 1
+        fi
+
+    elif [[ "${marketplace_path}" != "${PLUGIN_ROOT}" ]]; then
+        if [[ "${marketplace_path}" == "${PLUGIN_BASE}"/v* ]]; then
+            log "Codex: marketplace 경로를 '${marketplace_path}' 에서 '${PLUGIN_ROOT}' 로 옮깁니다."
+            if ! codex plugin marketplace remove "${MARKETPLACE_NAME}" >/dev/null 2>&1 \
+                || ! codex plugin marketplace add "${PLUGIN_ROOT}" --json >/dev/null 2>&1; then
+                fail "Codex: marketplace 경로 교정에 실패했습니다."
+                return 1
+            fi
+        else
+            warn "Codex: marketplace '${MARKETPLACE_NAME}'가 이미 '${marketplace_path}'를 가리키고 있습니다."
+            warn "Codex: 기존 사용자 설정을 보존하고 Superpowers 동기화를 건너뜁니다."
+            RESULT=1
+            return 1
+        fi
+    else
+        log "Codex: marketplace 설정이 이미 올바릅니다."
+    fi
+
+    if ! plugin_json="$(codex plugin list --json 2>/dev/null)"; then
+        fail "Codex plugin 설정을 읽을 수 없습니다."
+        return 1
+    fi
+
+    installed_version="$(
+        jq -r \
+            --arg id "${PLUGIN_ID}" \
+            '[.installed[]? | select(.pluginId == $id)][0].version // empty' \
+            <<<"${plugin_json}"
+    )"
+
+    enabled="$(
+        jq -r \
+            --arg id "${PLUGIN_ID}" \
+            '[.installed[]? | select(.pluginId == $id)][0].enabled // false' \
+            <<<"${plugin_json}"
+    )"
+
+    if [[ -z "${installed_version}" ]]; then
+        log "Codex: ${PLUGIN_ID}를 설치합니다."
+
+        if ! codex plugin add \
+            "${PLUGIN_ID}" \
+            --json >/dev/null 2>&1; then
+            fail "Codex: plugin 설치에 실패했습니다."
+            return 1
+        fi
+
+    elif [[ "${installed_version}" != "${PLUGIN_VERSION}" ]]; then
+        log "Codex: Superpowers ${installed_version} → ${PLUGIN_VERSION} 로 갱신합니다."
+        if ! codex plugin remove "${PLUGIN_ID}" >/dev/null 2>&1 \
+            || ! codex plugin add "${PLUGIN_ID}" --json >/dev/null 2>&1; then
+            fail "Codex: plugin 갱신에 실패했습니다."
+            return 1
+        fi
+    else
+        log "Codex: Superpowers ${PLUGIN_VERSION}가 이미 설치되어 있습니다."
+
+        if [[ "${enabled}" != "true" ]]; then
+            log "Codex: 사용자가 plugin을 비활성화한 상태이므로 그대로 유지합니다."
+        fi
+    fi
+
+    if ! write_marker "codex"; then
+        fail "Codex: @@BRAND@@ 관리 marker를 기록할 수 없습니다."
+        return 1
+    fi
+
+    return 0
+}
+
+if [[ -z "${PLUGIN_ROOT}" || ! -d "${PLUGIN_ROOT}" ]]; then
+    fail "Superpowers bundle을 찾을 수 없습니다: ${PLUGIN_ROOT:-${PLUGIN_BASE}/v*}"
+    exit "${RESULT}"
+fi
+
+if [[ -z "${PLUGIN_VERSION}" ]]; then
+    fail "Superpowers bundle 의 버전을 읽을 수 없습니다: ${PLUGIN_ROOT}/.claude-plugin/plugin.json"
+    exit "${RESULT}"
+fi
+
+if [[ ! -f "${PLUGIN_ROOT}/.claude-plugin/marketplace.json" ]]; then
+    fail "Claude marketplace manifest가 없습니다: ${PLUGIN_ROOT}"
+    exit "${RESULT}"
+fi
+
+if [[ ! -f "${PLUGIN_ROOT}/.agents/plugins/marketplace.json" ]]; then
+    fail "Codex marketplace manifest가 없습니다: ${PLUGIN_ROOT}"
+    exit "${RESULT}"
+fi
+
+sync_claude || true
+sync_codex || true
+
+exit "${RESULT}"

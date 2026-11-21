@@ -1,0 +1,35 @@
+services:
+  sftpgo:
+    image: drakkan/sftpgo:v2.7.6
+    container_name: sftpgo
+    restart: unless-stopped
+
+    group_add:
+      - "@@GID@@"
+
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "@@SFTP_BIND@@:2022:2022"
+
+    volumes:
+      - /srv/@@PFX@@/services/sftpgo/data:/srv/sftpgo
+      - /srv/@@PFX@@/users:/srv/users
+      - /srv/@@PFX@@/shared:/srv/shared
+
+    environment:
+      SFTPGO_SFTPD__BINDINGS__0__PORT: "2022"
+      SFTPGO_HTTPD__BINDINGS__0__PORT: "8080"
+      SFTPGO_HTTPD__BINDINGS__0__ADDRESS: "0.0.0.0"
+      SFTPGO_DATA_PROVIDER__DRIVER: "sqlite"
+      SFTPGO_DATA_PROVIDER__NAME: "/srv/sftpgo/sftpgo.db"
+      SFTPGO_DATA_PROVIDER__CREATE_DEFAULT_ADMIN: "true"
+      SFTPGO_DEFAULT_ADMIN_USERNAME: admin
+      SFTPGO_DEFAULT_ADMIN_PASSWORD: ${SFTPGO_ADMIN_PASSWORD:?.env 에 SFTPGO_ADMIN_PASSWORD 가 필요합니다}
+      TZ: @@TZ@@
+
+    networks:
+      - @@PFX@@-service-net
+
+networks:
+  @@PFX@@-service-net:
+    external: true

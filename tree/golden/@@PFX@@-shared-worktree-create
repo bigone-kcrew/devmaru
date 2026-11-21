@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+사용법:
+  @@PFX@@-shared-worktree-create <프로젝트명>
+
+공유 Git 저장소를 만들거나 기존 저장소를 재사용하고,
+현재 회원 전용 worktree와 branch를 준비합니다.
+
+공유 저장소:
+  /shared/repos/<프로젝트명>.git
+
+회원 작업공간:
+  /shared/worktrees/<프로젝트명>/<회원ID>
+
+회원 branch:
+  users/<회원ID>
+USAGE
+}
+
+die() {
+  echo "오류: $*" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+[[ $# -eq 1 ]] || {
+  usage >&2
+  exit 2
+}
+
+PROJECT="$1"
+
+[[ "$(id -u)" -ne 0 ]] || die "root가 아닌 회원 계정으로 실행하세요."
+
+[[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+  || die "사용할 수 없는 프로젝트명입니다: $PROJECT"
+
+USER_NAME="$(id -un)"
+AI_GROUP="@@PFX@@"
+
+REPO_ROOT="/shared/repos"
+WORKTREE_ROOT="/shared/worktrees"
+
+REPO="${REPO_ROOT}/${PROJECT}.git"
+PROJECT_WORKTREES="${WORKTREE_ROOT}/${PROJECT}"
+WORKTREE="${PROJECT_WORKTREES}/${USER_NAME}"
+BRANCH="users/${USER_NAME}"
+
+TEMPLATE="/opt/@@PFX@@/bootstrap/workspace-base"
+
+command -v git >/dev/null 2>&1 || die "git 명령을 찾을 수 없습니다."
+command -v flock >/dev/null 2>&1 || die "flock 명령을 찾을 수 없습니다."
+command -v setfacl >/dev/null 2>&1 || die "setfacl 명령을 찾을 수 없습니다."
+
+[[ -d "$REPO_ROOT" ]] || die "공유 Git 저장소 경로가 없습니다: $REPO_ROOT"
+[[ -d "$WORKTREE_ROOT" ]] || die "공유 worktree 경로가 없습니다: $WORKTREE_ROOT"
+[[ -d "$TEMPLATE" ]] || die "작업공간 기본 템플릿이 없습니다: $TEMPLATE"
+
+id -nG | tr ' ' '\n' | grep -Fxq "$AI_GROUP" \
+  || die "현재 사용자가 @@BRAND@@ 그룹($AI_GROUP)에 속해 있지 않습니다."
+
+LOCK_DIR="/shared/.locks"
+mkdir -p "$LOCK_DIR"
+
+LOCK_FILE="${LOCK_DIR}/smw-${PROJECT}.lock"
+
+exec 9>"$LOCK_FILE"
+flock 9
+
+if [[ ! -d "$REPO" ]]; then
+  echo "공유 Git 저장소를 만듭니다: $REPO"
+
+  git init --bare --initial-branch=main "$REPO"
+
+  chgrp -R "$AI_GROUP" "$REPO"
+  chmod -R g+rwX,o-rwx "$REPO"
+  find "$REPO" -type d -exec chmod g+s {} +
+
+  git -C "$REPO" config core.sharedRepository group
+
+  setfacl -R \
+    -m g:"$AI_GROUP":rwX,m::rwX,o::--- \
+    "$REPO"
+
+  find "$REPO" -type d -exec \
+    setfacl \
+      -m d:u::rwx,d:g::rwx,d:g:"$AI_GROUP":rwx,d:m::rwx,d:o::--- \
+      {} +
+
+  INIT_DIR="$(mktemp -d "/tmp/@@PFX@@-smw-init.${PROJECT}.XXXXXX")"
+
+  cleanup() {
+    rm -rf "$INIT_DIR"
+  }
+  trap cleanup EXIT
+
+  cp -a "$TEMPLATE"/. "$INIT_DIR"/
+
+  git -C "$INIT_DIR" init --initial-branch=main
+  git -C "$INIT_DIR" config user.name "@@BRAND@@ Bootstrap"
+  git -C "$INIT_DIR" config user.email "bootstrap@localhost"
+
+  git -C "$INIT_DIR" add -A
+  git -C "$INIT_DIR" commit -m "Initial @@BRAND@@ workspace"
+
+  git -C "$INIT_DIR" remote add origin "$REPO"
+  git -C "$INIT_DIR" push origin main
+
+  trap - EXIT
+  cleanup
+fi
+
+git --git-dir="$REPO" rev-parse --verify refs/heads/main >/dev/null \
+  || die "공유 저장소에 main branch가 없습니다: $REPO"
+
+if [[ ! -d "$PROJECT_WORKTREES" ]]; then
+  mkdir "$PROJECT_WORKTREES"
+
+  chgrp "$AI_GROUP" "$PROJECT_WORKTREES"
+  chmod 2770 "$PROJECT_WORKTREES"
+
+  setfacl \
+    -m u::rwx,g::rwx,g:"$AI_GROUP":rwx,m::rwx,o::--- \
+    -m d:u::rwx,d:g::rwx,d:g:"$AI_GROUP":rwx,d:m::rwx,d:o::--- \
+    "$PROJECT_WORKTREES"
+
+  # Normalize directory mode after ACL setup:
+  # setuid forbidden, setgid required.
+  chmod u-s,g+s "$PROJECT_WORKTREES"
+  chmod u=rwx,g=rwx,o= "$PROJECT_WORKTREES"
+else
+  [[ -w "$PROJECT_WORKTREES" && -x "$PROJECT_WORKTREES" ]] \
+    || die "공유 worktree 프로젝트 경로에 쓸 수 없습니다: $PROJECT_WORKTREES"
+fi
+
+if [[ -e "$WORKTREE" ]]; then
+  git --git-dir="$REPO" worktree list --porcelain \
+    | grep -Fxq "worktree $WORKTREE" \
+    || die "경로는 존재하지만 현재 저장소의 worktree로 등록되어 있지 않습니다: $WORKTREE"
+
+  echo "회원 전용 worktree가 이미 있습니다: $WORKTREE"
+else
+  if git --git-dir="$REPO" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git --git-dir="$REPO" worktree add "$WORKTREE" "$BRANCH"
+  else
+    git --git-dir="$REPO" worktree add -b "$BRANCH" "$WORKTREE" main
+  fi
+
+  chown -R "$USER_NAME:$AI_GROUP" "$WORKTREE"
+
+  # Per-user worktree policy:
+  #   directories: owner rwx, @@PFX@@ r-x, others ---
+  #   files:       owner rw-, @@PFX@@ r--, others ---
+  #
+  # Do not use a recursive mask::rwx here. Files may inherit ACL execute
+  # entries from the shared parent, and widening the mask can make regular
+  # files appear executable to Git.
+
+  find "$WORKTREE" -type d -exec \
+    setfacl \
+      -m u::rwx,g::r-x,g:"$AI_GROUP":r-x,m::r-x,o::--- \
+      -m d:u::rwx,d:g::r-x,d:g:"$AI_GROUP":r-x,d:m::r-x,d:o::--- \
+      {} +
+
+  find "$WORKTREE" -type f -exec \
+    setfacl \
+      -m u::rw-,g::r--,g:"$AI_GROUP":r--,m::r--,o::--- \
+      {} +
+
+  # Normalize visible POSIX modes after ACL application.
+  find "$WORKTREE" -type d -exec chmod 2750 {} +
+  find "$WORKTREE" -type f -exec chmod 0640 {} +
+fi
+
+echo
+echo "공유 Git worktree 준비가 완료되었습니다."
+echo
+echo "프로젝트     : $PROJECT"
+echo "공유 저장소  : $REPO"
+echo "회원 작업공간: $WORKTREE"
+echo "회원 branch : $BRANCH"

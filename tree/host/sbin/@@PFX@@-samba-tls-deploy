@@ -1,0 +1,80 @@
+#!/bin/bash
+set -euo pipefail
+
+SRC=/etc/letsencrypt/live/@@SMB_HOST@@
+DST=/srv/@@PFX@@/samba/tls
+
+CERT="$SRC/cert.pem"
+FULLCHAIN="$SRC/fullchain.pem"
+CHAIN="$SRC/chain.pem"
+KEY="$SRC/privkey.pem"
+
+for f in "$CERT" "$FULLCHAIN" "$CHAIN" "$KEY"; do
+    test -r "$f" || {
+        echo "ERROR: missing/unreadable $f" >&2
+        exit 1
+    }
+done
+
+# Certificate validity
+openssl x509 -in "$CERT" -noout -checkend 86400 >/dev/null || {
+    echo "ERROR: certificate expires within 24 hours" >&2
+    exit 1
+}
+
+# Required hostname
+openssl x509 -in "$CERT" -noout -ext subjectAltName |
+    grep -Fq 'DNS:@@SMB_HOST@@' || {
+        echo "ERROR: required SAN missing" >&2
+        exit 1
+    }
+
+# Required EKU
+openssl x509 -in "$CERT" -noout -ext extendedKeyUsage |
+    grep -Fq 'TLS Web Server Authentication' || {
+        echo "ERROR: Server Authentication EKU missing" >&2
+        exit 1
+    }
+
+# Certificate/private-key match
+CERT_FP="$(
+    openssl x509 -in "$CERT" -pubkey -noout |
+    openssl pkey -pubin -outform DER 2>/dev/null |
+    sha256sum | awk '{print $1}'
+)"
+
+KEY_FP="$(
+    openssl pkey -in "$KEY" -pubout -outform DER 2>/dev/null |
+    sha256sum | awk '{print $1}'
+)"
+
+test "$CERT_FP" = "$KEY_FP" || {
+    echo "ERROR: certificate/private-key mismatch" >&2
+    exit 1
+}
+
+install -d -o root -g root -m 0700 "$DST"
+
+TMP_CERT="$DST/.cert.pem.new"
+TMP_CA="$DST/.ca.pem.new"
+TMP_KEY="$DST/.key.pem.new"
+
+install -o root -g root -m 0644 "$FULLCHAIN" "$TMP_CERT"
+install -o root -g root -m 0644 "$CHAIN"     "$TMP_CA"
+install -o root -g root -m 0600 "$KEY"       "$TMP_KEY"
+
+mv -f "$TMP_CERT" "$DST/cert.pem"
+mv -f "$TMP_CA"   "$DST/ca.pem"
+mv -f "$TMP_KEY"  "$DST/key.pem"
+
+echo "PASS: Samba TLS certificate deployed"
+
+# Apply the renewed certificate only when the production QUIC service
+# is already running. Do not start a stopped/disabled service here.
+if systemctl is-active --quiet @@PFX@@-samba-quic.service; then
+    systemctl restart @@PFX@@-samba-quic.service
+    systemctl is-active --quiet @@PFX@@-samba-quic.service
+    echo "PASS: Samba QUIC service restarted"
+else
+    echo "INFO: Samba QUIC service inactive; restart skipped"
+fi

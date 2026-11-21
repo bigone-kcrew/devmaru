@@ -1,0 +1,14 @@
+[Unit]
+Description=Enforce member PostgreSQL common rules (connection limit, PUBLIC CONNECT revoked)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/@@PFX@@-db-policy
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=900
+ProtectSystem=strict
+ReadWritePaths=/var/lib/@@PFX@@ /run /srv/@@PFX@@/backups
+PrivateTmp=yes
+NoNewPrivileges=yes

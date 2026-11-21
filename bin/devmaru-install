@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""devmaru-install — 한 대의 Ubuntu 26.04 서버에 devmaru 환경을 설치한다 (Python 표준 라이브러리만 사용).
+
+  sudo devmaru-install                    질문에 답하며 설치(대화형)
+  sudo devmaru-install --config site.env --yes     질문 없이(원격·자동화)
+  sudo devmaru-install --plan             아무것도 바꾸지 않고 할 일만 보여 준다
+  sudo devmaru-install --resume           실패한 단계부터 이어서
+  sudo devmaru-install --only 40,50       지정한 단계만(번호)
+  sudo devmaru-install --web              웹 화면으로 설치(127.0.0.1 에서 열리며 SSH 터널로 접속)
+접두어(PFX)는 첫 설치 때 한 번 정하며 이후 바꾸지 않는다(기본 devmaru).
+"""
+import argparse, getpass, json, os, pwd, re, secrets, shlex, subprocess, sys, threading, time
+
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(KIT, "lib"))
+import devmaru_render as R
+
+STAGES = sorted(f for f in os.listdir(os.path.join(KIT, "stages")) if re.match(r"\d\d-.*\.sh$", f))
+QUESTIONS = [  # (키, 설명, 기본값 함수)
+    ("PFX", "접두어(명령·경로·이미지 이름에 쓰임, 첫 설치 때만 정함)", lambda v: "devmaru"),
+    ("BRAND", "서비스 표시 이름(화면에 보임)", lambda v: v["PFX"].capitalize()),
+    ("DOMAIN", "기본 도메인(예: example.org)", lambda v: ""),
+    ("PORTAL_LABEL", "포털 호스트 라벨(<라벨>.도메인)", lambda v: "portal"),
+    ("ADMIN_USER", "관리자 리눅스 계정(이미 있어야 함)", lambda v: os.environ.get("SUDO_USER") or "admin"),
+    ("ADMIN_EMAIL", "관리자 이메일(인증서 알림용)", lambda v: f"admin@{v['DOMAIN']}"),
+    ("ADMIN_CIDRS", "관리 화면(/ops·Cockpit) 접속 허용 대역(공백 구분)", lambda v: default_cidrs()),
+    ("TZ", "시간대", lambda v: default_tz()),
+]
+OPTIONAL_VARS = {"N8N_WORKFLOWS": "none", "WORKSPACE_OTHERS": "none", "SHARED_DEFAULT": "rw", "GOLDEN_VOICE": "0", "GOLDEN_OFFICE": "1", "TLS_MODE": "acme", "SSH_PORT": "22", "SMB_TRANSPORTS": "quic:1443"}   # 설정 파일에서만 바꾸는 옵션(음성 모델 포함·사무 문서 도구 제외·인증서 방식 internal)
+OPTIONAL = ["n8n", "files", "kordoc", "markitdown", "crawl4ai", "ollama", "uptime-kuma", "cockpit", "backup", "mail", "smb", "agent"]
+DEPS = {"smb": ["files"]}   # 선택하면 같이 켜지는 모듈(mail 은 n8n 불필요 — MAIL_MODE=n8n 일 때만 n8n 이 같이 켜진다)
+MAIL_KEYS = ["MAIL_MODE", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY", "MAIL_SMTP_USER", "MAIL_FROM", "MAIL_SMTP_VERIFY", "MAIL_TEST_SEND"]   # 비밀 아님(site.env 에 기록). 비밀번호는 /etc/<접두어>/secrets/
+DEFAULT_OPTIONAL = "n8n files kordoc markitdown crawl4ai backup"
+CORE = ["postgres", "caddy", "golden", "portal"]
+
+STAGE_TITLES = {"00": "사전 점검", "10": "패키지 설치", "20": "파일 배포·네트워크", "30": "설정·비밀 생성", "40": "서비스 기동", "45": "파일 서비스 연동", "47": "API 카탈로그", "48": "n8n 워크플로 템플릿",
+                "50": "웹 서버(Caddy) 설정", "52": "메일 자동 발송 연동", "55": "Cockpit 설정", "56": "SMB(QUIC) 설정", "58": "AI 에이전트 계정", "60": "Golden 이미지 빌드", "65": "관리형 MCP 의존성", "70": "포털 배치", "80": "백업 준비", "85": "주기 작업 켜기", "90": "최종 점검"}
+def title(s): return STAGE_TITLES.get(s[:2], s)
+
+def default_cidrs():
+    ip = (os.environ.get("SSH_CLIENT") or "").split(" ")[0]
+    if not ip:   # sudo 가 환경변수를 지우면 «who -m» 의 접속 IP 를 쓴다
+        try: ip = (re.search(r"\(([0-9.]+)\)", subprocess.run(["who", "-m"], capture_output=True, text=True).stdout) or [None, ""])[1]
+        except Exception: ip = ""
+    return "127.0.0.1/32" + (f" {ip}/32" if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip) else "")
+
+def default_tz():
+    try: return open("/etc/timezone").read().strip() or "UTC"
+    except OSError: return "UTC"
+
+def load_env(path):
+    out = {}
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1); out[k.strip()] = shlex.split(v, comments=True)[0] if v.strip() else ""
+    return out
+
+def ask(prompt, default):
+    r = input(f"  {prompt} [{default}]: ").strip()
+    return r or default
+
+def validate(v):
+    err = R.check_prefix(v.get("PFX"))
+    if err: return err
+    if not re.fullmatch(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", v.get("DOMAIN", "")): return "도메인 형식이 올바르지 않습니다(예: example.org)"
+    try: pwd.getpwnam(v["ADMIN_USER"])
+    except KeyError: return f"관리자 계정 '{v['ADMIN_USER']}' 이(가) 이 서버에 없습니다(먼저 만들어 두세요)"
+    if not re.fullmatch(r"[A-Za-z0-9가-힣 ._-]{1,40}", v.get("BRAND", "")): return "서비스 이름은 한글·영문·숫자·공백·._- 40자 이하로 입력하세요"
+    if v.get("WORKSPACE_OTHERS", "none") not in ("none", "read"): return "WORKSPACE_OTHERS 는 none 또는 read 입니다"
+    if v.get("SHARED_DEFAULT", "rw") not in ("rw", "ro"): return "SHARED_DEFAULT 는 rw 또는 ro 입니다"
+    return None
+
+def pick_gid(pfx):
+    try:
+        import grp
+        return str(grp.getgrnam(pfx).gr_gid)
+    except KeyError: pass
+    used = {int(l.split(":")[2]) for l in open("/etc/group")}
+    g = 1001
+    while g in used: g += 1
+    return str(g)
+
+def modules_from(v, interactive):
+    mods = v.get("MODULES")
+    if mods: return mods.split()
+    if not interactive: return CORE + DEFAULT_OPTIONAL.split()
+    print("\n  설치할 선택 서비스를 고르세요(필수: " + ", ".join(CORE) + ")")
+    chosen = list(CORE)
+    for m in OPTIONAL:
+        d = "y" if m in DEFAULT_OPTIONAL.split() else "n"
+        if ask(f"{m} 설치? (y/n)", d).lower().startswith("y"): chosen.append(m)
+    return chosen
+
+
+def checklist(v):
+    """설치 뒤 관리자가 처음 해야 할 일(선택한 모듈 기준). 비밀 값은 싣지 않고 위치만 알려 준다."""
+    pfx, dom, mods = v["PFX"], v["DOMAIN"], v["MODULES"].split()
+    O = f"/opt/{pfx}"; h = lambda k: R.values(v)[k + "_HOST"]
+    L = [("점검", f"sudo {pfx}-doctor — 전부 «성공» 이어야 합니다"),
+         ("포털", f"https://{R.values(v)['PORTAL_HOST']}/ — 회원용 안내(Guide)"),
+         ("첫 회원", f"sudo {pfx}-member-add <ID> --email <메일> — 초기 비밀번호가 화면에 표시되니 회원에게 직접 전달하세요"),
+         ("PostgreSQL", f"관리자 계정 postgres · 비밀번호는 {O}/config/env/postgres.env (root 만 읽음) · sudo docker exec -it postgres psql -U postgres")]
+    if "n8n" in mods: L.append(("n8n", f"https://{h('N8N')}/ — 처음 여는 사람이 소유자 계정을 만듭니다(관리자가 먼저 열어 만드세요). 암호화 키(N8N_ENCRYPTION_KEY)는 {O}/config/env/n8n.env — 백업하세요"))
+    if "files" in mods: L.append(("Files(SFTPGo)", f"https://{h('FILES')}/ — 회원 계정은 회원 등록 때 자동 생성·SSH 비밀번호와 동기화. 관리자 화면 /web/admin 의 admin 비밀번호는 {O}/compose/sftpgo/.env (SFTPGO_ADMIN_PASSWORD)"))
+    if "uptime-kuma" in mods: L.append(("Uptime Kuma", f"https://{h('UPTIME')}/ (관리자 대역만) — 처음 열면 데이터베이스 종류(SQLite 권장)를 고른 뒤 관리자 계정을 만듭니다"))
+    if "cockpit" in mods: L.append(("Cockpit", f"https://{h('COCKPIT')}/ (관리자 대역만) — 리눅스 관리자 계정({v['ADMIN_USER']})으로 로그인"))
+    if "ollama" in mods: L.append(("Ollama", "모델이 하나도 내려받아져 있지 않습니다 — 쓰려면 sudo docker exec " + f"{pfx}-ollama ollama pull <모델>  (이 킷의 다른 구성요소는 아직 Ollama 를 쓰지 않습니다)"))
+    if "mail" in mods:
+        mm = v.get("MAIL_MODE", "smtp")
+        L.append(("메일", f"회원 등록 안내 메일을 SMTP 로 자동 발송합니다 — 설정은 /etc/{pfx}/secrets/smtp.env(root 만) · 시험 sudo {pfx}-notify-mail --test <주소> · 발송에 실패하면 회원 등록 화면에 초기 비밀번호가 표시됩니다 (docs/MAIL.md)" if mm == "smtp"
+                  else f"MAIL_MODE={mm} — SMTP 직접 발송은 꺼져 있습니다. 켜려면 docs/MAIL.md"))
+    if "smb" in mods:
+        tr = v.get("SMB_TRANSPORTS", "quic:1443")
+        L.append(("SMB(네트워크 드라이브)", f"DNS 에 {h('SMB')} 가 이 서버를 가리켜야 하고 방화벽에서 전송 포트({tr})를 열어야 합니다 · Windows 11 24H2 이상에서 \\\\{h('SMB')}\\<회원ID> · 자체 서명 인증서(TLS_MODE=internal)면 /srv/{pfx}/samba/tls/cert.pem 을 클라이언트의 «신뢰할 수 있는 루트»에 등록 · 실제 Windows 접속은 설치기가 시험하지 못했습니다 (docs/SMB.md)"))
+    if "agent" in mods: L.append(("AI 에이전트", f"계정 {pfx}-agent 는 키가 없어 로그인할 수 없습니다 — sudo {pfx}-agent-key add <공개키 파일> 로 등록 · 기록 sudo {pfx}-agent-audit · docs/AGENT.md"))
+    if "backup" in mods: L.append(("백업", f"저장소 암호 /etc/{pfx}/secrets/restic-repository-password 를 서버 밖에도 보관하세요 · sudo {pfx}-backup-run"))
+    L.append(("자동 처리", "kordoc · markitdown · crawl4ai 키와 MCP 연결은 자동입니다(관리자 조치 없음). 회원 사이트·앱 공개와 회원 DB 도 회원 등록 때 자동 준비됩니다"))
+    return L
+
+class State:
+    def __init__(self, pfx):
+        self.dir = f"/var/lib/{pfx}/install"; os.makedirs(self.dir, exist_ok=True)
+        self.path = f"{self.dir}/state.json"
+        try: self.d = json.load(open(self.path))
+        except Exception: self.d = {"stages": {}}
+    def set(self, stage, status, **kw):
+        self.d["stages"][stage] = {"status": status, "at": time.strftime("%F %T"), **kw}
+        tmp = self.path + ".tmp"; json.dump(self.d, open(tmp, "w"), indent=1); os.replace(tmp, self.path)
+    def status(self, stage): return self.d["stages"].get(stage, {}).get("status")
+
+class PlanError(Exception): pass
+
+def finalize(v, skip_golden=False, interactive=False):
+    """사용자 값 → 설치 값(검증·기본값·GID·모듈). 문제가 있으면 PlanError."""
+    for k, desc, dflt in QUESTIONS:
+        if not v.get(k):
+            if k == "DOMAIN": raise PlanError("도메인(DOMAIN)이 필요합니다")
+            v[k] = dflt(v)
+    if interactive:   # 접근 정책(Enter = 기본값): 처음 설치 때 정해 두면 이후 devmaru-access 로 바꿀 수 있다
+        if not v.get("WORKSPACE_OTHERS"): v["WORKSPACE_OTHERS"] = "read" if ask("다른 회원이 내 workspace 를 읽게 할까요? (y/n, 쓰기는 항상 불가)", "n").lower().startswith("y") else "none"
+        if not v.get("SHARED_DEFAULT"): v["SHARED_DEFAULT"] = "ro" if ask("공유 프로젝트를 읽기 전용으로 할까요? (y=읽기만, n=회원 전원 읽기·쓰기)", "n").lower().startswith("y") else "rw"
+    for k, d in OPTIONAL_VARS.items(): v.setdefault(k, d)
+    if v["N8N_WORKFLOWS"] not in ("none", "generic"): raise PlanError("N8N_WORKFLOWS 는 none 또는 generic 이어야 합니다")
+    err = validate(v)
+    if err: raise PlanError(err)
+    v["MODULES"] = " ".join(modules_from(v, interactive))
+    v["GID"] = v.get("GID") or pick_gid(v["PFX"])
+    if skip_golden: v["MODULES"] = " ".join(m for m in v["MODULES"].split() if m != "golden")
+    if "postgres" not in v["MODULES"].split(): raise PlanError("postgres 는 필수 모듈입니다")
+    mods = v["MODULES"].split()
+    for m in list(mods):
+        for d in DEPS.get(m, []):
+            if d not in mods: mods.append(d)
+    v["MODULES"] = " ".join(mods)
+    mm = v.get("MAIL_MODE", "")
+    if interactive and "mail" in mods and not mm:
+        mm = ask("메일 발송 방식(smtp=서버가 SMTP 로 직접 보냄 · n8n=n8n 워크플로로 보냄)", "smtp")
+    mm = mm or ("smtp" if "mail" in mods else "none")
+    if mm not in ("none", "smtp", "n8n"): raise PlanError("MAIL_MODE 는 none · smtp · n8n 중 하나입니다")
+    if "mail" in mods and mm == "none": mm = "smtp"          # 모듈을 골랐는데 방식이 없으면 SMTP 직접 발송
+    if mm != "none" and "mail" not in mods: mods.append("mail")   # MAIL_MODE 를 정하면 mail 모듈이 같이 켜진다
+    if mm == "n8n" and "n8n" not in mods: mods.append("n8n")
+    v["MAIL_MODE"] = mm; v["MODULES"] = " ".join(mods)
+    if mm == "smtp": check_mail(v, interactive)
+    return v
+
+def check_mail(v, interactive):
+    """mail 모듈: SMTP 설정이 있어야 한다(대화형이면 묻고, 아니면 오류). 비밀번호는 v["MAIL_SMTP_PASSWORD"] 로만 다룬다(site.env 에 쓰지 않는다)."""
+    v.setdefault("MAIL_SMTP_PORT", "587"); v.setdefault("MAIL_SMTP_SECURITY", "starttls")
+    if interactive:
+        print("\n  메일 자동 발송 설정(회원 등록 때 초기 비밀번호·Paseo QR 을 메일로 보냅니다)")
+        for k, d, t in [("MAIL_SMTP_HOST", "SMTP 서버 주소(예: smtp.example.org)", ""), ("MAIL_SMTP_PORT", "SMTP 포트", v["MAIL_SMTP_PORT"]),
+                        ("MAIL_SMTP_SECURITY", "암호화(starttls/ssl/none)", v["MAIL_SMTP_SECURITY"]), ("MAIL_SMTP_USER", "SMTP 계정(없으면 비움)", ""),
+                        ("MAIL_FROM", "보내는 사람 주소", v.get("ADMIN_EMAIL", ""))]:
+            if not v.get(k): v[k] = ask(d, t)
+        if v.get("MAIL_SMTP_USER") and not (v.get("MAIL_SMTP_PASSWORD") or v.get("MAIL_SMTP_PASSWORD_FILE") or os.environ.get("MAIL_SMTP_PASSWORD")):
+            v["MAIL_SMTP_PASSWORD"] = getpass.getpass("  SMTP 비밀번호(화면에 표시되지 않음): ")
+    if not v.get("MAIL_SMTP_HOST") or not re.fullmatch(r"[A-Za-z0-9.-]+", v["MAIL_SMTP_HOST"]): raise PlanError("mail 모듈에는 MAIL_SMTP_HOST(SMTP 서버 주소)가 필요합니다")
+    if not re.fullmatch(r"\d{1,5}", v["MAIL_SMTP_PORT"]): raise PlanError("MAIL_SMTP_PORT 는 숫자여야 합니다")
+    if v["MAIL_SMTP_SECURITY"] not in ("starttls", "ssl", "none"): raise PlanError("MAIL_SMTP_SECURITY 는 starttls · ssl · none 중 하나입니다")
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", v.get("MAIL_FROM", "")): raise PlanError("mail 모듈에는 보내는 사람 주소(MAIL_FROM)가 필요합니다")
+    if v.get("MAIL_SMTP_USER") and re.search(r"[\s\"'`$\\]", v["MAIL_SMTP_USER"]): raise PlanError("MAIL_SMTP_USER 에 공백·따옴표·특수문자는 쓸 수 없습니다")
+
+def select_stages(only=None, skip=""):
+    st = STAGES
+    if only: st = [s for s in st if s[:2] in only.split(",")]
+    return [s for s in st if s[:2] not in skip.split(",")]
+
+def make_env(v, skip_dns):
+    pfx = v["PFX"]; site = f"/etc/{pfx}/site.env"
+    vals = R.values(v)
+    env = dict(os.environ, **{k: str(x) for k, x in v.items()}, **{k: str(x) for k, x in vals.items() if k not in v})
+    env.update(KIT=KIT, SITE_ENV=site, RENDERED=f"/var/lib/{pfx}/rendered", INSTALL_STATE=f"/var/lib/{pfx}/install",
+               SKIP_DNS="1" if skip_dns else "0", DEVMARU_MODULES=v["MODULES"])
+    return env, site
+
+def write_site(v, site):
+    os.makedirs(os.path.dirname(site), exist_ok=True)
+    with open(site, "w") as f:
+        f.write(f"# {v['BRAND']} 설치 설정 — devmaru-install 이 만들었다. 비밀은 여기 없다.\n")
+        for k in [q[0] for q in QUESTIONS] + ["GID", "MODULES", "N8N_WORKFLOWS", "WORKSPACE_OTHERS", "SHARED_DEFAULT", "TLS_MODE", "GOLDEN_VOICE", "GOLDEN_OFFICE", "SSH_PORT", "SMB_TRANSPORTS", "AGENT_EXPIRES"] + MAIL_KEYS:
+            if k in v: f.write(f"{k}={shlex.quote(str(v[k]))}\n")
+    os.chmod(site, 0o644)
+
+def run_stage(stage, env, log, emit):
+    t0 = time.time(); warns = 0; tail = []
+    p = subprocess.Popen(["bash", os.path.join(KIT, "stages", stage)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)   # 단계가 바이트 단위(cut -c)로 자른 줄에 깨진 UTF-8 이 섞여도 설치기가 멈추지 않게 한다
+    for line in p.stdout:
+        log.write(line); log.flush(); tail = (tail + [line.rstrip()])[-8:]
+        if line.startswith("경고"): warns += 1
+        if line.startswith(("성공", "실패", "경고", "안내", "==", "결과")) or line.startswith("  >"):
+            emit("line", text=line.rstrip()[:200])
+    rc = p.wait()
+    if rc: emit("tail", lines=[t[:150] for t in tail])
+    return rc, time.time() - t0, warns
+
+def store_mail_secret(v):
+    """SMTP 비밀번호(입력값·환경변수·파일)를 /etc/<접두어>/secrets/mail-smtp-password(0600)에만 둔다. 설정 파일·단계 환경에는 남기지 않는다."""
+    pw = v.pop("MAIL_SMTP_PASSWORD", "") or os.environ.pop("MAIL_SMTP_PASSWORD", "")
+    pf = v.get("MAIL_SMTP_PASSWORD_FILE", "")
+    if not pw and pf:
+        try: pw = open(pf).read().rstrip("\r\n")
+        except OSError as e: raise PlanError(f"MAIL_SMTP_PASSWORD_FILE 을 읽을 수 없습니다: {e}")
+    v.pop("MAIL_SMTP_PASSWORD_FILE", None)
+    if "mail" not in v.get("MODULES", "").split() or not pw: return
+    d = f"/etc/{v['PFX']}/secrets"; os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(f"{d}/mail-smtp-password", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(pw)
+
+def execute(v, stages, resume, skip_dns, emit):
+    """단계를 차례로 실행. 반환: 종료 코드(0 성공)."""
+    store_mail_secret(v)
+    env, site = make_env(v, skip_dns); pfx = v["PFX"]; write_site(v, site)
+    st = State(pfx); logp = f"/var/log/{pfx}-install.log"; t_all = time.time(); n = len(stages)
+    emit("plan", stages=[[s[:2], title(s)] for s in stages], site=site, log=logp)
+    with open(logp, "a") as log:
+        for i, s in enumerate(stages, 1):
+            if resume and st.status(s) == "ok": emit("stage", i=i, n=n, id=s[:2], title=title(s), status="skipped"); continue
+            emit("stage", i=i, n=n, id=s[:2], title=title(s), status="start"); log.write(f"\n===== {s} {time.strftime('%F %T')} =====\n")
+            st.set(s, "running")
+            rc, dt, warns = run_stage(s, env, log, emit)
+            if rc:
+                st.set(s, "failed", rc=rc)
+                emit("stage", i=i, n=n, id=s[:2], title=title(s), status="failed", rc=rc)
+                emit("done", ok=False, seconds=int(time.time() - t_all), pfx=pfx, log=logp,
+                     resume=f"sudo python3 {KIT}/bin/devmaru-install --config {site} --yes --resume")
+                return rc
+            st.set(s, "ok", seconds=int(dt), warnings=warns)
+            emit("stage", i=i, n=n, id=s[:2], title=title(s), status="ok", seconds=int(dt), warnings=warns)
+    emit("done", ok=True, seconds=int(time.time() - t_all), pfx=pfx, state=st.path, checklist=checklist(v))
+    return 0
+
+def cli_emit(kind, **d):
+    if kind == "line": print("    " + d["text"], flush=True)
+    elif kind == "tail": print("    --- 마지막 출력(원문) ---\n" + "\n".join("    " + t for t in d["lines"]))
+    elif kind == "stage":
+        if d["status"] == "skipped": print(f"[{d['i']}/{d['n']}] {d['title']}  (이미 완료 — 건너뜀)")
+        elif d["status"] == "start": print(f"[{d['i']}/{d['n']}] {d['title']}", flush=True)
+        elif d["status"] == "ok": print(f"    → 완료 {d['seconds']}초" + (f", 경고 {d['warnings']}" if d["warnings"] else ""))
+    elif kind == "done":
+        if d["ok"]:
+            print(f"\n  ✓ 설치 완료 ({d['seconds']}초). 상태: {d['state']}\n\n  ── 설치 후 첫 설정 체크리스트 ──")
+            for k, t in d["checklist"]: print(f"   • {k}: {t}")
+            print()
+        else: print(f"\n  ✗ 설치 중단. 로그: {d['log']}\n  고친 뒤 이어서: {d['resume']}\n")
+
+# ---------------------------------------------------------------- 웹 화면
+MODULE_INFO = {
+    "postgres": ("PostgreSQL(pgvector·pg_bigm)", True), "caddy": ("웹 서버·자동 인증서(Caddy)", True),
+    "golden": ("회원 개발환경 이미지(Golden) 빌드 — 수 분~수십 분", True), "portal": ("포털(Guide·Skills·Tools)", True),
+    "n8n": ("n8n 자동화 (범용 워크플로 템플릿 선택 가능)", False), "files": ("파일 서비스(SFTPGo 웹·SFTP)", False), "kordoc": ("Kordoc 문서 변환", False),
+    "markitdown": ("MarkItDown 문서 변환", False), "crawl4ai": ("Crawl4AI 웹 수집", False), "ollama": ("Ollama 임베딩", False),
+    "uptime-kuma": ("Uptime Kuma 상태 감시", False), "cockpit": ("Cockpit 관리 콘솔", False), "backup": ("restic 백업 저장소 준비", False),
+    "mail": ("메일 자동 발송(SMTP 직접 — n8n 불필요, 회원 등록 때 초기 비밀번호·Paseo QR)", False), "smb": ("SMB over QUIC 네트워크 드라이브(files 필요)", False),
+    "agent": ("AI 에이전트 전용 계정(SSH 키 전용·읽기성 명령만 sudo·감사 로그)", False)}
+
+class Run:
+    def __init__(self): self.events = []; self.cv = threading.Condition(); self.state = "idle"; self.thread = None
+    def emit(self, kind, **d):
+        with self.cv: self.events.append({"kind": kind, **d}); self.cv.notify_all()
+RUN = Run()
+
+def web_serve(bind, port, a):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    token = secrets.token_hex(16)
+    page = open(os.path.join(KIT, "lib", "wizard.html"), encoding="utf-8").read()
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *x): pass
+        def _ok(self):
+            c = self.headers.get("Cookie", ""); return f"devmarutok={token}" in c or self.headers.get("X-Devmaru-Token") == token
+        def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+            b = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code); self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(b)))
+            self.send_header("Cache-Control", "no-store"); self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in (extra or {}).items(): self.send_header(k, v)
+            self.end_headers(); self.wfile.write(b)
+        def do_GET(self):
+            path, _, q = self.path.partition("?")
+            if path == "/favicon.ico": return self._send(204, b"", "image/x-icon")
+            if path == "/":
+                if f"t={token}" in q:
+                    return self._send(200, page, "text/html; charset=utf-8", {"Set-Cookie": f"devmarutok={token}; HttpOnly; SameSite=Strict; Path=/"})
+                return self._send(403, "<meta charset=utf-8>접속 주소의 ?t=토큰 이 필요합니다(터미널에 표시된 주소를 쓰세요).", "text/html; charset=utf-8")
+            if not self._ok(): return self._send(403, '{"error":"토큰이 필요합니다"}')
+            if path == "/api/init":
+                mods = [{"name": m, "desc": MODULE_INFO.get(m, (m, False))[0], "required": m in CORE, "default": m in CORE or m in DEFAULT_OPTIONAL.split()} for m in CORE + OPTIONAL]
+                qs = []; v0 = {}
+                for k, desc, d in QUESTIONS:
+                    v0[k] = d(v0); qs.append({"key": k, "label": desc, "default": v0[k]})
+                return self._send(200, json.dumps({"questions": qs, "modules": mods, "state": RUN.state, "preset": PRESET}))
+            if path == "/api/events":
+                frm = int(dict(x.split("=") for x in q.split("&") if "=" in x).get("from", 0))
+                if self.headers.get("Last-Event-ID", "").isdigit(): frm = int(self.headers["Last-Event-ID"]) + 1
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Cache-Control", "no-store"); self.end_headers()
+                i = frm
+                try:
+                    while True:
+                        with RUN.cv:
+                            while i >= len(RUN.events): RUN.cv.wait(timeout=15); 
+                            if i >= len(RUN.events): self.wfile.write(b": ping\n\n"); self.wfile.flush(); continue
+                            ev = RUN.events[i]
+                        self.wfile.write(f"id: {i}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()); self.wfile.flush(); i += 1
+                except (BrokenPipeError, ConnectionResetError): return
+            return self._send(404, "{}")
+        def do_POST(self):
+            if not self._ok(): return self._send(403, '{"error":"토큰이 필요합니다"}')
+            n = int(self.headers.get("Content-Length", 0)); body = json.loads(self.rfile.read(n) or b"{}")
+            v = {k: str(x) for k, x in body.get("values", {}).items() if x != ""}
+            v["MODULES"] = " ".join(body.get("modules", []))
+            if self.path == "/api/plan":
+                try: v = finalize(v, a.skip_golden); stages = select_stages(None, "")
+                except PlanError as e: return self._send(200, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+                return self._send(200, json.dumps({"ok": True, "values": {k: v[k] for k in ("PFX", "BRAND", "DOMAIN", "GID", "MODULES")}, "stages": [[s[:2], title(s)] for s in stages]}, ensure_ascii=False))
+            if self.path == "/api/start":
+                if RUN.state == "running": return self._send(200, '{"ok":false,"error":"이미 설치가 진행 중입니다"}')
+                try: v = finalize(v, a.skip_golden); stages = select_stages(None, "")
+                except PlanError as e: return self._send(200, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+                def work():
+                    RUN.state = "running"
+                    rc = execute(v, stages, bool(body.get("resume")), a.skip_dns, RUN.emit)
+                    RUN.state = "done" if rc == 0 else "failed"
+                RUN.events.clear(); RUN.thread = threading.Thread(target=work, daemon=True); RUN.thread.start()
+                return self._send(200, '{"ok":true}')
+            return self._send(404, "{}")
+    srv = ThreadingHTTPServer((bind, port), H)
+    url = f"http://127.0.0.1:{port}/?t={token}"
+    print("\n  devmaru 웹 설치 화면이 열렸습니다.")
+    if bind in ("127.0.0.1", "localhost"):
+        print(f"  이 서버 안에서는:   {url}")
+        print(f"  내 PC 에서는 먼저 SSH 터널을 여세요:\n    ssh -L {port}:127.0.0.1:{port} <사용자>@<서버 주소>\n  그다음 내 PC 브라우저에서 위 주소를 여세요.")
+    else:
+        print(f"  ⚠ {bind} 에서 열렸습니다(HTTP, 토큰만 보호) — 신뢰하는 내부망에서만 쓰세요.\n  주소: http://<서버 주소>:{port}/?t={token}")
+    print("  설치가 끝나면 Ctrl+C 로 닫으세요.\n", flush=True)
+    try: srv.serve_forever()
+    except KeyboardInterrupt: print("\n  웹 설치 화면을 닫았습니다.")
+
+PRESET = {}
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False, usage="devmaru-install [옵션]")
+    ap.add_argument("-h", "--help", action="store_true", help="이 도움말을 보여 줍니다")
+    ap.add_argument("--config", help="설정 파일(KEY=값 형식)을 읽어 질문 없이 진행")
+    ap.add_argument("--yes", action="store_true", help="확인 질문 없이 진행(원격·자동화)")
+    ap.add_argument("--plan", action="store_true", help="아무것도 바꾸지 않고 할 일만 보여 줌")
+    ap.add_argument("--resume", action="store_true", help="실패한 단계부터 이어서 실행")
+    ap.add_argument("--only", help="지정한 단계 번호만 실행(예: 40,50)")
+    ap.add_argument("--skip", default="", help="건너뛸 단계 번호(예: 60)")
+    ap.add_argument("--skip-dns", action="store_true", help="DNS 점검을 건너뜀(내부망·시험용)")
+    ap.add_argument("--skip-golden", action="store_true", help="Golden 이미지 빌드를 건너뜀(나중에 따로 빌드)")
+    ap.add_argument("--web", action="store_true", help="웹 화면으로 설치(기본 127.0.0.1 — SSH 터널로 접속)")
+    ap.add_argument("--port", type=int, default=8765, help="웹 화면 포트(기본 8765)")
+    ap.add_argument("--bind", default="127.0.0.1", help="웹 화면 바인드 주소(기본 127.0.0.1)")
+    a = ap.parse_args()
+    if a.help: print(__doc__); ap.print_help(); return
+    if os.geteuid() != 0: sys.exit("실패: root 로 실행하세요 (sudo)")
+    if a.web: return web_serve(a.bind, a.port, a)
+    v = load_env(a.config) if a.config else {}
+    if a.resume and not v:   # 이전 설정 재사용
+        for cand in (f"/etc/{p}/site.env" for p in os.listdir("/etc")):
+            if os.path.exists(cand) and "PFX=" in open(cand).read() and "BRAND=" in open(cand).read(): v = load_env(cand); break
+    interactive = not a.yes and sys.stdin.isatty()
+    print("\n  devmaru 설치 — 질문에 Enter 만 누르면 [기본값]을 씁니다.\n" if interactive else "")
+    if interactive:
+        for k, desc, dflt in QUESTIONS:
+            if not v.get(k): v[k] = ask(desc, dflt(v))
+    try: v = finalize(v, a.skip_golden, interactive)
+    except PlanError as e: sys.exit(f"실패: {e}")
+    stages = select_stages(a.only, a.skip)
+    print(f"  접두어 {v['PFX']} · 서비스 '{v['BRAND']}' · 도메인 {v['DOMAIN']} · GID {v['GID']}")
+    print(f"  모듈: {v['MODULES']}")
+    print("  단계: " + " → ".join(title(s) for s in stages))
+    if a.plan: print("\n  (--plan: 아무것도 바꾸지 않았습니다)"); return
+    if interactive and not ask("이대로 설치할까요? (y/n)", "y").lower().startswith("y"): sys.exit("취소했습니다")
+    sys.exit(execute(v, stages, a.resume, a.skip_dns, cli_emit))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -eq 0 ]]; then
+  echo "ERROR: run as the member user, not root." >&2
+  exit 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "ERROR: git is not installed." >&2
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "ERROR: GitHub CLI (gh) is not installed." >&2
+  exit 1
+fi
+
+echo "===== @@BRAND@@ GitHub Connect ====="
+echo
+echo "GitHub is optional."
+echo "You only need this if you want to use GitHub repositories, push code,"
+echo "work with issues, or create pull requests."
+echo
+
+if gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "GitHub is already connected."
+  echo
+  exec @@PFX@@-github-status
+fi
+
+echo "A GitHub sign-in flow will start."
+echo "Complete the approval in your browser when prompted."
+echo
+
+gh auth login \
+  --hostname github.com \
+  --git-protocol https \
+  --web
+
+echo
+echo "Configuring Git to use GitHub CLI credentials..."
+gh auth setup-git
+
+echo
+echo "Verifying connection..."
+
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "ERROR: GitHub authentication did not complete successfully." >&2
+  exit 1
+fi
+
+echo
+exec @@PFX@@-github-status

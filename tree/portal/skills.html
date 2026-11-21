@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>@@BRAND@@ Skills</title>
+<meta name="description" content="@@BRAND@@ 기본 제공 Core Skill 24개와, 필요할 때 설치하는 Catalog Skill을 확인합니다.">
+<meta name="theme-color" content="#f7f7f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111214" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="@@BRAND@@">
+<meta property="og:title" content="@@BRAND@@ Skills Hub">
+<meta property="og:description" content="기본 제공 Core Skill 24개와 선택 설치용 Catalog Skill을 한곳에서 확인합니다.">
+<meta property="og:url" content="https://@@PORTAL_HOST@@/skills/">
+<meta name="twitter:card" content="summary">
+{{FAVICON}}
+{{THEME_INIT}}
+<style>
+{{SHARED_CSS}}
+
+/* --- skills page ------------------------------------------------------- */
+.what-is {
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-left: 3px solid var(--line-strong);
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+.what-is strong { color: var(--text); }
+
+.what-is a { display: inline-block; padding: var(--space-1) 0; }
+
+/* Usage strip: Golden vs Catalog, and the one command that matters. */
+.usage {
+  margin-top: var(--space-6);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.usage > summary {
+  display: flex;
+  align-items: center;
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: var(--w-med);
+}
+
+.usage-body {
+  padding: 0 var(--space-4) var(--space-4);
+  display: grid;
+  gap: var(--space-3);
+}
+
+.usage-item { display: grid; gap: var(--space-1); }
+
+.usage-item strong { font-size: var(--text-sm); }
+
+.usage-item p {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+/* Short explanatory blocks: even lines instead of a one-word last line. */
+.usage-item p { text-wrap: balance; }
+
+/* Inline links in the usage strip need a 24px hit area (WCAG 2.5.8). */
+.usage-item p a { padding-block: var(--space-1); }
+
+.usage code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--soft);
+  font-size: var(--text-code);
+  overflow-wrap: anywhere;
+}
+
+.usage .cmd {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+/* --- Skill sections ----------------------------------------------------- */
+/* Core and Superpowers are reference lists, not cards to act on: two lines
+   each, so 30 Skills stay inside a couple of screens. */
+.summary {
+  display: grid;
+  /* Three across at every width: the trio is the page's index, and a 2+1
+     wrap reads as one of them being an afterthought. */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin: var(--space-6) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.summary a {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  height: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: inherit;
+  text-decoration: none;
+}
+
+.summary a:hover { border-color: var(--line-strong); }
+
+.summary b {
+  font-size: var(--text-lg);
+  font-weight: var(--w-med);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+/* "Superpowers" must never break mid-word in a narrow column: the label is
+   sized to fit the third of a 390px viewport, and breaking is disallowed. */
+.summary-name {
+  font-size: var(--text-xs);
+  font-weight: var(--w-med);
+  overflow-wrap: normal;
+  word-break: keep-all;
+}
+
+.summary-sub {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: normal;
+}
+
+.s-section {
+  margin-top: var(--space-12);
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--line);
+}
+
+/* Superpowers is a different layer from Core: a tinted band separates the two
+   without demoting it to a footnote. */
+.s-alt {
+  margin-inline: calc(var(--space-4) * -1);
+  padding: var(--space-6) var(--space-4) var(--space-8);
+  border-top: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--soft);
+}
+
+.s-head-row { margin-bottom: var(--space-4); }
+
+.s-section h2 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-xl);
+  letter-spacing: -0.02em;
+}
+
+.s-note {
+  margin: 0;
+  max-width: 74ch;
+  color: var(--muted);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+
+.s-note code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--soft);
+  font-size: var(--text-code);
+}
+
+.s-alt .s-note code { background: var(--card); }
+
+.s-note + .s-note { margin-top: var(--space-2); }
+
+/* A license that restricts use has to be readable before the install command,
+   not after it, so it sits above the command box and borrows the amber the
+   design system already uses for "needs attention" (--hold). */
+.license-note {
+  display: flex;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-2);
+  padding: var(--space-1) var(--space-2) var(--space-1) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--soft);
+  box-shadow: inset 3px 0 0 var(--hold), inset 0 0 0 1px var(--line);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+
+.license-note .license-mark {
+  flex: none;
+  color: var(--hold);
+  font-weight: 700;
+}
+
+.license-note .license-name {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+/* Core 22종을 한 덩어리로 보이면 무엇이 무엇인지 안 읽힌다. 레지스트리의 group
+   으로 나누고, 각 묶음 머리에 개수를 붙여 훑어보기 쉽게 한다. */
+.sprite { display: none; }
+
+/* 묶음 머리띠. 라벨과 개수를 양끝에 두고 사이를 선으로 잇는다 -- 여섯 묶음이
+   같은 리듬으로 읽히게 하는 것이 목적이고, 장식이 목적이 아니다. */
+.s-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-6) 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--w-med);
+  color: var(--text);
+  scroll-margin-top: var(--space-6);
+}
+
+.s-group::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--line);
+}
+
+.s-group:first-of-type { margin-top: var(--space-3); }
+
+.s-group-n {
+  flex: 0 0 auto;
+  order: 3;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
+/* 묶음 칩. Catalog 의 검색은 client-side 라 Core 에 쓸 수 없다. Core 는 정적이므로
+   앵커가 맞고, 22개를 위에서 한눈에 세어 보게 한다. */
+.s-jump {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.s-jump a {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: 4px var(--space-2);
+  border: 1px solid var(--control-line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  font-size: var(--text-xs);
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.s-jump a:hover,
+.s-jump a:focus-visible { background: var(--soft); color: var(--text); }
+
+.s-jump b {
+  font-family: var(--font-mono);
+  font-weight: var(--w-med);
+  opacity: 0.75;
+}
+
+/* 원 프로젝트 저장소. 이름 오른쪽 끝에 작게 둔다 -- 카드의 주인공은 Skill 이름이다. */
+/* 개수(15)와 저장소 아이콘이 붙어 한 덩어리로 읽혔다. */
+.s-repo {
+  /* margin-inline-start 는 아래 `margin-left: auto` 에 덮여 0 이 됐다
+     (h2 가 display:block 이라 auto 가 0 으로 풀린다). padding 은 안 덮인다. */
+  padding-inline-start: var(--space-2);
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  opacity: 0.55;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.s-repo:hover,
+.s-repo:focus-visible { opacity: 1; color: var(--text); }
+
+.s-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(232px, 100%), 1fr));
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.s-card {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  transition: border-color var(--duration-fast) var(--ease),
+              box-shadow var(--duration-fast) var(--ease),
+              transform var(--duration-fast) var(--ease);
+}
+
+/* 가리키는 카드가 표면으로 반응한다. 색으로만 알리면 색각 이상에서 신호가 사라지고
+   링크 색과도 헷갈리므로, 테두리 대비와 그림자로 알린다. */
+@media (hover: hover) {
+  .s-card:hover {
+    border-color: var(--control-line);
+    box-shadow: 0 2px 10px rgb(0 0 0 / 0.07);
+    transform: translateY(-1px);
+  }
+}
+
+.s-card:focus-within {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .s-card { transition: none; }
+  .s-card:hover { transform: none; }
+}
+
+.s-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 2px;
+}
+
+/* The name is an identifier: it breaks at its own hyphens, never inside a
+   Hangul word elsewhere on the card. */
+.s-head code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--w-med);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.s-tag {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: var(--w-med);
+}
+
+/* 훑을 때 읽는 줄. 이름과 설명 사이에서 "무엇에 쓰는가" 만 답한다. */
+.s-use {
+  margin: 0 0 4px;
+  color: var(--muted);
+  /* 11px 였다 -- 본문 하한 12px 아래다. 13px(--text-xs)로 올리면 2줄이 17장으로
+     늘어 카드가 더 들쭉날쭉해진다(실측 1줄5/2줄17). 하한인 12px 가 접점이다.
+     "기능 1줄"은 글자 크기로는 도달할 수 없다 -- 11px 에서도 절반이 2줄이었다.
+     한 줄로 만들려면 레지스트리의 기능 목록 자체를 줄여야 한다(내용 결정). */
+  font-size: 12px;
+  line-height: 1.45;
+  text-wrap: pretty;
+  /* 기능 목록이라 1줄로 자르면 기능이 사라진다. 2줄로 최악만 없앤다. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.s-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  text-wrap: pretty;
+  /* 4~5줄짜리가 3장 있어 그 행만 키웠다. 넘치는 줄은 두 번째 문장(보충)이다. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+
+.optional-note {
+  margin: var(--space-8) 0 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--muted);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+
+.optional-note strong { color: var(--text); }
+
+.how { margin-top: var(--space-4); }
+
+/* A disclosure used as a section note: same measure as .s-note above it, and a
+   tighter top gap than the standalone usage strip at the foot of the page. */
+.s-head-row .usage { margin-top: var(--space-3); max-width: 74ch; }
+
+.ops-tree {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: flex-end;
+  margin: var(--space-8) 0 var(--space-4);
+}
+
+.field { flex: 1 1 320px; min-width: 0; }
+.field-narrow { flex: 0 1 220px; }
+.field input, .field select { width: 100%; }
+
+.result-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+#count { margin: 0; }
+
+.reset-button {
+  min-height: 36px;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--control-line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: inherit;
+  font-size: var(--text-xs);
+  font-weight: var(--w-med);
+  cursor: pointer;
+}
+
+.reset-button:hover { background: var(--soft); }
+.reset-button[hidden] { display: none; }
+
+.grid { grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
+
+#skills .card {
+  display: flex;
+  flex-direction: column;
+  /* Page-scoped: the registry list is the longest part of the page, so it uses
+     a tighter box than the shared --card-pad. Tap targets are untouched. */
+  padding: var(--space-4) var(--space-4) var(--space-3);
+}
+
+#skills .card h3 {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-lg);
+  letter-spacing: -0.02em;
+}
+
+.badge-version {
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+}
+
+.description { margin: 0 0 var(--space-3); font-size: var(--text-sm); }
+
+#skills .badges { margin: var(--space-2) 0 var(--space-3); }
+
+.card-foot { margin-top: auto; }
+
+.command {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--soft);
+}
+
+.command code {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: center;
+  overflow-wrap: anywhere;
+  font-size: var(--text-sm);
+}
+
+.copy-button {
+  flex: 0 0 auto;
+  min-width: 60px;
+  min-height: var(--tap-min);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--control-line);
+  border-radius: 6px;
+  background: var(--card);
+  color: inherit;
+  font-size: var(--text-xs);
+  font-weight: var(--w-med);
+  cursor: pointer;
+}
+
+.copy-button:hover { background: var(--bg); }
+.copy-button[data-copied="true"] { color: var(--ok); border-color: var(--ok); }
+
+.card-links {
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+}
+
+.card-links a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap-min);
+  color: var(--muted);
+}
+.card-links a:hover { color: var(--accent); }
+
+.empty {
+  padding: var(--space-8) var(--space-6);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty p { margin: 0 0 var(--space-4); }
+
+#error {
+  display: none;
+  padding: var(--space-6);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--muted);
+}
+</style>
+</head>
+
+<body>
+<svg class="sprite" aria-hidden="true" focusable="false"><symbol id="gh-mark" viewBox="0 0 16 16"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></symbol></svg>
+{{NAV}}
+
+<div class="wrap">
+
+
+<main id="main">
+
+<div class="masthead">
+  <h1>Skills Hub</h1>
+  <p class="subtitle">
+    @@BRAND@@ 개발환경에서 바로 쓸 수 있는 Skill 목록입니다.
+    <strong>Skill</strong>은 Agent가 업무를 수행하는 <em>방법</em>을 알려 줍니다.
+    실제 실행 기능은 <a href="https://@@PORTAL_HOST@@/tools/">Tools Hub</a>에 있습니다.
+  </p>
+
+  <ul class="summary" aria-label="Skill 구성 요약">
+    <li><a href="#core"><b>24</b><span class="summary-name">Core Skills</span><span class="summary-sub">기본 제공</span></a></li>
+    <li><a href="#superpowers"><b>15</b><span class="summary-name">Superpowers</span><span class="summary-sub">워크플로</span></a></li>
+    <li><a href="#catalog"><b>25</b><span class="summary-name">Catalog</span><span class="summary-sub">선택 설치</span></a></li>
+  </ul>
+
+  <p class="meta-line" id="data-meta"></p>
+</div>
+
+<section class="s-section" id="core" aria-labelledby="core-h">
+  <div class="s-head-row">
+    <h2 id="core-h">Core Skills · 24</h2>
+    <p class="s-note">설치 없이 바로 사용 · Claude · Codex · Antigravity 공용 · @@BRAND@@ 중앙 관리</p>
+    <p class="s-note">
+      중앙 원본 <code>/opt/@@PFX@@/skills</code>에서 <strong>Claude</strong>,
+      <strong>Codex</strong>, <strong>Antigravity</strong>(<code>agy</code>) 세 Agent로
+      동기화됩니다.
+    </p>
+  </div>
+{{CORE_SKILLS}}
+</section>
+
+<section class="s-section s-alt" id="superpowers" aria-labelledby="sp-h">
+  <div class="s-head-row">
+    <h2 id="sp-h">Superpowers · 15<a class="s-repo" href="https://github.com/obra/superpowers" rel="noopener" title="원 프로젝트 저장소 · obra/superpowers"><svg width="14" height="14" aria-hidden="true" focusable="false"><use href="#gh-mark"></use></svg><span class="sr-only">Superpowers 원 프로젝트 저장소 obra/superpowers</span></a></h2>
+    <p class="s-note">
+      아이디어 정리, 계획 수립·실행, 디버깅, 테스트·검증, 코드 리뷰, 병렬 작업,
+      git worktree, Skill 작성까지 다루는 워크플로우 Skill 세트입니다.
+      Plugin으로 기본 제공되며 Core 24개와는 별개입니다.
+    </p>
+  </div>
+{{SUPERPOWERS}}
+</section>
+
+<section class="s-section" id="catalog" aria-labelledby="catalog-h">
+  <div class="s-head-row">
+    <h2 id="catalog-h">Catalog Skills · 선택 설치</h2>
+    <p class="s-note">
+      모두 Optional Catalog Skill입니다. 기본 제공 Core 24개에 포함되지 않으며,
+      필요할 때 골라서 설치합니다. <code>@@PFX@@-skill install &lt;name&gt;</code>
+    </p>
+    <p class="s-note">
+      <code>mckinsey-pptx</code>는 McKinsey &amp; Company의 공식 제품이 아니며
+      제휴 관계도 없는 제3자 오픈소스입니다.
+    </p>
+    <p class="s-note">
+      <code>hyperframes</code>는 설치 후 첫 실행에서 <strong>전용 Chrome 약 260MB</strong>를
+      홈에 내려받습니다. 실행 도구도 <code>npx</code>로 그때 받으므로
+      <strong>네트워크가 필요하고 중앙에서 관리되지 않습니다</strong>.
+      HeyGen 클라우드 게시는 별도 키가 있어야 하며 기본값이 아닙니다.
+    </p>
+  </div>
+
+  <form class="toolbar" id="filters" role="search" aria-label="Catalog Skill 검색">
+    <div class="field">
+      <label class="field-label" for="search">Catalog Skill 검색</label>
+      <input id="search" type="search" placeholder="예: DART, 통계, 공문서" autocomplete="off">
+    </div>
+
+    <div class="field field-narrow">
+      <label class="field-label" for="category">카테고리</label>
+      <select id="category">
+        <option value="">전체 카테고리</option>
+      </select>
+    </div>
+  </form>
+
+  <div class="result-bar">
+    <p id="count" role="status" aria-atomic="true"></p>
+    <button type="button" class="reset-button" id="reset" hidden>필터 초기화</button>
+  </div>
+
+  <div id="error">
+    Skills 정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.
+  </div>
+
+  <div id="skills" class="grid"></div>
+</section>
+
+<p class="optional-note">
+  이 밖의 <strong>Plugin / Agent Skill</strong>(Claude marketplace, Codex plugin 등)은
+  필요에 따라 추가로 사용할 수 있습니다. 기본 제공 Core Skill에는 포함되지 않습니다.
+</p>
+
+<details class="usage">
+  <summary>Core Skill과 겹쳐 보일 때 — 역할 구분</summary>
+  <div class="usage-body">
+    <div class="usage-item">
+      <strong>다이어그램</strong>
+      <p><code>archify</code>(Core)는 코드베이스 근거가 있는 시스템 맵, <code>diagram-design</code>은 브랜드⁠·발표용.</p>
+    </div>
+    <div class="usage-item">
+      <strong>슬라이드</strong>
+      <p><code>slides</code>(Core)는 HTML 프레젠테이션, <code>mckinsey-pptx</code>는 템플릿 기반 보고용 PPTX.</p>
+    </div>
+    <div class="usage-item">
+      <strong>차트</strong>
+      <p><code>lieflat-charts</code>는 수치 중심 HTML 차트, 일반 페이지는 <code>html</code>(Core).</p>
+    </div>
+    <div class="usage-item">
+      <p>대체가 아니라 보완입니다. 겹쳐 보여도 쓰는 자리가 다릅니다.</p>
+    </div>
+  </div>
+</details>
+
+<details class="usage how">
+  <summary>How it works — 배포 경로와 명령</summary>
+  <div class="usage-body">
+    <div class="usage-item">
+      <p>
+        Core Skill은 중앙 원본(<code>/opt/@@PFX@@/skills</code>)을 기준으로
+        회원 환경에 동기화됩니다. @@BRAND@@이 관리하는 Skill만 갱신되고,
+        같은 이름의 개인 Skill은 덮어쓰지 않습니다.
+      </p>
+      <pre class="ops-tree">@@BRAND@@ Core
+   ├─ ~/.claude/skills
+   └─ ~/.agents/skills</pre>
+    </div>
+
+    <div class="usage-item">
+      <p>
+        <code class="cmd">@@PFX@@-skill-sync</code>
+        기본 제공 Skill을 현재 기준으로 다시 맞춥니다. 여러 번 실행해도 안전합니다.
+      </p>
+      <p>
+        <code class="cmd">@@PFX@@-skill install &lt;name&gt;</code>
+        Catalog Skill을 설치합니다. <code>@@PFX@@-skill</code>이 관리하는 대상은 Catalog뿐입니다.
+      </p>
+    </div>
+
+    <div class="usage-item">
+      <p>
+        Claude Code에서 <code>/skills</code>를 실행하면 Core Skill과 Plugin Skill이 함께 보입니다.
+        자세한 순서는 <a href="https://@@PORTAL_HOST@@/#capabilities">Portal 안내</a>를 참고하세요.
+      </p>
+    </div>
+  </div>
+</details>
+</main>
+
+<footer>
+  @@BRAND@@ Skills Hub · 기본 제공 Core Skill, Superpowers 워크플로 Skill, 선택 설치용 Catalog Skill을 안내합니다.
+</footer>
+
+</div>
+
+<script>
+{{SHARED_JS}}
+
+const root = document.getElementById("skills");
+const errorBox = document.getElementById("error");
+const searchBox = document.getElementById("search");
+const categoryBox = document.getElementById("category");
+const countBox = document.getElementById("count");
+const resetButton = document.getElementById("reset");
+const dataMeta = document.getElementById("data-meta");
+
+let allSkills = [];
+
+/* Read out of each Skill's artifact manifest at build time, never authored
+   here: {name: {notice, license}} for the Skills whose license restricts use. */
+const LICENSE_NOTES = {{LICENSE_NOTES}};
+const CATALOG_UPSTREAM = {{CATALOG_UPSTREAM}};
+
+/* Build one skill card with DOM APIs so no data value is ever parsed as HTML. */
+function buildSkill(skill) {
+  const name = String(skill.name ?? "");
+  const card = document.createElement("section");
+  card.className = "card";
+
+  const heading = document.createElement("h3");
+  heading.textContent = skill.display_name || name;
+  /* 출처 저장소. 제목 줄 오른쪽 끝 -- Core 카드와 같은 자리, 같은 동작. */
+  const repoUrl = CATALOG_UPSTREAM[name];
+  if (repoUrl) {
+    const link = document.createElement("a");
+    link.className = "s-repo";
+    link.href = repoUrl;
+    link.rel = "noopener";
+    const repo = repoUrl.replace(/^https?:\/\/github\.com\//, "");
+    link.title = `원 프로젝트 저장소 · ${repo}`;
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("width", "13");
+    svg.setAttribute("height", "13");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    const use = document.createElementNS(ns, "use");
+    use.setAttribute("href", "#gh-mark");
+    svg.appendChild(use);
+    link.appendChild(svg);
+    const label = document.createElement("span");
+    label.className = "sr-only";
+    label.textContent = `${name} 원 프로젝트 저장소 ${repo}`;
+    link.appendChild(label);
+    heading.appendChild(link);
+  }
+  card.appendChild(heading);
+
+  const badges = document.createElement("div");
+  badges.className = "badges";
+
+  const category = document.createElement("span");
+  category.className = "badge";
+  category.textContent = skill.category || "other";
+  badges.appendChild(category);
+
+  const version = document.createElement("span");
+  version.className = "badge badge-version";
+  version.textContent = skill.latest || "-";
+  badges.appendChild(version);
+
+  const licenseNote = LICENSE_NOTES[name];
+  if (licenseNote) {
+    const flag = document.createElement("span");
+    flag.className = "badge badge-hold";
+    flag.textContent = "라이선스 확인";
+    badges.appendChild(flag);
+  }
+
+  card.appendChild(badges);
+
+  const description = document.createElement("p");
+  description.className = "description";
+  description.textContent = bindSeparators(skill.description || "");
+  card.appendChild(description);
+
+  const foot = document.createElement("div");
+  foot.className = "card-foot";
+
+  /* Before the install command, not after it: a member who reads only as far
+     as the command they are about to run still sees the restriction. */
+  if (licenseNote) {
+    const box = document.createElement("p");
+    box.className = "license-note";
+
+    const mark = document.createElement("span");
+    mark.className = "license-mark";
+    mark.textContent = "!";
+    mark.setAttribute("aria-hidden", "true");
+    box.appendChild(mark);
+
+    const body = document.createElement("span");
+    body.textContent = licenseNote.notice;
+    if (licenseNote.license) {
+      const which = document.createElement("span");
+      which.className = "license-name";
+      which.textContent = `License: ${licenseNote.license}`;
+      body.appendChild(which);
+    }
+    box.appendChild(body);
+    foot.appendChild(box);
+  }
+
+  const command = `@@PFX@@-skill install ${name}`;
+
+  const commandBox = document.createElement("div");
+  commandBox.className = "command";
+
+  const commandCode = document.createElement("code");
+  commandCode.textContent = command;
+  commandBox.appendChild(commandCode);
+
+  const copyButton = document.createElement("button");
+  copyButton.type = "button";
+  copyButton.className = "copy-button";
+  copyButton.textContent = "복사";
+  copyButton.setAttribute("aria-label", `${command} 명령 복사`);
+  /* The label changes on click, so the accessible name has to be rewritten
+     with it: WCAG 2.5.3 needs the visible word to appear in the name, in the
+     result states too, or voice control cannot reach the button it can see. */
+  const relabel = (word) => {
+    copyButton.textContent = word;
+    copyButton.setAttribute("aria-label", `${word}: ${command} 명령`);
+  };
+  relabel("복사");
+
+  copyButton.addEventListener("click", async () => {
+    const ok = await copyText(command);
+    relabel(ok ? "복사됨" : "실패");
+    copyButton.dataset.copied = ok ? "true" : "false";
+    window.setTimeout(() => {
+      relabel("복사");
+      delete copyButton.dataset.copied;
+    }, 1600);
+  });
+  commandBox.appendChild(copyButton);
+
+  foot.appendChild(commandBox);
+
+  // registry 의 manifest 는 허브 기준 경로(/artifacts/…)다 — 이 페이지는 /skills/ 아래라 «현재 폴더» 기준으로 풀어야 열린다(origin 기준이면 404)
+  const manifestRaw = typeof skill.manifest === "string" && skill.manifest.startsWith("/")
+    ? location.pathname.replace(/[^/]*$/, "") + skill.manifest.slice(1)
+    : skill.manifest;
+  const manifest = safeUrl(manifestRaw);
+  if (manifest) {
+    const links = document.createElement("div");
+    links.className = "card-links";
+    const link = document.createElement("a");
+    link.href = manifest;
+    link.textContent = "manifest.json 보기";
+    links.appendChild(link);
+    foot.appendChild(links);
+  }
+
+  card.appendChild(foot);
+  return card;
+}
+
+function buildEmpty(query) {
+  const box = document.createElement("div");
+  box.className = "empty";
+
+  const message = document.createElement("p");
+  message.textContent = "조건에 맞는 Skill이 없습니다.";
+  box.appendChild(message);
+
+  const hint = document.createElement("p");
+  hint.className = "note";
+  hint.textContent = "검색어를 줄이거나 카테고리를 전체로 바꿔 보세요.";
+  box.appendChild(hint);
+
+  /* A Tools Hub deep link can name a Golden Skill, which is pre-installed and
+     therefore not part of this installable Catalog registry. Say so instead of
+     leaving the member at a dead end. */
+  if (query) {
+    const catalogNote = document.createElement("p");
+    catalogNote.className = "note";
+    catalogNote.textContent =
+      `"${query}"는 기본 제공 Core Skill이거나 확장 플러그인(Superpowers)에 포함된 ` +
+      "Skill일 수 있습니다. 이 목록은 설치 가능한 Catalog Skill만 표시하며, " +
+      "기본 제공 Skill은 Claude Code에서 /skills 로 확인합니다.";
+    box.appendChild(catalogNote);
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "button";
+  button.textContent = "필터 초기화";
+  button.addEventListener("click", resetFilters);
+  box.appendChild(button);
+
+  return box;
+}
+
+function resetFilters() {
+  searchBox.value = "";
+  categoryBox.value = "";
+  render();
+  searchBox.focus();
+}
+
+function render() {
+  const query = searchBox.value.trim().toLowerCase();
+  const category = categoryBox.value;
+
+  const filtered = allSkills.filter(skill => {
+    const text = [
+      skill.name,
+      skill.display_name,
+      skill.description,
+      skill.category
+    ].join(" ").toLowerCase();
+
+    const queryMatch = !query || text.includes(query);
+    const categoryMatch = !category || skill.category === category;
+
+    return queryMatch && categoryMatch;
+  });
+
+  const isFiltered = Boolean(query || category);
+  resetButton.hidden = !isFiltered;
+
+  countBox.textContent = isFiltered
+    ? `전체 ${allSkills.length}개 중 ${filtered.length}개 표시`
+    : `Catalog Skill ${allSkills.length}개`;
+
+  root.replaceChildren();
+
+  if (filtered.length === 0) {
+    root.appendChild(buildEmpty(searchBox.value.trim()));
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  filtered.forEach(skill => fragment.appendChild(buildSkill(skill)));
+  root.appendChild(fragment);
+}
+
+/* Accept ?q= / ?category= so Tools Hub can deep-link to a specific Skill. */
+function applyDeepLink() {
+  const params = new URLSearchParams(window.location.search);
+  const query = params.get("q");
+  const category = params.get("category");
+
+  if (query) searchBox.value = query;
+  if (category) categoryBox.value = category;
+}
+
+fetch("./index.json", { cache: "no-store" })
+  .then(response => {
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json();
+  })
+  .then(data => {
+    allSkills = Array.isArray(data.skills) ? data.skills : [];
+
+    const categories = [...new Set(
+      allSkills
+        .map(skill => skill.category)
+        .filter(Boolean)
+    )].sort();
+
+    categories.forEach(category => {
+      const option = document.createElement("option");
+      option.value = category;
+      option.textContent = category;
+      categoryBox.appendChild(option);
+    });
+
+    const generated = formatDate(data.generated_at);
+    if (generated) {
+      dataMeta.textContent = `registry 기준 ${generated}`;
+    }
+
+    applyDeepLink();
+    render();
+  })
+  .catch(error => {
+    console.error(error);
+    errorBox.style.display = "block";
+    countBox.textContent = "";
+  });
+
+/* Enter in the search box must not reload the page (no server-side search). */
+document.getElementById("filters").addEventListener("submit", event => {
+  event.preventDefault();
+});
+
+searchBox.addEventListener("input", render);
+categoryBox.addEventListener("change", render);
+resetButton.addEventListener("click", resetFilters);
+</script>
+
+</body>
+</html>

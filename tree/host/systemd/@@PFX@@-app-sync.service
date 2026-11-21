@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply member app publish requests (rule-based auto approval, Caddy apps.d)
+After=docker.service caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/@@PFX@@-app-sync
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=120
+ProtectSystem=strict
+ReadWritePaths=/etc/caddy /etc/@@PFX@@/apps /var/lib/@@PFX@@ /home /run
+PrivateTmp=yes
+NoNewPrivileges=yes

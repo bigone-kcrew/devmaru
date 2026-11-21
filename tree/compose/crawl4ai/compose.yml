@@ -1,0 +1,101 @@
+# crawl4ai (회원·중앙용): 중앙 엔진 + 회원 MCP 안전 게이트웨이.
+# 엔진 이미지 태그는 맨 위 x-crawl4ai-image 한 줄만 고친다(update-crawl4ai.sh 가 이 줄을 바꾼다).
+# 토큰·SECRET_KEY 는 같은 디렉터리 .env 하나(root 600)에서 읽는다.
+x-crawl4ai-image: &c4ai-image unclecode/crawl4ai:0.9.5
+
+services:
+  crawl4ai:
+    image: *c4ai-image
+    container_name: crawl4ai
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      TZ: @@TZ@@
+
+    networks:
+      - @@PFX@@-dev-net
+
+    shm_size: "1gb"
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    read_only: true
+
+    tmpfs:
+      - /tmp
+      - /var/lib/redis:uid=999,gid=999,mode=0700
+      - /var/lib/crawl4ai/outputs:uid=999,gid=999,mode=0700
+      - /home/appuser/.crawl4ai:uid=999,gid=999,mode=0700
+      - /home/appuser/.cache/url_seeder:uid=999,gid=999,mode=0700
+      - /home/appuser/.gunicorn:uid=999,gid=999,mode=0700
+
+    pids_limit: 512
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:11235/health
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # 회원 MCP(managed-mcp/crawl4ai)가 호출하는 게이트웨이. 자체 빌드 이미지라 엔진 버전과 별도로 관리한다.
+  crawl4ai-api:
+    build: ./api
+    image: @@PFX@@-crawl4ai-api:0.3.2
+    container_name: crawl4ai-api
+    restart: unless-stopped
+
+    depends_on:
+      crawl4ai:
+        condition: service_healthy
+
+    environment:
+      TZ: @@TZ@@
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?.env 에 CRAWL4AI_API_TOKEN 이 필요합니다}
+      CRAWL4AI_UPSTREAM: http://crawl4ai:11235
+      CRAWL4AI_MAX_CONCURRENCY: "2"
+      CRAWL4AI_UPSTREAM_TIMEOUT_SECONDS: "180"
+      CRAWL4AI_SITE_TIMEOUT_SECONDS: "900"
+
+    ports:
+      - "127.0.0.1:3431:3431"
+
+    networks:
+      - @@PFX@@-dev-net
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    read_only: true
+
+    tmpfs:
+      - /tmp
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3431/health')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  @@PFX@@-dev-net:
+    external: true

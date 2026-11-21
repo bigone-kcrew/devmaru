@@ -1,0 +1,26 @@
+# @@PFX@@-publish (v2): 멤버 사이트 «사본»(/srv/@@PFX@@/site/<멤버>/<프로젝트>)을 서빙하는 샌드박스 Caddy (127.0.0.1:18090 전용).
+# 사본은 root 가 @@PFX@@-site-sync 로 만든다 — 일반 파일과 폴더뿐이고 링크가 없다. 멤버 폴더(/srv/@@PFX@@/users)는 이 서버에 보이지 않는다.
+# 기존 Caddy 가 허용 IP 확인 뒤 X-Member 헤더를 붙여 프록시한다. 직접 바꾸지 말 것(@@PFX@@-publish.service 재시작으로 반영).
+{
+	admin off
+	auto_https off
+}
+http://:18090 {   # Host 는 운영 Caddy 가 원래 값(<id>.@@DOMAIN@@)을 넘기므로 호스트 무관, 접근은 bind 로 loopback 한정
+	bind 127.0.0.1
+	@ok header_regexp m X-Member ^[a-z][a-z0-9-]{1,30}$
+	handle @ok {
+		root * {$AI_SITE_ROOT:/srv/@@PFX@@/site}/{header.X-Member}
+		@np not path_regexp ^/[A-Za-z0-9_-]+(/.*)?$
+		respond @np 404
+		@hidden path_regexp (^|/)\.[^/]
+		respond @hidden 404
+		@slashless path_regexp ^/[A-Za-z0-9_-]+$
+		redir @slashless {path}/ 301
+		header X-Robots-Tag "noindex, nofollow"
+		header X-Content-Type-Options nosniff
+		header -Server
+		encode zstd gzip
+		file_server
+	}
+	respond 400
+}

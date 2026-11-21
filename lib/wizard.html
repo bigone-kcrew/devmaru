@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>devmaru 설치</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1b1f24;--sub:#5b6570;--line:#dfe3e8;--acc:#2f6fed;--acc-ink:#fff;--ok:#1a7f4b;--warn:#a15c00;--bad:#c62828;--log:#0f1419;--logink:#d6dde5}
+@media (prefers-color-scheme:dark){:root{--bg:#10141a;--card:#181d25;--ink:#e8ecf1;--sub:#9aa5b1;--line:#2a313b;--acc:#5b8cff;--acc-ink:#0b1020;--ok:#4cc38a;--warn:#e0a040;--bad:#ff6b6b;--log:#0a0d12}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI","Noto Sans KR",sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}
+.sub{color:var(--sub);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px}
+label{display:block;font-weight:600;margin:12px 0 4px}
+input[type=text],input[type=password],select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+input:focus,select:focus{outline:2px solid var(--acc);outline-offset:1px}
+.hint{color:var(--sub);font-size:13px;margin-top:3px}
+.mods{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px}
+.mod{border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:flex;gap:8px;align-items:flex-start}
+.mod small{color:var(--sub);display:block}
+button{font:inherit;border:0;border-radius:8px;padding:10px 18px;cursor:pointer;background:var(--acc);color:var(--acc-ink);font-weight:600}
+button.sec{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+.err{color:var(--bad);font-weight:600;margin-top:10px;white-space:pre-wrap}
+.stages{list-style:none;margin:0;padding:0}
+.stages li{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
+.stages li:last-child{border:0}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--line);flex:none}
+.s-start .dot{background:var(--acc);animation:p 1s infinite}.s-ok .dot{background:var(--ok)}.s-failed .dot{background:var(--bad)}.s-skipped .dot{background:var(--sub)}
+@keyframes p{50%{opacity:.35}}@media (prefers-reduced-motion:reduce){.s-start .dot{animation:none}}
+.t{margin-left:auto;color:var(--sub);font-size:13px}
+.bar{height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin:6px 0 14px}.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
+#log{background:var(--log);color:var(--logink);border-radius:8px;padding:12px;height:300px;overflow:auto;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+#log .성공{color:#4cc38a}#log .실패{color:#ff7b7b;font-weight:700}#log .경고{color:#e8b04a}
+code{background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px}
+pre.cmd{background:var(--log);color:var(--logink);padding:10px 12px;border-radius:8px;overflow:auto}
+.hide{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>devmaru 설치</h1>
+<p class="sub">한 대의 서버에 AI 협업 환경을 설치합니다. 질문에 답하고 «설치 시작»을 누르세요. 접두어는 처음 한 번만 정하며 이후 바꾸지 않습니다.</p>
+
+<section id="v-form">
+  <div class="card"><h2>1. 기본 정보</h2><div id="qs"></div>
+    <details style="margin-top:14px"><summary>고급 설정</summary>
+      <label for="TLS_MODE">인증서 방식</label>
+      <select id="TLS_MODE"><option value="acme">공인 인증서 자동 발급(기본 — 도메인과 80/443 필요)</option><option value="internal">내부 인증서(내부망·시험용, 브라우저 경고)</option></select>
+      <label for="WORKSPACE_OTHERS">다른 회원의 내 workspace 접근</label>
+      <select id="WORKSPACE_OTHERS"><option value="none">읽기·쓰기 모두 불가(기본)</option><option value="read">읽기만 가능(쓰기는 항상 불가)</option></select>
+      <label for="SHARED_DEFAULT">공유 프로젝트 기본 권한</label>
+      <select id="SHARED_DEFAULT"><option value="rw">회원 전원 읽기·쓰기(기본)</option><option value="ro">읽기만(쓰기는 만든 사람·관리자)</option></select>
+      <label style="font-weight:400"><input type="checkbox" id="GOLDEN_VOICE"> Paseo 음성 모델 포함(영어 전용·용량 큼)</label>
+      <label style="font-weight:400"><input type="checkbox" id="GOLDEN_OFFICE" checked> 사무 문서 도구 포함(LibreOffice·한글 글꼴, 약 +570MB — pptx·docx·xlsx 변환·확인)</label>
+      <label for="N8N_WORKFLOWS">n8n 워크플로 템플릿 (n8n 설치 시)</label>
+      <select id="N8N_WORKFLOWS"><option value="none">가져오지 않음(기본)</option><option value="generic">범용 템플릿 가져오기 — 회원 온보딩 메일·운영 알림(비활성 상태로)</option></select>
+    </details></div>
+  <div class="card"><h2>2. 설치할 서비스</h2><div class="mods" id="mods"></div><p class="hint">필수 항목은 항상 설치됩니다.</p></div>
+  <div class="card hide" id="mailcard"><h2>3. 메일 자동 발송 설정</h2>
+    <p class="hint">회원을 등록하면 초기 비밀번호와 Paseo QR 을 메일로 보냅니다. 비밀번호는 서버의 비밀 폴더에만 저장되고 설정 파일에는 쓰지 않습니다.</p>
+    <label for="m-MODE">발송 방식</label><select id="m-MODE"><option value="smtp">SMTP 로 직접 보냄 (n8n 불필요)</option><option value="n8n">n8n 워크플로로 보냄 (n8n 이 같이 설치되고, 설치 뒤 n8n 화면에서 SMTP 자격증명을 고릅니다)</option></select>
+    <div id="m-smtp"><label for="m-HOST">SMTP 서버 주소</label><input type="text" id="m-HOST" placeholder="smtp.example.org">
+    <label for="m-PORT">포트</label><input type="text" id="m-PORT" value="587">
+    <label for="m-SEC">암호화</label><select id="m-SEC"><option value="starttls">STARTTLS (587)</option><option value="ssl">SSL/TLS (465)</option><option value="none">없음(내부 릴레이)</option></select>
+    <label for="m-USER">SMTP 계정 (인증이 없으면 비움)</label><input type="text" id="m-USER" autocomplete="off">
+    <label for="m-PW">SMTP 비밀번호</label><input type="password" id="m-PW" autocomplete="new-password">
+    <label for="m-FROM">보내는 사람 주소</label><input type="text" id="m-FROM" placeholder="noreply@example.org"></div></div>
+  <div class="row"><button id="btn-plan">설치 계획 확인</button></div>
+  <div class="err" id="err"></div>
+</section>
+
+<section id="v-confirm" class="hide">
+  <div class="card"><h2>설치 계획</h2><div id="plan"></div></div>
+  <div class="row"><button id="btn-go">설치 시작</button><button class="sec" id="btn-back">돌아가기</button></div>
+</section>
+
+<section id="v-run" class="hide">
+  <div class="card"><h2 id="run-title">설치 진행 중</h2><div class="bar"><i id="bar"></i></div><ul class="stages" id="stages"></ul></div>
+  <div class="card"><h2>진행 로그</h2><div id="log" aria-live="polite"></div></div>
+  <div class="card hide" id="result"></div>
+</section>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const HINT={PFX:'명령·폴더·이미지 이름에 붙는 짧은 이름(소문자 시작, 소문자·숫자 2~12자). 예: devmaru, myorg',DOMAIN:'예: example.org — A 레코드가 이 서버를 가리켜야 합니다',ADMIN_CIDRS:'관리 화면(/ops·Cockpit) 접속 허용 IP 대역, 공백으로 구분'};
+let init=null,stageIdx={};
+async function api(p,b){const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});return r.json()}
+function form(){const values={};init.questions.forEach(q=>values[q.key]=$('#f-'+q.key).value.trim());values.TLS_MODE=$('#TLS_MODE').value;values.N8N_WORKFLOWS=$('#N8N_WORKFLOWS').value;values.WORKSPACE_OTHERS=$('#WORKSPACE_OTHERS').value;values.SHARED_DEFAULT=$('#SHARED_DEFAULT').value;values.GOLDEN_VOICE=$('#GOLDEN_VOICE').checked?'1':'0';values.GOLDEN_OFFICE=$('#GOLDEN_OFFICE').checked?'1':'0';
+  if($('#mods input[value=mail]').checked){values.MAIL_MODE=$('#m-MODE').value;if(values.MAIL_MODE==='smtp'){values.MAIL_SMTP_HOST=$('#m-HOST').value.trim();values.MAIL_SMTP_PORT=$('#m-PORT').value.trim();values.MAIL_SMTP_SECURITY=$('#m-SEC').value;values.MAIL_SMTP_USER=$('#m-USER').value.trim();values.MAIL_SMTP_PASSWORD=$('#m-PW').value;values.MAIL_FROM=$('#m-FROM').value.trim()}}
+  const modules=[...document.querySelectorAll('#mods input')].filter(i=>i.checked).map(i=>i.value);return{values,modules}}
+(async()=>{init=await api('/api/init');
+  $('#qs').innerHTML=init.questions.map(q=>`<label for="f-${q.key}">${esc(q.label)}</label><input type="text" id="f-${q.key}" value="${esc(q.default)}">${HINT[q.key]?`<div class="hint">${esc(HINT[q.key])}</div>`:''}`).join('');
+  $('#mods').innerHTML=init.modules.map(m=>`<label class="mod" style="font-weight:400;margin:0"><input type="checkbox" value="${m.name}" ${m.default?'checked':''} ${m.required?'disabled':''}><span><b>${m.name}</b><small>${esc(m.desc)}</small></span></label>`).join('');
+  const touched={};['BRAND','ADMIN_EMAIL'].forEach(k=>$('#f-'+k).addEventListener('input',()=>touched[k]=1));
+  $('#f-PFX').addEventListener('input',()=>{if(!touched.BRAND){const v=$('#f-PFX').value;$('#f-BRAND').value=v?v.charAt(0).toUpperCase()+v.slice(1):''}});
+  $('#f-DOMAIN').addEventListener('input',()=>{if(!touched.ADMIN_EMAIL)$('#f-ADMIN_EMAIL').value='admin@'+$('#f-DOMAIN').value.trim()});
+  $('#m-MODE').addEventListener('change',()=>$('#m-smtp').classList.toggle('hide',$('#m-MODE').value!=='smtp'));
+  const mailBox=$('#mods input[value=mail]');if(mailBox)mailBox.addEventListener('change',()=>$('#mailcard').classList.toggle('hide',!mailBox.checked));
+  if(init.state==='running'){go(true)}})();
+$('#btn-plan').onclick=async()=>{$('#err').textContent='';const f=form();f.modules=[...new Set([...init.modules.filter(m=>m.required).map(m=>m.name),...f.modules])];
+  const r=await api('/api/plan',f);if(!r.ok){$('#err').textContent=r.error;return}
+  const v=r.values;$('#plan').innerHTML=`<p>접두어 <code>${esc(v.PFX)}</code> · 서비스 이름 <b>${esc(v.BRAND)}</b> · 도메인 <code>${esc(v.DOMAIN)}</code></p><p>설치 모듈: ${v.MODULES.split(' ').map(m=>`<code>${m}</code>`).join(' ')}</p><p>단계: ${r.stages.map(s=>esc(s[1])).join(' → ')}</p><p class="hint">Golden 이미지 빌드는 인터넷 속도에 따라 수 분~수십 분 걸립니다. 설치 중 이 창을 닫아도 설치는 계속됩니다.</p>`;
+  $('#v-form').classList.add('hide');$('#v-confirm').classList.remove('hide');window._f=f};
+$('#btn-back').onclick=()=>{$('#v-confirm').classList.add('hide');$('#v-form').classList.remove('hide')};
+$('#btn-go').onclick=()=>go(false);
+async function go(attach,resume){if(!attach){const r=await api('/api/start',Object.assign({},window._f,{resume:!!resume}));if(!r.ok){alert(r.error);return}}
+  $('#v-form').classList.add('hide');$('#v-confirm').classList.add('hide');$('#v-run').classList.remove('hide');$('#result').classList.add('hide');$('#log').innerHTML='';$('#stages').innerHTML='';$('#run-title').textContent='설치 진행 중';stageIdx={};
+  const es=new EventSource('/api/events?from=0');es.onmessage=e=>{const d=JSON.parse(e.data);handle(d);if(d.kind==='done')es.close()}}
+function handle(d){
+  if(d.kind==='plan'){$('#stages').innerHTML=d.stages.map(s=>`<li id="st-${s[0]}" class="s-wait"><span class="dot"></span><span>${esc(s[1])}</span><span class="t"></span></li>`).join('')}
+  else if(d.kind==='stage'){const li=$('#st-'+d.id);if(!li)return;li.className='s-'+d.status;li.querySelector('.t').textContent=d.status==='ok'?d.seconds+'초'+(d.warnings?' · 경고 '+d.warnings:''):d.status==='skipped'?'건너뜀':d.status==='failed'?'실패':'진행 중';
+    const done=document.querySelectorAll('.s-ok,.s-skipped').length,tot=document.querySelectorAll('#stages li').length;$('#bar').style.width=(100*done/tot)+'%'}
+  else if(d.kind==='line'){const k=d.text.slice(0,2);const el=document.createElement('div');el.className=k;el.textContent=d.text;$('#log').appendChild(el);$('#log').scrollTop=1e9}
+  else if(d.kind==='tail'){const el=document.createElement('div');el.textContent='--- 마지막 출력(원문) ---\n'+d.lines.join('\n');$('#log').appendChild(el)}
+  else if(d.kind==='done'){const r=$('#result');r.classList.remove('hide');
+    if(d.ok){$('#bar').style.width='100%';$('#run-title').textContent='설치 완료';r.innerHTML=`<h2>설치가 끝났습니다 (${d.seconds}초)</h2><h2>설치 후 첫 설정 체크리스트</h2><ul>${(d.checklist||[]).map(c=>`<li><b>${esc(c[0])}</b> — ${esc(c[1])}</li>`).join('')}</ul><p class="hint">이 화면은 Ctrl+C 로 닫을 수 있습니다. 설치 상태: ${esc(d.state)}</p>`}
+    else{$('#run-title').textContent='설치 중단';r.innerHTML=`<h2>설치가 중단되었습니다</h2><p>위 로그에서 원인을 확인하고, 고친 뒤 이어서 시도하세요. 로그 파일: <code>${esc(d.log)}</code></p><div class="row"><button id="btn-resume">이어서 다시 시도</button></div>`;$('#btn-resume').onclick=()=>go(false,true)}}}
+</script>
+</body>
+</html>

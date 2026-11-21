@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# @@PFX@@-access (관리자, root) — 접근 정책 보기·바꾸기·적용·확인.
+#   @@PFX@@-access status                          정책과 실제 권한, 어긋난 곳
+#   @@PFX@@-access set workspace-others none|read  다른 회원이 내 workspace 를 읽을 수 있나(쓰기는 항상 불가)
+#   @@PFX@@-access set shared rw|ro                공유 프로젝트 기본 권한(ro: 쓰기는 만든 사람·관리자만)
+#   @@PFX@@-access apply [회원|--all] [--plan] [--full]
+#                                                  기존 회원·공유 공간에 정책 적용. --plan 은 바꾸지 않고 보여 준다
+#                                                  기본은 최상위만, --full 은 안쪽 전체(무겁다 — 서버 부하가 낮을 때)
+#   @@PFX@@-access verify [회원]                   다른 회원 차단/허용·본인·공유 접근을 실제 계정으로 확인
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "실패: root 로 실행하세요(sudo)" >&2; exit 1; }
+. /opt/@@PFX@@/scripts/@@PFX@@-access-lib.sh; acc_load
+SITE=$ACC_SITE
+pass(){ echo "성공: $*"; }; warn(){ echo "경고: $*"; }; bad(){ echo "실패: $*"; }
+
+setkey() { grep -q "^$1=" "$SITE" 2>/dev/null && sed -i "s/^$1=.*/$1=$2/" "$SITE" || printf '%s=%s\n' "$1" "$2" >> "$SITE"; }
+
+# 그룹이 가진 권한(getfacl 의 group:: 줄)
+gperm() { getfacl -p "$1" 2>/dev/null | awk -F: '$1=="group"&&$2==""{print substr($3,1,3); exit}'; }
+dgperm() { getfacl -p "$1" 2>/dev/null | awk -F: '$1=="default"&&$2=="group"&&$3==""{print substr($4,1,3); exit}'; }
+can() {  # <회원> <r|w|x> <경로> — 그 회원 계정으로 접근 가능한가
+  setpriv --reuid="$1" --regid="$(id -g "$1")" --init-groups sh -c "test -$2 \"\$0\"" "$3" 2>/dev/null
+}
+
+expect_ws() { [[ $WORKSPACE_OTHERS = read ]] && echo "r-x" || echo "---"; }
+
+cmd_status() {
+  echo "== 접근 정책"
+  echo "  WORKSPACE_OTHERS = $WORKSPACE_OTHERS   (다른 회원의 내 workspace 읽기: $([[ $WORKSPACE_OTHERS = read ]] && echo 가능 || echo 불가), 쓰기는 항상 불가)"
+  echo "  SHARED_DEFAULT   = $SHARED_DEFAULT   (공유 프로젝트: $([[ $SHARED_DEFAULT = rw ]] && echo '회원 전원 읽기·쓰기' || echo '읽기만, 쓰기는 만든 사람·관리자'))"
+  local n=0 mism=0 u g want
+  want=$(expect_ws)
+  echo "== 회원 workspace 권한(그룹 몫)"
+  for u in $(acc_members); do
+    n=$((n+1)); g=$(gperm "$ACC_USERS/$u/workspace")
+    if [[ $g = "$want" ]]; then echo "  성공  $u  workspace g::$g"; else echo "  불일치 $u  workspace g::${g:-?} (기대 $want) — apply 필요"; mism=$((mism+1)); fi
+  done
+  [[ $n = 0 ]] && echo "  (회원 없음)"
+  echo "== 공유 공간"
+  local sd; sd=$(dgperm "$ACC_SHARED/workspaces"); local wantd; [[ $SHARED_DEFAULT = rw ]] && wantd=rwx || wantd=r-x
+  if [[ -d $ACC_SHARED/workspaces ]]; then
+    if [[ $sd = "$wantd" ]]; then echo "  성공  $ACC_SHARED/workspaces  default g::$sd"; else echo "  불일치 $ACC_SHARED/workspaces  default g::${sd:-?} (기대 $wantd) — apply 필요"; mism=$((mism+1)); fi
+  else echo "  없음 $ACC_SHARED/workspaces — apply 로 만들어집니다"; mism=$((mism+1)); fi
+  if [[ -f /srv/@@PFX@@/samba/smb.conf ]]; then
+    local cur wsm; cur=$(awk '/^\[/{s=$0} s=="[shared]" && /read only/{gsub(/.*=[ \t]*/,""); print; exit}' /srv/@@PFX@@/samba/smb.conf); [[ $SHARED_DEFAULT = ro ]] && wsm=yes || wsm=no
+    if [[ $cur = "$wsm" ]]; then echo "  성공  Samba [shared] read only = $cur"; else echo "  불일치 Samba [shared] read only = ${cur:-?} (기대 $wsm) — apply 필요"; mism=$((mism+1)); fi
+  fi
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then   # 회원 컨테이너의 /members 읽기 전용 마운트가 정책과 맞나
+    echo "== 회원 컨테이너 안(/members 읽기 전용 마운트)"
+    local want_n have_n; [[ $WORKSPACE_OTHERS = read ]] && want_n=$(( $(acc_members | wc -l) - 1 )) || want_n=0
+    for u in $(acc_members); do
+      docker container inspect "dev-$u" >/dev/null 2>&1 || continue
+      have_n=$(docker container inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "dev-$u" | grep -c '^/members/')
+      [[ $have_n = "$want_n" ]] || { echo "  불일치 dev-$u  /members 마운트 $have_n 개 (기대 $want_n) — @@PFX@@-member-update-all 로 재생성"; mism=$((mism+1)); }
+    done
+  fi
+  [[ $mism = 0 ]] && echo "결과: 정책과 실제 권한이 일치합니다" || { echo "결과: 어긋난 곳 $mism 건 — sudo @@PFX@@-access apply --all"; return 1; }
+}
+
+cmd_set() {
+  case "${1:-} ${2:-}" in
+    "workspace-others none"|"workspace-others read") setkey WORKSPACE_OTHERS "$2";;
+    "shared rw"|"shared ro") setkey SHARED_DEFAULT "$2";;
+    *) echo "사용법: @@PFX@@-access set workspace-others none|read  |  set shared rw|ro" >&2; exit 2;;
+  esac
+  pass "정책을 바꿨습니다($1 = $2). 기존 회원·프로젝트에 적용하려면: sudo @@PFX@@-access apply --all [--plan] [--full]"
+}
+
+cmd_apply() {
+  local target="" full=0 u
+  for a in "$@"; do case $a in --plan) ACC_PLAN=1;; --full) full=1;; --all) target=--all;; -*) echo "알 수 없는 옵션: $a" >&2; exit 2;; *) target=$a;; esac; done
+  target=${target:---all}; export ACC_PLAN
+  if [[ $full = 1 ]]; then
+    local l c; l=$(cut -d' ' -f1 /proc/loadavg); c=$(nproc)
+    awk -v l="$l" -v c="$c" 'BEGIN{exit !(l>c/2)}' && warn "서버 부하 $l (코어 $c) — --full 은 안쪽 전체를 바꿔 무겁습니다. 부하가 낮을 때 한 명씩 하세요"
+  fi
+  echo "== 정책 적용 (WORKSPACE_OTHERS=$WORKSPACE_OTHERS · SHARED_DEFAULT=$SHARED_DEFAULT)$([[ ${ACC_PLAN:-0} = 1 ]] && echo ' — 계획만, 아무것도 바꾸지 않습니다')"
+  if [[ $target = --all ]]; then
+    for u in $(acc_members); do echo "-- 회원 $u"; acc_member "$u" "$full"; acc_sftpgo "$u"; done
+    echo "-- 공유 공간"; acc_members_map; acc_shared "$full"; acc_samba
+  else
+    id "$target" >/dev/null 2>&1 || { bad "회원이 없습니다: $target"; exit 1; }
+    echo "-- 회원 $target"; acc_member "$target" "$full"; acc_sftpgo "$target"
+  fi
+  echo "참고: 이미 있는 회원 컨테이너는 다시 만들어야 WORKSPACE_OTHERS 가 컨테이너 안(/members/<회원>, 읽기 전용)에 반영됩니다 → sudo @@PFX@@-member-update-all"
+  pass "완료. 확인: sudo @@PFX@@-access verify"
+}
+
+cmd_verify() {
+  local only=${1:-} rc=0 u o exp t
+  check() {  # <기대 y|n> <설명> <회원> <r|w|x> <경로>
+    if can "$3" "$4" "$5"; then t=y; else t=n; fi
+    if [[ $t = "$1" ]]; then echo "  성공  $2"; else echo "  실패  $2 (기대 $1, 실제 $t)"; rc=1; fi
+  }
+  local rd; [[ $WORKSPACE_OTHERS = read ]] && rd=y || rd=n
+  for u in $(acc_members); do
+    [[ -n $only && $u != "$only" ]] && continue
+    echo "== $u 의 workspace"
+    check y "본인 쓰기" "$u" w "$ACC_USERS/$u/workspace"
+    for o in $(acc_members); do
+      [[ $o = "$u" ]] && continue
+      check "$rd" "$o 가 읽기(들어가기)" "$o" x "$ACC_USERS/$u/workspace"
+      check "$rd" "$o 가 목록 읽기" "$o" r "$ACC_USERS/$u/workspace"
+      check n "$o 가 쓰기" "$o" w "$ACC_USERS/$u/workspace"
+      check n "$o 가 users/$u 목록 읽기" "$o" r "$ACC_USERS/$u"
+    done
+  done
+  echo "== 공유 공간"
+  local w; [[ $SHARED_DEFAULT = rw ]] && w=y || w=n
+  for u in $(acc_members); do
+    [[ -n $only && $u != "$only" ]] && continue
+    check y "$u 가 /shared/workspaces 에 프로젝트 만들기" "$u" w "$ACC_SHARED/workspaces"
+    check "$w" "$u 가 /shared 루트에 새 항목 만들기" "$u" w "$ACC_SHARED"
+    for p in "$ACC_SHARED"/workspaces/*/; do
+      [[ -d $p && ! -e $p/.@@PFX@@-access ]] || continue
+      local ow; ow=$(stat -c %U "$p")
+      [[ $u = "$ow" ]] && check y "$u 가 자기 프로젝트(${p%/}) 쓰기" "$u" w "$p" || check "$w" "$u 가 남의 프로젝트(${p%/}) 쓰기" "$u" w "$p"
+    done
+  done
+  [[ $rc = 0 ]] && echo "결과: 통과" || { echo "결과: 실패"; return 1; }
+}
+
+case "${1:-}" in
+  status) cmd_status;; set) shift; cmd_set "$@";; apply) shift; cmd_apply "$@";; verify) shift; cmd_verify "${1:-}";;
+  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+esac

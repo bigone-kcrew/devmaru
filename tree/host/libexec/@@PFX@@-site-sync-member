@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""@@PFX@@-site-sync-member (v2) — «멤버 권한»으로 실행된다(@@PFX@@-site-sync 가 setpriv 로 부른다). root 는 멤버 폴더를 직접 읽지 않는다.
+  list <workspace>              publish/ 가 진짜 폴더인 프로젝트 목록을 JSON 으로 낸다([{project, off}]) — 켜진 프로젝트의 publish 폴더에는 «공개 중» 표시(caddy ACL, @@PFX@@-site list 용)를 두고 꺼진 것은 거둔다
+  pack <workspace> <프로젝트>   publish/ 의 «일반 파일과 폴더만» 담은 tar 를 표준출력으로 낸다. 링크·FIFO·소켓·점(.) 파일·비밀로 보이는 이름은 담지 않는다.
+                                파일 수·크기 상한을 넘으면 종료코드 3(그때까지 낸 tar 는 버려진다)
+  note <workspace> <프로젝트> <문장>   프로젝트 폴더(publish 밖)에 상태 한 줄(.publish-status)을 쓴다 — 빈 문장이면 지운다
+같은 파일 이름 규칙이 @@PFX@@-site-sync(root) 에도 있다(root 쪽이 한 번 더 검사한다). 둘의 목록이 같은지는 test-site-v2.sh 가 비교한다.
+"""
+import fnmatch, json, os, re, stat, subprocess, sys, tarfile
+
+CUID = os.environ.get('AI_SITE_CADDY_UID', '995')
+MAX_FILE = int(os.environ.get('AI_SITE_MAX_FILE', 50 * 1024 * 1024))
+MAX_TOTAL = int(os.environ.get('AI_SITE_MAX_TOTAL', 200 * 1024 * 1024))
+MAX_FILES = int(os.environ.get('AI_SITE_MAX_FILES', 5000))
+MAX_DIRS = int(os.environ.get('AI_SITE_MAX_DIRS', 2000))
+MAX_DEPTH = 20
+PROJ = re.compile(r'^[A-Za-z0-9_-]+$')
+SECRET = ['.env*', '*.env', '*.pem', '*.key', 'id_rsa*', 'id_*', '*credential*', '*secret*', '*.sqlite*', '*.db', '*password*', '*token*',
+          '*.p12', '*.pfx', '*.jks', '*.kdbx', '*.ppk', '*.sql', '*.tfstate', '*apikey*', '*api_key*']
+
+
+def secret(name):
+    n = name.lower()
+    return any(fnmatch.fnmatchcase(n, p) for p in SECRET)
+
+
+def real_dir(p):
+    try:
+        return stat.S_ISDIR(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
+def setfacl(args):
+    try:
+        subprocess.run(['setfacl'] + args, capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def cmd_list(w):
+    out = []
+    if real_dir(w):
+        for proj in sorted(os.listdir(w)):
+            pd = os.path.join(w, proj); d = os.path.join(pd, 'publish')
+            if not PROJ.match(proj) or not real_dir(pd) or not real_dir(d):
+                continue
+            off = os.path.lexists(os.path.join(pd, '.publish-off'))
+            if off:
+                setfacl(['-x', f'u:{CUID}', d])
+            else:
+                setfacl(['-m', f'u:{CUID}:rX', d])   # @@PFX@@-site list 가 «공개 중» 판단에 쓰는 표시(서빙 권한이 아니다 — 샌드박스는 사본만 본다)
+            out.append({'project': proj, 'off': off})
+    print(json.dumps(out, ensure_ascii=False))
+
+
+class Limit(Exception):
+    pass
+
+
+def cmd_pack(w, proj):
+    if not PROJ.match(proj):
+        sys.exit('프로젝트 이름 형식 오류')
+    pd = os.path.join(w, proj); d = os.path.join(pd, 'publish')
+    if not (real_dir(w) and real_dir(pd) and real_dir(d)):
+        sys.exit('publish 폴더가 없거나 링크다')
+    tf = tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.PAX_FORMAT)
+    st = {'files': 0, 'total': 0, 'dirs': 0}
+
+    def add_dir(path, rel, depth):
+        if depth > MAX_DEPTH:
+            raise Limit('폴더가 너무 깊다')
+        try:
+            entries = sorted(os.scandir(path), key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            name = e.name
+            if name.startswith('.') or secret(name):
+                continue
+            r = f'{rel}/{name}' if rel else name
+            if len(r.encode()) > 1000:
+                raise Limit('경로가 너무 길다')
+            try:
+                s = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(s.st_mode):
+                st['dirs'] += 1
+                if st['dirs'] > MAX_DIRS:
+                    raise Limit(f'폴더가 너무 많다(>{MAX_DIRS}개)')
+                ti = tarfile.TarInfo(r); ti.type = tarfile.DIRTYPE; ti.mode = 0o755; ti.mtime = 0
+                tf.addfile(ti)
+                add_dir(e.path, r, depth + 1)
+            elif stat.S_ISREG(s.st_mode):
+                try:   # 열기 직전에 FIFO·링크로 바꿔치기해도 막히지 않게 NONBLOCK·NOFOLLOW 로 열고 fstat 로 다시 확인한다
+                    fd = os.open(e.path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                except OSError:
+                    continue
+                with os.fdopen(fd, 'rb') as f:
+                    fs = os.fstat(f.fileno())
+                    if not stat.S_ISREG(fs.st_mode):
+                        continue
+                    if fs.st_size > MAX_FILE:
+                        raise Limit(f'파일이 너무 크다(>{MAX_FILE // 1048576}MB): {r}')
+                    st['files'] += 1; st['total'] += fs.st_size
+                    if st['files'] > MAX_FILES:
+                        raise Limit(f'파일이 너무 많다(>{MAX_FILES}개)')
+                    if st['total'] > MAX_TOTAL:
+                        raise Limit(f'전체 용량이 너무 크다(>{MAX_TOTAL // 1048576}MB)')
+                    ti = tarfile.TarInfo(r); ti.size = fs.st_size; ti.mode = 0o644; ti.mtime = 0
+                    tf.addfile(ti, f)
+            # 링크·FIFO·소켓·장치 파일은 담지 않는다
+
+    try:
+        add_dir(d, '', 0)
+        tf.close()
+    except Limit as e:
+        print(f'LIMIT: {e}', file=sys.stderr)
+        sys.exit(3)
+
+
+def cmd_note(w, proj, text):
+    if not PROJ.match(proj):
+        sys.exit('프로젝트 이름 형식 오류')
+    pd = os.path.join(w, proj)
+    if not (real_dir(w) and real_dir(pd)):
+        return
+    p = os.path.join(pd, '.publish-status')
+    try:
+        if not text:
+            if os.path.lexists(p) and stat.S_ISREG(os.lstat(p).st_mode):
+                os.unlink(p)
+            return
+        # .tmp 자리에 FIFO 를 놓아도 열기에서 막히지 않게 NONBLOCK 으로 열고, 열린 뒤에 일반 파일인지 확인한다
+        fd = os.open(p + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text[:300] + '\n')
+        os.replace(p + '.tmp', p)
+    except OSError:
+        pass
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[1] == 'list':
+        return cmd_list(argv[2])
+    if len(argv) == 4 and argv[1] == 'pack':
+        return cmd_pack(argv[2], argv[3])
+    if len(argv) >= 4 and argv[1] == 'note':
+        return cmd_note(argv[2], argv[3], ' '.join(argv[4:]))
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    main(sys.argv)

@@ -1,0 +1,24 @@
+# @@PFX@@-publish (v3) 샌드박스 Caddy 설정 — 멤버용(@@PFX@@-publish@<멤버>.service)과 공용(@@PFX@@-publish-shared.service)이 같은 파일을 쓴다.
+# 청취 포트는 유닛 drop-in 의 Environment=AI_PUBLISH_PORT, 서빙 루트는 /site(drop-in 의 BindReadOnlyPaths 가 /site/<프로젝트> 로 마운트).
+# 사이트 주소는 반드시 http://:PORT 형태(Host 무관) — http://127.0.0.1:PORT 는 운영 Caddy 가 넘기는 Host 와 달라 빈 200 이 된다.
+{
+	admin off
+	auto_https off
+}
+http://:{$AI_PUBLISH_PORT} {
+	bind 127.0.0.1
+	root * {$AI_PUBLISH_ROOT:/site}
+	@np not path_regexp ^/[A-Za-z0-9_-]+(/.*)?$
+	respond @np 404
+	@hidden path_regexp (^|/)\.[^/]
+	respond @hidden 404
+	@secret path_regexp (?i)(^|/)([^/]*\.(pem|key|p12|pfx|jks|kdbx|ppk|sql|tfstate|env|db)|[^/]*\.sqlite[^/]*|id_[^/]*|[^/]*(credential|secret|password|token|apikey|api_key)[^/]*)$
+	respond @secret 404
+	@slashless path_regexp ^/[A-Za-z0-9_-]+$
+	redir @slashless {path}/ 301
+	header X-Robots-Tag "noindex, nofollow"
+	header X-Content-Type-Options nosniff
+	header -Server
+	encode zstd gzip
+	file_server
+}

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# @@PFX@@-doctor — 설치 상태 점검(읽기 전용). 사용: sudo @@PFX@@-doctor [--json]
+#   --json: 사람용 출력 대신 JSON 한 개를 출력(에이전트·자동화용). 종료 코드는 같다(통과 0 · 실패 1).
+set -uo pipefail
+PFX=@@PFX@@; SITE=/etc/$PFX/site.env; bad=0; warn=0
+JSON=0; [ "${1:-}" = "--json" ] && JSON=1
+LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
+[ "$JSON" = 1 ] && exec 3>&1 1>/dev/null            # JSON 모드: 사람용 출력은 버리고 마지막에 JSON 만 낸다
+pass(){ echo "성공: $*"; printf 'ok\t%s\n' "$*" >> "$LOG"; }; fail(){ echo "실패: $*"; printf 'fail\t%s\n' "$*" >> "$LOG"; bad=1; }; wrn(){ echo "경고: $*"; printf 'warn\t%s\n' "$*" >> "$LOG"; warn=$((warn+1)); }
+emit_json(){ python3 - "$LOG" "$bad" "$warn" "${BRAND:-}" "${DOMAIN:-}" >&3 <<'PY'
+import json, sys
+rows = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]) if "\t" in l]
+print(json.dumps({"status": "fail" if sys.argv[2] == "1" else "pass", "warnings": int(sys.argv[3]), "brand": sys.argv[4], "domain": sys.argv[5],
+                  "checks": [{"status": s, "message": m} for s, m in rows]}, ensure_ascii=False))
+PY
+}
+[ -r "$SITE" ] || { echo "실패: $SITE 없음 — 설치되지 않았습니다"; fail "$SITE 없음 — 설치되지 않았습니다"; [ "$JSON" = 1 ] && emit_json; exit 1; }
+. "$SITE"
+has(){ case " $MODULES " in *" $1 "*) return 0;; esac; return 1; }
+echo "== $PFX-doctor ($BRAND · $DOMAIN)"
+getent group "$PFX" >/dev/null && pass "그룹 $PFX" || fail "그룹 $PFX 없음"
+for n in $PFX-service-net $PFX-dev-net; do docker network inspect "$n" >/dev/null 2>&1 && pass "네트워크 $n" || fail "네트워크 $n 없음"; done
+ctr(){ local i st; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo none); [ "$st" = starting ] || break; sleep 5; done
+  case $st in healthy|running) pass "컨테이너 $1 ($st)";; *) fail "컨테이너 $1 상태 $st";; esac; }
+ctr postgres
+has n8n && ctr n8n; [ "${N8N_WORKFLOWS:-none}" = generic ] && has n8n && { "/usr/local/sbin/$PFX-n8n-workflows" list --check >/dev/null 2>&1 && pass "n8n 워크플로 템플릿 가져옴" || wrn "n8n 워크플로 템플릿이 일부 없음(sudo $PFX-n8n-workflows install --all)"; }; has files && ctr sftpgo; has kordoc && ctr kordoc; has markitdown && ctr markitdown
+has crawl4ai && { ctr crawl4ai; ctr crawl4ai-api; }; has ollama && ctr $PFX-ollama; has uptime-kuma && ctr uptime-kuma
+docker exec postgres psql -U postgres -tAc "select count(*) from pg_extension where extname in ('vector','pg_bigm')" 2>/dev/null | grep -q 2 && pass "PostgreSQL 확장 vector · pg_bigm" || fail "PostgreSQL 확장 확인 실패"
+systemctl is-active --quiet caddy && pass "caddy" || fail "caddy 중지됨"
+caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 && pass "Caddyfile 유효" || fail "Caddyfile 검증 실패"
+h=$(curl -ks -o /dev/null -m 10 -w '%{http_code}' --resolve "$PORTAL_LABEL.$DOMAIN:443:127.0.0.1" "https://$PORTAL_LABEL.$DOMAIN/" 2>/dev/null || true)
+case "$h" in 200) pass "포털 응답 200";; 000|"") wrn "포털 HTTPS 응답 없음(인증서 발급 전이거나 DNS 가 아직 이 서버를 가리키지 않음)";; *) wrn "포털 응답 $h";; esac
+img=$(sed -n 's/^GOLDEN_IMAGE=//p' /opt/$PFX/config/dev-container.env)
+if has golden; then docker image inspect "$img" >/dev/null 2>&1 && pass "Golden 이미지 $img" || fail "Golden 이미지 $img 없음"; fi
+if has mail; then
+  MM=$(sed -n 's/^MAIL_MODE=//p' "$SITE" | tr -d "'\"" | head -1)
+  case "${MM:-none}" in
+    smtp)
+      if [ -r "/etc/$PFX/secrets/smtp.env" ]; then
+        o=$("/usr/local/sbin/$PFX-notify-mail" --check 2>&1) && pass "메일 발송(SMTP 직접) — 연결·인증 확인" || wrn "메일 SMTP 연결 실패 — ${o##*실패: } (회원 등록 때 화면 전달 안내로 대체됩니다)"
+        [ "$(stat -c %a "/etc/$PFX/secrets/smtp.env")" = 600 ] && pass "SMTP 설정 파일 권한 600" || fail "smtp.env 권한이 600 이 아닙니다"
+      else fail "메일 발송 설정이 없습니다 — sudo python3 /opt/devmaru-kit/bin/devmaru-install --config $SITE --yes --only 52"; fi ;;
+    n8n)
+      c=$(curl -s -o /dev/null -m 8 -w '%{http_code}' -X POST "http://127.0.0.1:5678/webhook/$PFX-member-onboarding" -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)
+      case "$c" in 404) wrn "메일(n8n) 워크플로가 아직 켜져 있지 않습니다 — n8n 화면에서 SMTP 자격증명을 고르고 활성화(docs/N8N.md)";; 000|"") fail "n8n 웹훅에 연결할 수 없습니다";; *) pass "메일(n8n) 웹훅 응답 $c";; esac
+      p=$(curl -ks -o /dev/null -m 8 -w '%{http_code}' --resolve "@@N8N_HOST@@:443:127.0.0.1" -X POST "https://@@N8N_HOST@@/webhook/$PFX-member-onboarding" -d '{}' 2>/dev/null || true)
+      case "$p" in 404) pass "공개 주소로는 메일 웹훅이 막혀 있음";; 000|"") wrn "공개 주소 점검 불가(인증서 발급 전)";; *) fail "공개 주소로 메일 웹훅이 열려 있음($p)";; esac ;;
+  esac
+fi
+if has smb; then
+  TR=$(sed -n 's/^SMB_TRANSPORTS=//p' "$SITE" | tr -d "'\"" | head -1); TR=${TR:-quic:1443}
+  systemctl is-active --quiet $PFX-samba-quic && pass "SMB 서비스($PFX-samba-quic, 전송 $TR)" || fail "SMB 서비스 중지됨(journalctl -u $PFX-samba-quic)"
+  testparm -s "/srv/$PFX/samba/smb.conf" >/dev/null 2>&1 && pass "smb.conf 문법" || fail "smb.conf 검증 실패(/srv/$PFX/samba/smb.conf)"
+  [ -s "/srv/$PFX/samba/tls/cert.pem" ] && pass "SMB 인증서 있음" || wrn "SMB 인증서가 없습니다 — 서비스가 시작되지 않습니다(docs/SMB.md)"
+  for t in ${TR//,/ }; do k=${t%%:*}; n=${t#*:}
+    if [ "$k" = quic ]; then
+      lsmod | grep -q '^quic' && pass "quic 커널 모듈" || fail "quic 커널 모듈 없음(Secure Boot 서명 등록이 필요할 수 있음 — docs/SMB.md)"
+      ss -lun 2>/dev/null | grep -q ":$n " && pass "UDP $n 리슨(QUIC)" || wrn "UDP $n 이 열려 있지 않습니다"
+    else ss -ltn 2>/dev/null | grep -q ":$n " && pass "TCP $n 리슨" || wrn "TCP $n 이 열려 있지 않습니다"; fi
+  done
+fi
+if [ -x "/usr/local/sbin/$PFX-access" ]; then
+  "/usr/local/sbin/$PFX-access" status >/dev/null 2>&1 && pass "접근 정책 일치(workspace 읽기 ${WORKSPACE_OTHERS:-none} · 공유 ${SHARED_DEFAULT:-rw})" || wrn "접근 정책이 실제 권한과 어긋남 — sudo $PFX-access status · apply --all (회원 컨테이너의 /members 마운트가 어긋난 것이면 sudo $PFX-member-update-all, 작업 중인 회원이 있으면 --check 로 확인)"
+fi
+free=$(df --output=avail -BG /srv | tail -1 | tr -dc 0-9); [ "$free" -ge 20 ] && pass "/srv 여유 ${free}GB" || wrn "/srv 여유 ${free}GB"
+[ "$JSON" = 1 ] && emit_json
+[ "$bad" = 0 ] && echo "결과: 통과 (경고 $warn)" || { echo "결과: 실패"; exit 1; }

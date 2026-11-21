@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" -eq 0 ]]; then
+    echo "오류: @@PFX@@-paseo-pair는 root가 아닌 회원 계정으로 실행해야 합니다." >&2
+    exit 1
+fi
+
+if ! command -v paseo >/dev/null 2>&1; then
+    echo "오류: Paseo CLI를 찾을 수 없습니다." >&2
+    exit 1
+fi
+
+echo "===== @@BRAND@@ Paseo 연결 ====="
+echo
+echo "Paseo 앱과 현재 @@BRAND@@ 개발환경을 연결합니다."
+echo
+echo "잠시 후 연결용 QR 코드 또는 링크가 표시됩니다."
+echo "이 QR 코드와 링크는 비밀번호처럼 취급하세요."
+echo "다른 사람에게 공유하지 마세요."
+echo
+echo "QR 코드가 표시되지 않으면 아래 Pairing link를"
+echo "Paseo 앱에 직접 붙여넣어 연결할 수 있습니다."
+echo
+
+exec paseo onboard \
+    --relay \
+    --voice disable

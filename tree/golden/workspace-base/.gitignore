@@ -1,0 +1,62 @@
+# Credentials / secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Temporary workspace
+tmp/
+*.tmp
+*.temp
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE / local settings
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / JavaScript
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.bun/
+
+# Build / coverage outputs
+dist/
+build/
+coverage/
+.cache/
+
+# Playwright / test artifacts
+playwright-report/
+test-results/
+
+# Credentials and personal data (project-local)
+.private/
+
+# Local AI/tool state
+.claude/
+.codex/
+.gemini/
+.paseo/

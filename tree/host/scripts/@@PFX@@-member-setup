@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DB_HELPER=/srv/@@PFX@@/admin-harness/bin/@@PFX@@-member-db-add
+ROOTLESS_HELPER=/opt/@@PFX@@/scripts/@@PFX@@-member-rootless-provision
+PG_CONTAINER=${PG_CONTAINER:-postgres}
+
+usage() {
+  echo "usage: sudo @@PFX@@-member-setup <username> [--db <dbname>] [--rootless] [--no-createdb] [--dry-run]" >&2
+  exit 2
+}
+
+[[ $EUID -eq 0 ]] || { echo "ERROR: run as root: sudo @@PFX@@-member-setup ..." >&2; exit 1; }
+
+USER_NAME=""
+DB_NAME=""
+ROOTLESS=0
+NO_CREATEDB=0
+DRY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --db) DB_NAME=${2:-}; shift 2 ;;
+    --rootless) ROOTLESS=1; shift ;;
+    --no-createdb) NO_CREATEDB=1; shift ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) usage ;;
+    -*) usage ;;
+    *) [[ -z "$USER_NAME" ]] || usage; USER_NAME=$1; shift ;;
+  esac
+done
+[[ -n "$USER_NAME" ]] || usage
+[[ -n "$DB_NAME" ]] || DB_NAME="${USER_NAME}_db"
+[[ "$USER_NAME$DB_NAME" =~ ^[a-zA-Z0-9_]+$ ]] || { echo "ERROR: invalid user/db name" >&2; exit 1; }
+
+id "$USER_NAME" >/dev/null 2>&1 || { echo "ERROR: unknown user: $USER_NAME" >&2; exit 1; }
+[[ -x "$DB_HELPER" ]] || { echo "ERROR: missing DB helper: $DB_HELPER" >&2; exit 1; }
+if [[ $ROOTLESS -eq 1 ]]; then
+  [[ -x "$ROOTLESS_HELPER" ]] || { echo "ERROR: missing rootless helper: $ROOTLESS_HELPER" >&2; exit 1; }
+fi
+
+psql_q() { docker exec "$PG_CONTAINER" psql -U postgres -tAc "$1"; }
+role_exists=$(psql_q "select count(*) from pg_roles where rolname='$USER_NAME'")
+db_exists=$(psql_q "select count(*) from pg_database where datname='$DB_NAME'")
+if [[ "$role_exists" != 0 && "$db_exists" == 0 ]]; then
+  echo "ERROR: role exists but DB is missing: $USER_NAME / $DB_NAME" >&2
+  exit 1
+fi
+if [[ "$role_exists" == 0 && "$db_exists" != 0 ]]; then
+  echo "ERROR: DB exists but role is missing: $USER_NAME / $DB_NAME" >&2
+  exit 1
+fi
+
+echo "member=$USER_NAME db=$DB_NAME rootless=$ROOTLESS dry_run=$DRY"
+if [[ "$role_exists" != 0 ]]; then
+  echo "DB: existing role/database — no duplicate creation"
+else
+  echo "DB: new role/database required"
+fi
+
+if [[ $DRY -eq 1 ]]; then
+  [[ "$role_exists" != 0 ]] || "$DB_HELPER" "$USER_NAME" --db "$DB_NAME" $([[ $NO_CREATEDB -eq 1 ]] && echo --no-createdb) --dry-run
+  if [[ $ROOTLESS -eq 1 ]]; then
+    uid=$(id -u "$USER_NAME")
+    grep -q "^${USER_NAME}:" /etc/subuid || { echo "ERROR: no subuid range" >&2; exit 1; }
+    grep -q "^${USER_NAME}:" /etc/subgid || { echo "ERROR: no subgid range" >&2; exit 1; }
+    for cmd in newuidmap newgidmap slirp4netns fuse-overlayfs dockerd-rootless-setuptool.sh; do
+      command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: missing command: $cmd" >&2; exit 1; }
+    done
+    echo "ROOTLESS: preflight PASS uid=$uid data-root=/srv/@@PFX@@/nvme/members/$USER_NAME/docker"
+  fi
+  echo "DRY-RUN PASS"
+  exit 0
+fi
+
+if [[ "$role_exists" == 0 ]]; then
+  args=("$USER_NAME" --db "$DB_NAME")
+  [[ $NO_CREATEDB -eq 1 ]] && args+=(--no-createdb)
+  "$DB_HELPER" "${args[@]}"
+else
+  echo "DB: skipped"
+fi
+
+if [[ $ROOTLESS -eq 1 ]]; then
+  "$ROOTLESS_HELPER" "$USER_NAME"
+fi
+
+echo "@@PFX@@-member-setup PASS"

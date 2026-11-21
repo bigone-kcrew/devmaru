@@ -1,0 +1,19 @@
+# 모듈 목록 — 형식: 이름|종류|compose 디렉터리|기다릴 컨테이너|대기 초|필수|의존|설명
+#   종류: compose(= /opt/<pfx>/compose/<dir> 에서 docker compose up) · host(호스트 구성요소)
+#   순서가 기동 순서다. 필수(1)는 항상 설치된다.
+postgres|compose|postgres|postgres|180|1||PostgreSQL 18 (pgvector · pg_bigm) — 설치 서버에서 이미지를 빌드한다
+caddy|host|||0|1||Caddy(웹 서버·인증서)
+golden|host|||0|1|postgres|회원 개발환경(Golden) 이미지 — 설치 서버에서 빌드한다(수십 분)
+portal|host|||0|1||포털(Guide · Skills · Tools)
+n8n|compose|n8n|n8n|180|0|postgres|n8n 자동화
+files|compose|sftpgo|sftpgo|180|0||SFTPGo 파일 서비스(웹·SFTP)
+kordoc|compose|kordoc|kordoc|240|0||Kordoc 문서 변환(빌드)
+markitdown|compose|markitdown|markitdown|180|0||MarkItDown 문서 변환(빌드)
+crawl4ai|compose|crawl4ai|crawl4ai|300|0||Crawl4AI 수집 엔진 + 게이트웨이(빌드)
+ollama|compose|ollama|@@PFX@@-ollama|180|0||Ollama 임베딩(모델은 설치 후 pull)
+uptime-kuma|compose|uptime-kuma|uptime-kuma|120|0||Uptime Kuma 상태 감시
+cockpit|host|||0|0||Cockpit 웹 관리 콘솔
+mail|host|||0|0||회원 등록 안내 메일 자동 발송(SMTP 직접 — n8n 불필요)
+smb|host|||0|0|files|SMB over QUIC(Samba + 커널 QUIC 모듈 DKMS 빌드 — Windows 11 24H2+ 네트워크 드라이브)
+backup|host|||0|0||restic 백업 저장소(DR 스냅샷·포터블 킷) 준비
+agent|host|||0|0||AI 에이전트 전용 계정(SSH 키 전용 · 읽기성 명령만 sudo · 감사 로그)

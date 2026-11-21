@@ -1,0 +1,5 @@
+# DS-0002 (이미지 기본 사용자가 root): Golden 은 컨테이너가 시작될 때 root 로 회원 계정(UID/GID)을 만들고 마운트 권한을 맞춘 뒤,
+# 모든 세션을 회원 UID 로 내려 실행한다(docker exec -u <회원>). 최종 USER 를 비루트로 두면 계정 생성이 불가능하다.
+# 컨테이너는 privileged=false, Docker 소켓 미마운트, 호스트 포트는 127.0.0.1 로만 연결된다. 근거: docs/ARCHITECTURE.md
+DS-0002
+DS002

@@ -1,0 +1,13 @@
+
+# 모듈: cockpit (관리 콘솔) — 관리자 대역만
+@@COCKPIT_HOST@@ {
+	import access_log
+	@denied not remote_ip @@ADMIN_CIDRS@@
+	respond @denied "Forbidden" 403
+	reverse_proxy https://127.0.0.1:9090 {
+		header_up Host {host}
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}

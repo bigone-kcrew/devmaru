@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# script-rev: 2026-11-04 v2 (config-extra · mem0 · selfkey · 운영자 홈 · 선택 DB 덤프 추가)
+set -euo pipefail
+
+REPO="/srv/@@PFX@@/backups/restic"
+PASSFILE="/etc/@@PFX@@/secrets/restic-repository-password"
+STAGE_BASE="/srv/@@PFX@@/backups/dr-stage"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+STAGE="$STAGE_BASE/$STAMP"
+
+cleanup() {
+  rm -rf "$STAGE"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+pass() {
+  echo "PASS: $*"
+}
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+[ -d "$REPO" ] || fail "restic repository missing"
+[ -s "$PASSFILE" ] || fail "restic password file missing"
+
+export RESTIC_REPOSITORY="$REPO"
+export RESTIC_PASSWORD_FILE="$PASSFILE"
+
+install -d -o root -g root -m 0700 \
+  "$STAGE_BASE" \
+  "$STAGE"
+
+echo '===== DR BACKUP CREATE ====='
+
+echo
+echo '[1/8] CONFIG / SECRETS'
+
+install -d "$STAGE/config" "$STAGE/secrets"
+
+cp -a /opt/@@PFX@@/config/dev-container.env \
+  "$STAGE/config/"
+
+cp -a /opt/@@PFX@@/config/platform.env \
+  "$STAGE/config/"
+
+install -d "$STAGE/config/env"
+
+find /opt/@@PFX@@/config/env \
+  -maxdepth 1 \
+  -type f \
+  -name '*.env' \
+  ! -name '*.bak*' \
+  -exec cp -a {} "$STAGE/config/env/" \;
+
+rsync -a \
+  --exclude='restic-repository-password' \
+  /etc/@@PFX@@/secrets/ \
+  "$STAGE/secrets/"
+
+if [ -e "$STAGE/secrets/restic-repository-password" ]; then
+  fail "restic repository password leaked into staging"
+fi
+
+pass "config/secrets staged; repository password excluded"
+
+echo
+echo '[2/8] POSTGRES LOGICAL DUMPS'
+
+install -d "$STAGE/postgres"
+
+docker exec postgres \
+  pg_dumpall -U postgres --globals-only \
+  > "$STAGE/postgres/globals.sql"
+
+for db in postgres n8n; do
+  docker exec postgres \
+    pg_dump -U postgres -Fc "$db" \
+    > "$STAGE/postgres/${db}.dump"
+done
+
+test -s "$STAGE/postgres/globals.sql" \
+  || fail "globals.sql empty"
+
+test -s "$STAGE/postgres/postgres.dump" \
+  || fail "postgres.dump empty"
+
+test -s "$STAGE/postgres/n8n.dump" \
+  || fail "n8n.dump empty"
+
+pass "PostgreSQL logical dumps created"
+
+echo
+echo '[3/8] SFTPGO SQLITE BACKUP'
+
+install -d "$STAGE/sftpgo"
+
+sqlite3 /srv/@@PFX@@/services/sftpgo/data/sftpgo.db \
+  ".backup '$STAGE/sftpgo/sftpgo.db'"
+
+CHECK="$(
+  sqlite3 "$STAGE/sftpgo/sftpgo.db" \
+    'PRAGMA integrity_check;'
+)"
+
+[ "$CHECK" = "ok" ] \
+  || fail "SFTPGo SQLite integrity check failed"
+
+pass "SFTPGo SQLite backup valid"
+
+echo
+echo '[4/8] SAMBA PRIVATE BACKUP'
+
+install -d "$STAGE/samba/private"
+
+for tdb in \
+  /srv/@@PFX@@/samba/private/passdb.tdb \
+  /srv/@@PFX@@/samba/private/secrets.tdb
+do
+  [ -f "$tdb" ] || continue
+
+  base="$(basename "$tdb")"
+
+  (
+    cd "$STAGE/samba/private"
+    tdbbackup -s .bak "$tdb"
+    mv "${tdb}.bak" "$base"
+  )
+done
+
+[ -d /srv/@@PFX@@/samba/private ] && { test -s "$STAGE/samba/private/passdb.tdb" || fail "Samba passdb backup missing"; } || echo "SKIP: Samba 모듈이 없어 건너뜀"
+
+pass "Samba TDB backup created"
+
+echo
+echo '[5/8] ACCOUNT METADATA'
+
+install -d "$STAGE/accounts"
+
+getent group @@PFX@@ \
+  > "$STAGE/accounts/@@PFX@@.group"
+
+find /srv/@@PFX@@/users \
+  -mindepth 1 -maxdepth 1 \
+  -type d \
+  -printf '%f\n' \
+  | sort -u \
+  > "$STAGE/accounts/member-list.txt"
+
+{
+  echo @@ADMIN_USER@@
+  cat "$STAGE/accounts/member-list.txt"
+} | sort -u > "$STAGE/accounts/account-list.txt"
+
+while IFS= read -r user; do
+  id "$user" >/dev/null 2>&1 || continue
+
+  getent passwd "$user"
+done < "$STAGE/accounts/account-list.txt" \
+  > "$STAGE/accounts/passwd.txt"
+
+while IFS= read -r user; do
+  id "$user" >/dev/null 2>&1 || continue
+
+  getent shadow "$user"
+done < "$STAGE/accounts/account-list.txt" \
+  > "$STAGE/accounts/shadow.txt"
+
+chmod 0600 "$STAGE/accounts/shadow.txt"
+
+pass "account metadata staged"
+
+echo
+echo '[6/8] LETSENCRYPT / N8N'
+
+install -d "$STAGE/etc"
+
+[ -d /etc/letsencrypt ] && cp -a /etc/letsencrypt "$STAGE/etc/letsencrypt" || true
+[ -d /var/lib/caddy/.local/share/caddy ] && { install -d "$STAGE/etc/caddy-data"; rsync -a /var/lib/caddy/.local/share/caddy/ "$STAGE/etc/caddy-data/"; } || true
+
+install -d "$STAGE/n8n"
+
+[ -d /srv/@@PFX@@/services/n8n/data ] && rsync -a \
+  --exclude='*.log' \
+  --exclude='crash.journal' \
+  --exclude='*.bak*' \
+  /srv/@@PFX@@/services/n8n/data/ \
+  "$STAGE/n8n/data/" || echo "SKIP: n8n 모듈이 없어 건너뜀"
+
+pass "Let's Encrypt and n8n data staged"
+
+echo
+echo '[7a/8] EXTRA STATE (2026-11-04)'
+
+# ---- 선택 설정: /etc/@@PFX@@/dr.conf  (없으면 아래 기본값)
+#   DR_EXTRA_DBS="alice_db bob_db"   메인 postgres 의 추가 DB(회원 DB 등) 논리 덤프
+DR_EXTRA_DBS=""
+if [ -f /etc/@@PFX@@/dr.conf ]; then
+  # shellcheck disable=SC1091
+  . /etc/@@PFX@@/dr.conf
+fi
+
+pg_dump_checked() {  # <container> <db> <outfile>
+  docker exec "$1" pg_dump -U postgres -Fc "$2" > "$3"
+  test -s "$3" || fail "$3 empty"
+  docker exec -i "$1" pg_restore -l < "$3" > /dev/null \
+    || fail "pg_restore -l failed: $3"
+}
+
+have_container() { docker inspect "$1" >/dev/null 2>&1; }
+
+# ---- config-extra: DR 이 빠뜨리던 설정·토큰·회원 메타 (restic 은 암호화되어 있다)
+install -d "$STAGE/config-extra"
+for d in mcp-tokens members memory agent-defaults; do
+  if [ -d "/opt/@@PFX@@/config/$d" ]; then
+    rsync -a --exclude='*.bak*' --exclude='*.pre-*' \
+      "/opt/@@PFX@@/config/$d/" "$STAGE/config-extra/$d/"
+  fi
+done
+test -d "$STAGE/config-extra" || fail "config-extra missing"
+pass "config-extra staged (mcp-tokens · members · memory · agent-defaults)"
+
+# /etc/@@PFX@@ 의 secrets 외 나머지(apps 등록부·알림 토큰·방화벽 목록·site-v3·publish)
+install -d "$STAGE/etc-@@PFX@@"
+rsync -a --exclude='secrets/' --exclude='backups/' --exclude='*.bak*' --exclude='*.pre-*' \
+  /etc/@@PFX@@/ "$STAGE/etc-@@PFX@@/"
+if [ -e "$STAGE/etc-@@PFX@@/secrets" ]; then
+  fail "secrets dir leaked into etc-@@PFX@@ staging"
+fi
+pass "etc-@@PFX@@ staged (apps · firewall lists · site-v3 · publish)"
+
+# ---- 추가 DB: 회원 DB 등(선택)
+if [ -n "$DR_EXTRA_DBS" ]; then
+  install -d "$STAGE/postgres/extra"
+  for db in $DR_EXTRA_DBS; do
+    pg_dump_checked postgres "$db" "$STAGE/postgres/extra/${db}.dump"
+  done
+  pass "extra DB dumps: $DR_EXTRA_DBS"
+else
+  echo "SKIP: DR_EXTRA_DBS empty (회원 DB 는 이번 DR 에 들어가지 않는다 — /etc/@@PFX@@/dr.conf)"
+fi
+
+# ---- mem0: DB(약 15MB) + SQLite 둘(ACL 색인 · history) + 설정·게이트웨이 코드
+if have_container @@PFX@@-memory-db; then
+  install -d "$STAGE/postgres/mem0"
+  docker exec @@PFX@@-memory-db pg_dumpall -U postgres --globals-only \
+    > "$STAGE/postgres/mem0/globals.sql"
+  test -s "$STAGE/postgres/mem0/globals.sql" || fail "mem0 globals.sql empty"
+  pg_dump_checked @@PFX@@-memory-db mem0 "$STAGE/postgres/mem0/mem0.dump"
+  pass "mem0 DB dump valid"
+else
+  echo "SKIP: @@PFX@@-memory-db container not present"
+fi
+
+M0=/srv/@@PFX@@/nvme/mem0
+if [ -d "$M0" ]; then
+  install -d "$STAGE/mem0"
+  rsync -a --exclude='venv/' --exclude='pgdata/' --exclude='backups/' \
+    --exclude='__pycache__/' --exclude='*.db' --exclude='*.db-*' \
+    "$M0/" "$STAGE/mem0/"
+  for db in state/index.db state/mem0dir/history.db; do
+    if [ -f "$M0/$db" ]; then
+      install -d "$STAGE/mem0/$(dirname "$db")"
+      sqlite3 "$M0/$db" ".backup '$STAGE/mem0/$db'"
+      [ "$(sqlite3 "$STAGE/mem0/$db" 'PRAGMA integrity_check;')" = "ok" ] \
+        || fail "mem0 $db integrity check failed"
+    fi
+  done
+  pass "mem0 state staged (config · gateway · SQLite 2개 integrity ok)"
+fi
+
+# ---- 운영자(@@ADMIN_USER@@) 홈: 스크립트·키트·crontab. rclone 설정(Drive 접근)·ssh 개인키·도구 상태는 넣지 않는다
+# (--max-size=5M: patches/ 에 쌓인 agent-browser 바이너리 약 17MB×6, kordoc OCR 모델 약 12.8MB×n 같은 다시 받을 수 있는 빌드 중간물을 뺀다 — 2026-11-04 첫 실행에서 stage 가 286MB 가 된 원인)
+install -d "$STAGE/operator"
+crontab -l -u @@ADMIN_USER@@ > "$STAGE/operator/crontab-doob.txt" 2>/dev/null || true
+rsync -a --max-size=5M \
+  --exclude='.cache/' --exclude='.npm/' --exclude='.local/' --exclude='.claude/' \
+  --exclude='.codex/' --exclude='.docker/' --exclude='.ssh/' --exclude='.config/' \
+  --exclude='.bash_history' --exclude='node_modules/' --exclude='__pycache__/' \
+  --exclude='*.log' --exclude='*.jsonl' --exclude='*.tar*' --exclude='*.zst' --exclude='*.gz' \
+  --exclude='backups/' --exclude='*.bak*' --exclude='*.pre-*' --exclude='bak_*' \
+  /home/@@ADMIN_USER@@/ "$STAGE/operator/home-doob/"
+if [ -f /home/@@ADMIN_USER@@/.ssh/authorized_keys ]; then
+  install -d "$STAGE/operator/ssh"
+  cp -a /home/@@ADMIN_USER@@/.ssh/authorized_keys "$STAGE/operator/ssh/authorized_keys"
+fi
+pass "operator home staged (rclone 설정은 제외 — 따로 보관해야 한다)"
+
+echo
+echo '[7/8] METADATA'
+
+install -d "$STAGE/meta"
+
+{
+  echo "Created: $(date --iso-8601=seconds)"
+  echo "Hostname: $(hostname)"
+  echo "Kernel: $(uname -r)"
+  echo
+  echo '[Docker]'
+  docker --version
+  docker compose version
+  echo
+  echo '[Images]'
+  docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+  echo
+  echo '[DKMS]'
+  dkms status || true
+} > "$STAGE/meta/VERSIONS.txt"
+
+# 컨테이너 인벤토리: 3번째 칸이 비어 있으면 compose 가 아닌 수동 docker run
+docker ps -a --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' \
+  | sort > "$STAGE/meta/containers.txt"
+ls -1 /opt/@@PFX@@/compose > "$STAGE/meta/compose-dirs.txt"
+echo "script-rev: 2026-11-04 v2" > "$STAGE/meta/DR-REV.txt"
+
+(
+  cd "$STAGE"
+
+  find . \
+    -type f \
+    ! -path './meta/STAGE-SHA256SUMS' \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum
+) > "$STAGE/meta/STAGE-SHA256SUMS"
+
+pass "metadata/checksums created"
+
+echo
+echo '[8/8] RESTIC SNAPSHOT'
+
+echo "STAGE size: $(du -sh "$STAGE" | cut -f1) · files: $(find "$STAGE" -type f | wc -l)"
+
+restic backup \
+  --tag @@PFX@@-dr \
+  --tag "$STAMP" \
+  "$STAGE"
+
+echo
+echo '===== SNAPSHOT LIST ====='
+restic snapshots --tag @@PFX@@-dr --latest 1
+
+echo
+echo '===== REPOSITORY CHECK ====='
+restic check
+
+echo
+echo 'RESULT: PASS'

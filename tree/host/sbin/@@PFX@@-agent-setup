@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# @@PFX@@-agent-setup (root) — AI 에이전트 전용 계정(@@PFX@@-agent)과 제한된 sudo·감사 로그를 만든다/없앤다/보여 준다.
+#   @@PFX@@-agent-setup install [--expires YYYY-MM-DD]   계정(SSH 키 전용·비밀번호 잠금) · sudoers · sshd 드롭인 · 로그 회전
+#   @@PFX@@-agent-setup remove                           계정·sudoers·키·sshd 드롭인 삭제(감사 로그는 남김)
+#   @@PFX@@-agent-setup status
+# 감사 로그: sudo 는 syslog(저널)에 기록한다 — 최신 배포판의 sudo-rs 는 logfile 옵션이 없어, 저널의 sudo 줄 중 에이전트 계정 것만 파일로 모으는 서비스(@@PFX@@-agent-audit.service)를 둔다.
+# 키는 @@PFX@@-agent-key 로 관리자가 등록한다. 허용 명령은 아래 ALLOW 의 «정확한 명령줄» 만(인자 와일드카드 없음).
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "실패: root 로 실행하세요(sudo)" >&2; exit 1; }
+PFX=@@PFX@@; A=$PFX-agent; S=/usr/local/sbin/$PFX
+SUDOERS=/etc/sudoers.d/$A; SSHD=/etc/ssh/sshd_config.d/$A.conf; KEYS=/etc/$PFX/agent-authorized_keys
+LOGDIR=/var/log/$PFX; LOG=$LOGDIR/agent-audit.log
+# 읽기성 명령만. 인자 없는 명령은 "" 로 «인자 없음» 을 못박는다(그렇지 않으면 아무 인자나 허용된다).
+ALLOW=(
+  "$S-doctor \"\"" "$S-doctor --json"
+  "$S-update --check"
+  "$S-access status" "$S-access verify" "$S-access apply --all --plan"
+  "$S-backup-run \"\""
+)
+die(){ echo "실패: $*" >&2; exit 1; }
+
+install_sudoers() {
+  local t=/etc/sudoers.d/.$A.new bak=/etc/sudoers.d/.$A.bak
+  { echo "# @@BRAND@@ AI 에이전트 계정 — 읽기성 명령만 비밀번호 없이. 목록에 없는 명령(회원 삭제·업데이트 등)은 비밀번호가 필요하므로 사람이 직접 승인한다."
+    echo "Defaults:$A !lecture"
+    printf '%s ALL=(root) NOPASSWD: ' "$A"; local i; for i in "${!ALLOW[@]}"; do [ "$i" = 0 ] || printf ', '; printf '%s' "${ALLOW[$i]}"; done; echo
+  } > "$t"; chmod 0440 "$t"
+  [ -f "$SUDOERS" ] && cp -p "$SUDOERS" "$bak"
+  if ! visudo -cf "$t" >/dev/null 2>&1; then rm -f "$t"; [ -f "$bak" ] && rm -f "$bak"; die "sudoers 검증 실패 — 변경하지 않았습니다"; fi
+  mv -f "$t" "$SUDOERS"
+  if ! visudo -c >/dev/null 2>&1; then
+    if [ -f "$bak" ]; then mv -f "$bak" "$SUDOERS"; else rm -f "$SUDOERS"; fi
+    die "visudo -c 실패 — 되돌렸습니다"
+  fi
+  rm -f "$bak"
+}
+
+install_sshd() {
+  local bak=""; [ -f "$SSHD" ] && { bak=$(mktemp); cp -p "$SSHD" "$bak"; }
+  cat > "$SSHD" <<CONF
+# @@BRAND@@ AI 에이전트 계정: 공개키 로그인만, 키 목록은 관리자만 고친다($KEYS).
+Match User $A
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthenticationMethods publickey
+    AuthorizedKeysFile $KEYS
+    AllowTcpForwarding no
+    X11Forwarding no
+    AllowAgentForwarding no
+CONF
+  chmod 0644 "$SSHD"
+  install -d -m 0755 /run/sshd
+  if ! sshd -t 2>/dev/null; then
+    if [ -n "$bak" ]; then mv -f "$bak" "$SSHD"; else rm -f "$SSHD"; fi
+    die "sshd 설정 검증 실패 — 되돌렸습니다"
+  fi
+  [ -n "$bak" ] && rm -f "$bak"
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+}
+
+cmd=${1:-status}; shift || true
+case "$cmd" in
+install)
+  EXP=""; while [ $# -gt 0 ]; do case "$1" in --expires) EXP=${2:-}; shift 2;; *) die "알 수 없는 옵션: $1";; esac; done
+  [[ -z $EXP || $EXP =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--expires 는 YYYY-MM-DD 형식입니다"
+  [ -z "$EXP" ] || date -d "$EXP" >/dev/null 2>&1 || die "올바른 날짜가 아닙니다: $EXP"
+  id "$A" >/dev/null 2>&1 || useradd -m -s /bin/bash -c "@@BRAND@@ AI agent" "$A" || die "계정 생성 실패"
+  passwd -l "$A" >/dev/null 2>&1
+  [ -z "$EXP" ] || chage -E "$EXP" "$A"
+  [ -e "$KEYS" ] || install -m 0644 -o root -g root /dev/null "$KEYS"
+  install -d -m 0750 -o root -g adm "$LOGDIR"; [ -e "$LOG" ] || install -m 0640 -o root -g adm /dev/null "$LOG"
+  cat > /etc/systemd/system/$A-audit.service <<CONF
+[Unit]
+Description=@@BRAND@@ AI agent sudo audit log collector
+After=systemd-journald.service
+[Service]
+ExecStart=/bin/sh -c 'journalctl -t sudo -o short-iso --cursor-file=/var/lib/$PFX/agent-audit.cursor -n 0 -f | grep --line-buffered -F " $A : " >> $LOG'
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+CONF
+  cat > /etc/logrotate.d/$A <<CONF
+$LOG {
+    weekly
+    rotate 26
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+CONF
+  install_sudoers; install_sshd
+  install -d -m 0755 /var/lib/$PFX; systemctl daemon-reload; systemctl enable --now $A-audit.service >/dev/null 2>&1 || die "감사 로그 수집 서비스를 켜지 못했습니다"
+  echo "성공: 에이전트 계정 $A (SSH 키 전용·비밀번호 잠금${EXP:+, 만료 $EXP})"
+  echo "성공: 제한된 sudo $SUDOERS (허용 ${#ALLOW[@]}개) · 감사 로그 $LOG"
+  echo "안내: 키 등록 — sudo $PFX-agent-key add <공개키 파일>"
+  ;;
+remove)
+  systemctl disable --now $A-audit.service >/dev/null 2>&1; rm -f /etc/systemd/system/$A-audit.service /var/lib/$PFX/agent-audit.cursor; systemctl daemon-reload
+  rm -f "$SUDOERS" "$SSHD" "$KEYS" /etc/logrotate.d/$A
+  id "$A" >/dev/null 2>&1 && { pkill -KILL -u "$A" 2>/dev/null; userdel -r "$A" >/dev/null 2>&1; }
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+  echo "성공: 에이전트 계정·sudoers·키 삭제(감사 로그 $LOG 는 남김)" ;;
+status)
+  if id "$A" >/dev/null 2>&1; then
+    echo "계정: $A ($(passwd -S "$A" | awk '{print $2}' | sed 's/^L$/비밀번호 잠금/;s/^P$/비밀번호 있음(주의)/'))"
+    echo "만료: $(chage -l "$A" | awk -F': ' '/Account expires/{print $2}')"
+  else echo "계정: 없음(미설치)"; fi
+  [ -f "$SUDOERS" ] && echo "sudoers: 있음(허용 명령 $(grep -o "$S-[a-z-]*" "$SUDOERS" | sort -u | wc -l)종)" || echo "sudoers: 없음"
+  [ -f "$SSHD" ] && echo "sshd 드롭인: 있음" || echo "sshd 드롭인: 없음"
+  echo "감사 수집 서비스: $(systemctl is-active $A-audit.service 2>/dev/null)"
+  [ -f "$LOG" ] && echo "감사 로그: $LOG ($(wc -l < "$LOG")줄)" || echo "감사 로그: 없음" ;;
+*) die "사용: $PFX-agent-setup install [--expires YYYY-MM-DD] | remove | status" ;;
+esac

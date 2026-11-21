@@ -1,0 +1,6 @@
+{
+  "id": "@@PFX@@-managed-mcp",
+  "requirements": {
+    "paseo": ">=0.8.0"
+  }
+}

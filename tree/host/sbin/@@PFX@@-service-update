@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# @@PFX@@-service-update — compose 서비스를 하나씩 백업 → 이미지 받기·빌드 → 올리기 → 헬스 확인, 실패하면 이전 이미지·설정으로 되돌린다.
+#   @@PFX@@-service-update <서비스>|--all [--plan]    무엇을 할지만 보여 준다(기본. 아무것도 바꾸지 않는다)
+#   @@PFX@@-service-update <서비스>|--all --check     지금 상태만 점검한다(실행 이미지 ≠ compose 가 가리키는 이미지인지, 헬스) — 읽기 전용
+#   @@PFX@@-service-update <서비스>|--all --apply     실제로 갱신한다(root)
+# 서비스 목록: site.env 의 MODULES(+필수 모듈) 중 compose 종류. 이름 목록은 인자 없이 실행하면 나온다.
+# 백업: /var/backups/@@PFX@@/service-update/<시각>/<서비스>/ (compose 디렉터리·env·데이터 디렉터리 tar·postgres 는 pg_dumpall·이전 이미지 태그)
+# 롤백: 성공할 때마다 compose 디렉터리를 service-update/last-good/<서비스>.tar 로 저장해 두고, 실패하면 그것으로 되돌린다(없으면 compose 의 이미지 줄만
+#       롤백 전 실행 이미지로 되돌림). 실패한 변경은 compose.yml.failed-<시각> 으로 남긴다.
+# --all 은 첫 실패(롤백 완료)에서 멈춘다. DB 데이터는 자동으로 되돌리지 않는다 — 덤프 복원 방법을 출력한다.
+set -uo pipefail
+PFX=@@PFX@@; SITE=/etc/$PFX/site.env; O=/opt/$PFX; MODS=/opt/devmaru-kit/config/modules.list
+MODE=plan; TARGET=""
+for a in "$@"; do case "$a" in
+  --plan) MODE=plan;; --check) MODE=check;; --apply) MODE=apply;; --all) TARGET=--all;;
+  -h|--help) sed -n 2,8p "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  -*) echo "실패: 알 수 없는 옵션: $a" >&2; exit 2;; *) TARGET=$a;; esac; done
+[ -r "$SITE" ] || { echo "실패: $SITE 없음 — 설치되지 않았습니다" >&2; exit 1; }
+[ -r "$MODS" ] || { echo "실패: $MODS 없음" >&2; exit 1; }
+[ "$MODE" = apply ] && [ "$(id -u)" != 0 ] && { echo "실패: --apply 는 root 로 실행하세요(sudo)" >&2; exit 1; }
+MODULES=$(sed -n 's/^MODULES=//p' "$SITE" | tail -1 | tr -d '"'"'")
+# 대상 서비스: name|dir|container|secs  (modules.list 순서 = 기동 순서)
+LIST=$(while IFS='|' read -r name kind dir ctr secs req _; do
+  case "$name" in ''|\#*) continue;; esac; [ "$kind" = compose ] || continue
+  case " $MODULES " in *" $name "*) ;; *) [ "$req" = 1 ] || continue;; esac
+  echo "$name|$dir|${ctr//@@PFX@@/$PFX}|$secs"; done < "$MODS")
+[ -n "$TARGET" ] || { echo "사용법: $PFX-service-update <서비스>|--all [--plan|--check|--apply]"; echo "서비스: $(cut -d'|' -f1 <<<"$LIST" | tr '\n' ' ')"; exit 2; }
+if [ "$TARGET" = --all ]; then NAMES=$(cut -d'|' -f1 <<<"$LIST")
+else grep -q "^$TARGET|" <<<"$LIST" || { echo "실패: '$TARGET' 은(는) 이 서버의 compose 서비스가 아닙니다 (가능: $(cut -d'|' -f1 <<<"$LIST" | tr '\n' ' '))" >&2; exit 2; }; NAMES=$TARGET; fi
+
+# compose 가 가리키는 이미지 목록: "서비스키|이미지|build(1/0)"
+cfg() { ( cd "$O/compose/$1" && docker compose config --format json 2>/dev/null ) | python3 -c '
+import sys, json
+for k, v in json.load(sys.stdin).get("services", {}).items(): print(k, v.get("image", ""), 1 if "build" in v else 0, sep="|")'; }
+running_ref() { docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null; }
+health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo none; }
+wait_ok() { local i st; for ((i=0;i<$2;i+=3)); do st=$(health "$1"); case $st in healthy|running) return 0;; esac; sleep 3; done; echo "  > $1 상태: $st"; return 1; }
+
+# compose 파일에서 메인 서비스(키 == 서비스명 또는 컨테이너명)의 image 줄이 <ref> 와 다르면 <ref> 로 되돌려 쓴다(build 서비스는 건드리지 않음)
+pin_image() { # <name> <dir> <ctr> <ref>
+  local k img b f; while IFS='|' read -r k img b; do
+    [ "$b" = 0 ] && [ -n "$img" ] && [ "$img" != "$4" ] && { [ "$k" = "$1" ] || [ "$k" = "$3" ]; } || continue
+    local hit=0; for f in "$O/compose/$2"/*.yml "$O/compose/$2"/*.yaml; do [ -f "$f" ] || continue
+      python3 - "$f" "$img" "$4" <<'PY' && hit=1
+import re, sys
+f, old, new = sys.argv[1:]
+t = open(f).read()
+n, c = re.subn(r'(?m)^(\s*image:\s*["\']?)' + re.escape(old) + r'(["\']?\s*(#.*)?)$', lambda m: m.group(1) + new + m.group(2), t)
+if c: open(f, "w").write(n)
+sys.exit(0 if c else 1)
+PY
+    done
+    [ "$hit" = 1 ] && echo "  > compose 의 $k 이미지 $img → $4 로 되돌림" || echo "  ! compose 의 $k 이미지 줄($img)을 찾지 못했습니다 — 직접 확인: $O/compose/$2"
+  done < <(cfg "$2"); }
+
+show_state() { # <name> <dir> <ctr> — plan/check 공통: 현재 상태와 compose 가 가리키는 이미지
+  local name=$1 dir=$2 ctr=$3 cur want
+  cur=$(running_ref "$ctr"); echo "  컨테이너 $ctr: ${cur:-없음} (상태 $(health "$ctr"))"
+  while IFS='|' read -r k img b; do
+    [ -n "$img" ] || continue
+    if [ "$img" != "$cur" ] && [ "$k" = "$name" -o "$ctr" = "$k" ]; then echo "  ! compose 가 가리키는 이미지: $img  ← 실행 중인 것과 다름(적용하면 바뀝니다)"
+    else echo "  compose 이미지: $img ($([ "$b" = 1 ] && echo 빌드 || echo 받기))"; fi
+  done < <(cfg "$dir")
+}
+
+update_one() { # <name> <dir> <ctr> <secs>
+  local name=$1 dir=$2 ctr=$3 secs=$4 B="$BK/$1" C="$O/compose/$2" k img b ref tag rb=""
+  mkdir -p "$B"; chmod 0700 "$B"
+  echo "[$name] 1/5 백업 → $B"
+  tar -C "$C" -cf "$B/compose-dir.tar" . || { echo "실패: compose 디렉터리 백업"; return 1; }
+  for e in "$O/config/env/$name.env"; do [ -f "$e" ] && cp -p "$e" "$B/"; done
+  [ -d "/srv/$PFX/services/$dir/data" ] && tar -C "/srv/$PFX/services/$dir" -cf "$B/data.tar" data 2>/dev/null && echo "  > 데이터 디렉터리 백업($(du -h "$B/data.tar" | cut -f1))"
+  if [ "$name" = postgres ]; then
+    docker exec "$ctr" pg_dumpall -U postgres 2>"$B/dump.err" | gzip > "$B/pg_dumpall.sql.gz"
+    [ "${PIPESTATUS[0]}" = 0 ] && [ -s "$B/pg_dumpall.sql.gz" ] || { echo "실패: postgres 덤프 — $B/dump.err"; return 1; }
+    echo "  > DB 덤프 $(du -h "$B/pg_dumpall.sql.gz" | cut -f1)"
+  fi
+  # 이전 이미지에 롤백 태그를 붙여 두면 pull·build 로 같은 태그가 덮여도 남는다
+  ref=$(running_ref "$ctr"); local id; id=$(docker inspect -f '{{.Image}}' "$ctr" 2>/dev/null)
+  if [ -n "$ref" ]; then tag="$PFX-rollback/$name:$TS"; docker tag "$id" "$tag" && rb="$tag"; printf '%s\n%s\n' "$ref" "$tag" > "$B/image-rollback"; echo "  > 이전 이미지 $ref → $tag"; fi
+  echo "[$name] 2/5 이미지 받기·빌드"
+  local ok=1
+  while IFS='|' read -r k img b; do
+    if [ "$b" = 1 ]; then ( cd "$C" && docker compose build --pull "$k" 2>&1 | tail -3; exit "${PIPESTATUS[0]}" ) || ok=0
+    elif [ -n "$img" ] && [ "$img" = "$PFX-postgres:${img#*:}" ] && [ -d "$O/images/postgres" ]; then docker build -q -t "$img" "$O/images/postgres" >/dev/null || ok=0   # 설치 서버에서 빌드하는 이미지
+    elif [ -n "$img" ]; then docker pull -q "$img" >/dev/null 2>"$B/pull.err" || { echo "  > 받기 실패: $img ($(tail -1 "$B/pull.err"))"; ok=0; }; fi
+  done < <(cfg "$dir")
+  if [ "$ok" = 0 ]; then   # 받기·빌드 실패 — 컨테이너는 아직 건드리지 않았다(올리기 전)
+    echo "[$name] 실패 — 컨테이너는 바뀌지 않았습니다(이전 이미지로 계속 실행 중: $(health "$ctr")). compose.yml 의 이미지 태그를 확인하세요: $C/compose.yml"
+    return 1
+  fi
+  if [ "$ok" = 1 ]; then
+    echo "[$name] 3/5 올리기"; ( cd "$C" && docker compose up -d --no-build 2>&1 | tail -3; exit "${PIPESTATUS[0]}" ) || ok=0
+  fi
+  if [ "$ok" = 1 ]; then echo "[$name] 4/5 헬스 확인(최대 ${secs}초)"; wait_ok "$ctr" "$secs" || ok=0; fi
+  if [ "$ok" = 1 ]; then
+    echo "[$name] 5/5 성공: $(running_ref "$ctr")"
+    install -d -m 0700 "$LG" && tar -C "$C" --exclude='*.failed-*' -cf "$LG/$name.tar.new" . && mv -f "$LG/$name.tar.new" "$LG/$name.tar" && echo "  > 성공 상태 저장(롤백용): $LG/$name.tar"
+    return 0
+  fi
+  echo "[$name] 실패 — 롤백합니다"
+  local f; for f in "$C"/*.yml "$C"/*.yaml; do [ -f "$f" ] && cp -p "$f" "$f.failed-$TS"; done   # 실패한 변경은 되돌린 뒤에도 남긴다
+  if [ -f "$LG/$name.tar" ]; then tar -C "$C" -xf "$LG/$name.tar" && echo "  > compose 설정을 마지막 성공 상태(last-good)로 복원"
+  else echo "  > 마지막 성공 상태 없음(첫 실행) — compose 의 이미지 줄만 되돌립니다"; fi
+  [ -n "$ref" ] && pin_image "$name" "$dir" "$ctr" "$ref"   # last-good 이어도 실행 중이던 이미지로 맞춘다
+  for f in "$C"/*.failed-"$TS"; do [ -f "$f" ] || continue; if cmp -s "$f" "${f%.failed-$TS}"; then rm -f "$f"; else echo "  > 실패한 변경 보존: $f"; fi; done
+  if [ -n "$rb" ]; then docker tag "$rb" "$ref" && echo "  > 이미지 $ref 를 이전 것으로 되돌림"; fi
+  if ( cd "$C" && docker compose up -d --no-build --force-recreate 2>&1 | tail -3; exit "${PIPESTATUS[0]}" ) && wait_ok "$ctr" "$secs"; then
+    echo "[$name] 롤백 완료: $(running_ref "$ctr") (상태 $(health "$ctr"))"
+  else echo "[$name] !! 롤백 후에도 올라오지 않음 — 수동 확인: docker logs $ctr · 백업 $B"; fi
+  [ "$name" = postgres ] && echo "  안내: DB 데이터는 자동으로 되돌리지 않았습니다. 필요하면: zcat $B/pg_dumpall.sql.gz | docker exec -i $ctr psql -U postgres"
+  [ -f "$B/data.tar" ] && echo "  안내: 데이터 디렉터리는 자동으로 되돌리지 않았습니다. 필요하면 서비스를 멈추고 tar -C /srv/$PFX/services/$dir -xf $B/data.tar"
+  return 1
+}
+
+[ "$MODE" = apply ] && { TS=$(date +%Y%m%d-%H%M%S); BK=/var/backups/$PFX/service-update/$TS; install -d -m 0700 "$BK"; LG=/var/backups/$PFX/service-update/last-good; }
+echo "== $PFX-service-update ($MODE) — 대상: $(echo $NAMES)"
+rc=0
+for n in $NAMES; do
+  IFS='|' read -r name dir ctr secs <<<"$(grep "^$n|" <<<"$LIST")"
+  if [ "$MODE" != apply ]; then
+    echo "[$name]"; show_state "$name" "$dir" "$ctr"
+    [ "$MODE" = plan ] && echo "  적용하면: 백업($([ "$name" = postgres ] && echo 'DB 덤프 포함' || echo 'compose·env·데이터')) → 이미지 받기·빌드 → 올리기 → 헬스(${secs}초) → 실패 시 롤백"
+    continue
+  fi
+  update_one "$name" "$dir" "$ctr" "$secs" || { rc=1; echo "중단: $name 에서 실패(롤백 시도 완료). 남은 서비스는 건드리지 않았습니다."; break; }
+done
+[ "$MODE" = plan ] && echo "안내: 위는 계획입니다. 실제로 갱신하려면 sudo $PFX-service-update $TARGET --apply"
+[ "$MODE" = apply ] && echo "백업 위치: $BK"
+exit $rc

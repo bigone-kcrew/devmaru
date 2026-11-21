@@ -1,0 +1,40 @@
+--- a/modules/net/quic/Makefile
++++ b/modules/net/quic/Makefile
+@@ -5,6 +5,14 @@
+ 
+ LINUXINCLUDE += -I$(ROOTDIR)/include
+ 
++# Ubuntu 7.0.0 ABI 38 backports newer networking APIs while
++# LINUX_VERSION_CODE remains 7.0.0. Detect the Ubuntu ABI from
++# KERNELRELEASE supplied by DKMS/Kbuild.
++UBUNTU_ABI := $(shell printf "%s\n" "$(KERNELRELEASE)" | sed -n "s/^[0-9.]*-\([0-9][0-9]*\)-.*/\1/p")
++ifeq ($(shell [ -n "$(UBUNTU_ABI)" ] && [ "$(UBUNTU_ABI)" -ge 38 ] 2>/dev/null && echo y),y)
++ccflags-y += -DQUIC_NEW_NET_API
++endif
++
+ obj-$(CONFIG_IP_QUIC) += quic.o
+ 
+ quic-y := common.o family.o protocol.o socket.o stream.o connid.o path.o \
+--- a/modules/net/quic/path.c
++++ b/modules/net/quic/path.c
+@@ -95,7 +95,7 @@
+ 	tuncfg.encap_type = 1;
+ 	tuncfg.encap_rcv = quic_udp_rcv;
+ 	tuncfg.encap_err_lookup = quic_udp_err;
+-#ifdef RTEXT_FILTER_NAME_ONLY
++#ifdef QUIC_NEW_NET_API
+ 	setup_udp_tunnel_sock(net, sock->sk, &tuncfg);
+ #else
+ 	setup_udp_tunnel_sock(net, sock, &tuncfg);
+--- a/modules/net/quic/socket.c
++++ b/modules/net/quic/socket.c
+@@ -1309,7 +1309,8 @@
+ 	return err;
+ }
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
++#if defined(QUIC_NEW_NET_API) || \
++    LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+ static int quic_recvmsg(struct sock *sk, struct msghdr *msg, size_t msg_len,
+ 			int flags)
+ #else

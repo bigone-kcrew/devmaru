@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# @@PFX@@-paseo-host — Paseo 파일 다운로드(직접 연결)를 켜거나 끈다. 멤버가 자기 컨테이너에서 실행한다.
+#   @@PFX@@-paseo-host on      직접 연결을 연다(<내ID>.paseo.@@DOMAIN@@). 암호는 계정 비밀번호와 연동되면 묻지 않는다
+#   @@PFX@@-paseo-host off     직접 연결을 닫는다(암호는 그대로 둔다)
+#   @@PFX@@-paseo-host status  현재 상태
+# 암호 없이 여는 것은 지원하지 않는다: 암호가 없으면 접속자가 곧바로 소유자 권한을 얻는다.
+# (내부) _sync: root 의 @@PFX@@-paseo-password-sync 가 호출 — 표준입력의 새 계정 암호로 데몬 암호를 맞춘다.
+set -euo pipefail
+ID=$(id -un); HOST="$ID.paseo.@@DOMAIN@@"; PH="${PASEO_HOME:-$HOME/.paseo}"; CFG="$PH/config.json"; MARK="$PH/.@@PFX@@-password-synced"
+SETPW=/usr/lib/node_modules/@getpaseo/cli/dist/commands/daemon/set-password.js
+has_pw(){ node -e 'try{process.exit(require(process.argv[1]).daemon?.auth?.password?0:1)}catch{process.exit(1)}' "$CFG"; }
+cfg_listen(){ node -e 'try{console.log(require(process.argv[1]).daemon?.listen??"127.0.0.1:6767")}catch{console.log("127.0.0.1:6767")}' "$CFG"; }
+is_open(){ case "$(cfg_listen)" in 127.0.0.1:*|localhost:*) return 1;; *) return 0;; esac; }
+listen(){ paseo daemon status 2>/dev/null | sed -n 's/^ *listen: *//p' | head -1; }
+status(){
+  echo "  직접 연결 주소 : $HOST (포트 443, TLS)"
+  echo "  데몬 listen    : $(listen)"
+  if has_pw; then [ -e "$MARK" ] && echo "  데몬 암호      : 설정됨(계정 비밀번호와 자동 연동)" || echo "  데몬 암호      : 설정됨(직접 입력, 자동 연동 아님)"; else echo "  데몬 암호      : 없음"; fi
+  is_open && echo "  직접 연결      : 켜짐" || echo "  직접 연결      : 꺼짐(릴레이만)"
+}
+ask(){ local a; read -r -p "$1 " a; [[ $a == [yY]* ]]; }
+case "${1:-}" in
+  status) status ;;
+  off)
+    for k in daemon.listen daemon.hostnames daemon.trustedProxies; do paseo daemon config unset "$k" >/dev/null 2>&1 || true; done
+    paseo daemon restart | tail -1; status ;;
+  on)
+    echo "Paseo 직접 연결을 켭니다. 켜면 허용 IP 에서 $HOST 로 접속할 수 있고, 데몬 암호가 유일한 인증입니다."
+    echo "암호가 알려지면 이 컨테이너의 파일·터미널·에이전트에 접근됩니다."
+    if has_pw && [ -e "$MARK" ]; then
+      echo "데몬 암호는 계정(SSH) 비밀번호와 자동으로 연동돼 있습니다. SSH 비밀번호를 바꾸면 함께 바뀝니다."
+    elif has_pw && ask "이미 직접 입력한 데몬 암호가 있습니다(계정 비밀번호와 연동되지 않음). 그대로 쓸까요? [y/N]"; then :
+    else
+      echo "데몬 암호를 입력합니다. 계정 비밀번호와 같게 입력해도 되지만 자동 연동되지는 않습니다."
+      echo "(SSH 비밀번호를 한 번 바꾸면 이후로는 자동 연동됩니다.)"
+      paseo daemon set-password; rm -f "$MARK"
+    fi
+    has_pw || { echo "데몬 암호가 없어 중단합니다." >&2; exit 1; }
+    ask "에이전트가 작업 중이면 재시작으로 끊깁니다. 계속할까요? [y/N]" || { echo "취소"; exit 1; }
+    paseo daemon config set daemon.listen 0.0.0.0:6767 >/dev/null
+    paseo daemon config set daemon.hostnames "[\"$HOST\"]" >/dev/null
+    paseo daemon config set daemon.trustedProxies '["loopback","172.18.0.1"]' >/dev/null  # 172.18.0.1 = @@PFX@@-dev-net 게이트웨이(프록시 경유 신뢰)
+    paseo daemon restart | tail -1; status
+    echo "Paseo 앱: 호스트 → Add host → 직접 연결 → 호스트 $HOST / 포트 443 / SSL 사용 / 위의 암호 → 연결" ;;
+  _sync)
+    # 표준입력 한 줄 = 새 계정 암호. 인자·환경변수·출력에 암호를 두지 않는다. 직접 연결이 켜져 있을 때만 재시작한다.
+    node --input-type=module -e '
+      let pw=""; for await (const c of process.stdin) pw+=c; pw=pw.replace(/\r?\n$/,"");
+      if(!pw) process.exit(2);
+      const m=await import(process.argv[1]); await m.setDaemonPasswordInConfig(pw,{home:process.argv[2]});' "$SETPW" "$PH" >/dev/null
+    : > "$MARK"
+    if is_open; then paseo daemon restart --home "$PH" >/dev/null 2>&1 || exit 3; echo "synced+restarted"; else echo "synced"; fi ;;
+  *) echo "사용: @@PFX@@-paseo-host on|off|status" >&2; exit 2 ;;
+esac

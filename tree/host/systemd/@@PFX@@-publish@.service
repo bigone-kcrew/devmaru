@@ -1,0 +1,31 @@
+[Unit]
+Description=@@BRAND@@ member static publish sandbox (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+# 멤버의 보조 그룹(@@PFX@@ 등)을 쓰지 않는다
+SupplementaryGroups=
+ExecStart=/usr/bin/caddy run --config /etc/@@PFX@@/publish/publish.Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+# 샌드박스: 루트를 빈 파일시스템으로 바꾸고 /usr, 설정, 그리고 drop-in(@@PFX@@-site-sync3)이 정한 publish 폴더만 읽기 전용으로 보인다
+TemporaryFileSystem=/:ro
+BindReadOnlyPaths=/usr /etc/@@PFX@@/publish
+PrivateDevices=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=64M
+TasksMax=64
+RuntimeDirectory=@@PFX@@-publish/%i
+Environment=XDG_CONFIG_HOME=/run/@@PFX@@-publish/%i/c XDG_DATA_HOME=/run/@@PFX@@-publish/%i/d AI_PUBLISH_PORT=0
+
+[Install]
+WantedBy=multi-user.target

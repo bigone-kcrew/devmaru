@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""@@PFX@@-site-sync (root, v3 최종) — @@PFX@@-site-sync.timer 가 1분마다 부른다. 사본을 만들지 않는다(tar·해시 없음).
+/etc/caddy/sites.d/<멤버>.caddy 블록이 있는 모든 멤버의 workspace/<프로젝트>/publish 와 공용 /shared/workspaces/<프로젝트>/publish 를 «발견·검사»하고(stat 만),
+바뀐 것이 있을 때만 해당 샌드박스 유닛(@@PFX@@-publish@<멤버>.service · @@PFX@@-publish-shared.service)의 bind mount 목록(drop-in)을 다시 쓰고 재시작한다.
+ - 공용: /etc/@@PFX@@/site-v3.shared 파일이 있을 때만(@@PFX@@-site-caddy shared on|off). 공용 매처는 `@@PFX@@-site-caddy shared-matchers` 가 만든다
+ - publish 가 링크이거나 폴더가 아니면 공개하지 않는다(systemd 는 bind 원본의 링크를 따라가므로 여기서 거른다)
+ - 폴더가 «잠깐 없어진» 것은 MISSING_RUNS 번 연속일 때만 내린다. publish 의 inode 가 바뀌면(지우고 다시 만듦) 곧바로 재시작한다
+사용: @@PFX@@-site-sync [--plan]     (--plan: 아무것도 바꾸지 않고 할 일만 출력)
+"""
+import fcntl, hashlib, http.client, json, os, pwd, re, shlex, stat, subprocess, sys, time, urllib.error, urllib.request
+
+E = os.environ
+USERS = E.get('AI_SITE_USERS', '/srv/@@PFX@@/users')
+SHARED = E.get('AI_SITE_SHARED', '/srv/@@PFX@@/shared/workspaces')
+PORTAL = E.get('AI_SITE_PORTAL', '/srv/@@PFX@@/public/portal')
+STATE = E.get('AI_SITE3_STATE', '/var/lib/@@PFX@@/site-v3')   # v2(@@PFX@@-site-sync)의 상태 폴더 /var/lib/@@PFX@@/site-sync 와 «다른 폴더» — 같은 state.json 을 쓰면 병행 운영 중 서로 망가뜨린다
+OUT = E.get('AI_SITE3_OUT', '/var/lib/@@PFX@@/site-v3.json')
+SITES = E.get('AI_SITE_SITES', '/etc/caddy/sites.d')   # 멤버 블록이 있는 멤버가 관리 대상(v2 와 같은 환경변수 이름·기본값)
+SHARED_FLAG = E.get('AI_SITE3_SHARED_ON', '/etc/@@PFX@@/site-v3.shared')
+DROPIN = E.get('AI_SITE3_DROPIN', '/run/systemd/system')
+SYSTEMCTL = shlex.split(E.get('AI_SITE3_SYSTEMCTL', 'systemctl'))
+SHARED_CADDY = shlex.split(E.get('AI_SITE3_SHARED_CADDY', '/usr/local/sbin/@@PFX@@-site-caddy shared-matchers'))
+NOTE = shlex.split(E.get('AI_SITE3_NOTE', ''))          # 멤버에게 .site 상태 파일을 쓰는 명령(비어 있으면 건너뜀). 인자: <멤버> , 표준입력=본문
+LOCKF = E.get('AI_SITE3_LOCK', '/run/@@PFX@@-site-sync/lock')
+NOPROBE = E.get('AI_SITE3_NOPROBE') == '1'
+MISSING_RUNS = int(E.get('AI_SITE_MISSING_RUNS', 3))
+SYSCTL_TIMEOUT = int(E.get('AI_SITE3_SYSCTL_TIMEOUT', 60))
+
+MEMBER_RE = re.compile(r'^[a-z][a-z0-9-]{1,30}$')
+PROJ_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+SHARED_RE = re.compile(r'^[a-z][a-z0-9-]{1,30}$')
+MAX_PROJECTS = int(E.get('AI_SITE_MAX_PROJECTS', 20))
+MAX_SHARED = int(E.get('AI_SITE_MAX_SHARED', 10))
+PORT_LO, PORT_HI = 18100, 18189
+SHARED_PORT = 18199
+FIXED_RESERVED = set('ops skills tools api admin guide ai www static assets app apps docs dev test status mail portal paseo'.split())
+
+
+def log(*a):
+    print('@@PFX@@-site-sync:', *a, file=sys.stderr)
+
+
+# ---- 발견 --------------------------------------------------------------------------------------
+def managed_members():
+    """관리 대상 멤버 = sites.d 에 <멤버>.caddy 블록이 있는 멤버(@@PFX@@-site-caddy add 로 생김, remove 로 사라짐).
+    AI_SITE_ALSO(쉼표 목록)의 멤버도 이번 회차에 포함한다 — add 가 블록을 만들기 «전에» 포트를 받으려고 부른다(블록이 있어야 관리하므로 그대로면 신규 멤버는 포트를 못 받는다)."""
+    try:
+        names = os.listdir(SITES)
+    except OSError:
+        names = []
+    got = {n[:-6] for n in names if n.endswith('.caddy') and MEMBER_RE.match(n[:-6])}
+    got |= {x for x in E.get('AI_SITE_ALSO', '').split(',') if MEMBER_RE.match(x)}
+    return sorted(got)
+
+
+def _publish_dir(proj_dir):
+    """(경로, inode, None) 또는 (None, None, 사유). publish 는 «실제 폴더»여야 한다(링크·파일 거부)."""
+    d = os.path.join(proj_dir, 'publish')
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return None, None, 'publish 폴더 없음'
+    if stat.S_ISLNK(st.st_mode):
+        return None, None, 'publish 가 링크라 공개하지 않음'
+    if not stat.S_ISDIR(st.st_mode):
+        return None, None, 'publish 가 폴더가 아님'
+    return d, st.st_ino, None
+
+
+def discover_member(m):
+    """멤버의 공개 대상. 반환: (accepted[(프로젝트, publish 경로, inode)], rejects[(프로젝트, 사유)]) · workspace 를 못 읽으면 None."""
+    w = os.path.join(USERS, m, 'workspace')
+    try:
+        names = sorted(os.listdir(w))
+    except OSError:
+        return None
+    acc, rej = [], []
+    for p in names:
+        pd = os.path.join(w, p)
+        if p.startswith('.') or not os.path.isdir(pd) and not os.path.islink(pd):
+            continue
+        if not PROJ_RE.match(p):
+            if os.path.isdir(os.path.join(pd, 'publish')) and not os.path.islink(pd):   # 공개하려던 폴더면 이유를 알려 준다
+                rej.append((p, '프로젝트 이름은 영문·숫자·_·- 만 가능'))
+            continue
+        if os.path.islink(pd):
+            if os.path.isdir(os.path.join(pd, 'publish')):   # 공개하려던 폴더면 이유를 알려 준다(자기 링크 /workspace/workspace 같은 것은 소음이라 조용히 건너뜀)
+                rej.append((p, '프로젝트 폴더가 링크'))
+            continue
+        if os.path.exists(os.path.join(pd, '.publish-off')):
+            rej.append((p, '.publish-off'))
+            continue
+        d, ino, why = _publish_dir(pd)
+        if d is None:
+            if why != 'publish 폴더 없음':
+                rej.append((p, why))
+            continue
+        acc.append((p, d, ino))
+    for p, d, ino in acc[MAX_PROJECTS:]:
+        rej.append((p, f'공개 프로젝트는 멤버당 최대 {MAX_PROJECTS}개'))
+    return acc[:MAX_PROJECTS], rej
+
+
+def reserved_names():
+    names = {n.lower() for n in FIXED_RESERVED}
+    try:
+        names |= {n.lower() for n in os.listdir(PORTAL) if '.' not in n}
+    except OSError:
+        pass
+    return names
+
+
+def member_names():
+    try:
+        return {d for d in os.listdir(USERS) if MEMBER_RE.match(d) and os.path.isdir(os.path.join(USERS, d, 'workspace'))}
+    except OSError:
+        return set()
+
+
+def discover_shared(members):
+    """공용 정적 프로젝트(자동 규칙). 반환: (accepted, rejects) — SPEC 5.4."""
+    try:
+        names = sorted(os.listdir(SHARED))
+    except OSError:
+        return None
+    resv = reserved_names()
+    acc, rej = [], []
+    for p in names:
+        pd = os.path.join(SHARED, p)
+        if p.startswith('.') or not os.path.isdir(pd) and not os.path.islink(pd):
+            continue
+        d, ino, why = (None, None, None)
+        if not SHARED_RE.match(p):
+            if os.path.isdir(os.path.join(pd, 'publish')):
+                rej.append((p, '이름은 소문자로 시작하는 영문 소문자·숫자·하이픈 2~31자'))
+            continue
+        if os.path.islink(pd):
+            rej.append((p, '프로젝트 폴더가 링크'))
+            continue
+        d, ino, why = _publish_dir(pd)
+        if d is None:
+            if why != 'publish 폴더 없음':
+                rej.append((p, why))
+            continue
+        if os.path.exists(os.path.join(pd, '.publish-off')):
+            rej.append((p, '.publish-off'))
+            continue
+        if p in resv:
+            rej.append((p, '예약된 이름(포털·서버 경로와 겹침)'))
+            continue
+        try:
+            owner = pwd.getpwuid(os.lstat(pd).st_uid).pw_name
+        except (KeyError, OSError):
+            owner = None
+        if owner not in members:
+            rej.append((p, '프로젝트 폴더 소유자가 현재 멤버가 아님'))
+            continue
+        acc.append((p, d, ino, owner))
+    for x in acc[MAX_SHARED:]:
+        rej.append((x[0], f'공유 프로젝트는 최대 {MAX_SHARED}개'))
+    return acc[:MAX_SHARED], rej
+
+
+# ---- 판단 ---------------------------------------------------------------------------------------
+def alloc_port(ports, m):
+    """멤버별 고정 포트(한 번 받으면 계속 같다)."""
+    if m in ports:
+        return ports[m]
+    used = set(ports.values())
+    for p in range(PORT_LO, PORT_HI + 1):
+        if p not in used:
+            ports[m] = p
+            return p
+    return None
+
+
+def key_of(projs):
+    return sorted([[p, ino] for p, _d, ino in projs])
+
+
+def effective(prev, acc, rej, missing, unit):
+    """이번 회차에 «공개로 칠» 목록. 일시 누락(폴더가 잠깐 없음)은 MISSING_RUNS 번 연속일 때만 내린다. 거부 사유가 있으면 곧바로 내린다."""
+    rejected = {p for p, _ in rej}
+    have = {p for p, _d, _i in acc}
+    out = list(acc)
+    mk = missing.setdefault(unit, {})
+    for p, d, ino in prev:
+        if p in have:
+            mk.pop(p, None)
+        elif p not in rejected:
+            mk[p] = mk.get(p, 0) + 1
+            if mk[p] < MISSING_RUNS:
+                out.append((p, d, ino))
+            else:
+                mk.pop(p, None)
+    for p in list(mk):
+        if p in have or p in rejected:
+            mk.pop(p, None)
+    return sorted(out)
+
+
+def decide(prev_key, new_key, running):
+    """'none' | 'restart' | 'stop'."""
+    if not new_key:
+        return 'stop' if (prev_key or running) else 'none'
+    if prev_key != new_key or not running:
+        return 'restart'
+    return 'none'
+
+
+def render_dropin(port, projs, extra_env=''):
+    lines = ['[Service]', f'Environment=AI_PUBLISH_PORT={port}']
+    for p, d, _ino in sorted(projs):
+        lines.append(f'BindReadOnlyPaths=-{d}:/site/{p}')   # '-' : 경로가 없어도(유예 중인 사라진 폴더) 유닛은 뜬다
+    return '\n'.join(lines) + '\n'
+
+
+# ---- 적용 ---------------------------------------------------------------------------------------
+def sysctl(*args):
+    """systemctl 호출. 시간이 넘으면(정지 대기 등) 예외로 전체 실행이 죽지 않게 실패(rc=124)로 돌려준다 — 다음 분에 다시 시도한다."""
+    try:
+        return subprocess.run(SYSTEMCTL + list(args), capture_output=True, text=True, timeout=SYSCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f'systemctl {" ".join(args)} 시간 초과({SYSCTL_TIMEOUT}초)')
+        return subprocess.CompletedProcess(args, 124, '', 'timeout')
+
+
+def dropin_file(unit):
+    return os.path.join(DROPIN, unit + '.d', 'binds.conf')
+
+
+def write_atomic(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.new'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def probe(port):
+    """샌드박스가 응답하는가(404 도 응답). 시험에서는 AI_SITE3_NOPROBE=1."""
+    if NOPROBE:
+        return True
+    for _ in range(25):
+        try:
+            c = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+            c.request('GET', '/')
+            c.getresponse()   # 404 도 응답이다
+            c.close()
+            return True
+        except (OSError, http.client.HTTPException):
+            time.sleep(0.2)
+    return False
+
+
+def recheck(projs):
+    """재시작 직전에 publish 가 여전히 «실제 폴더»인지 다시 본다(발견~기동 사이에 링크로 바뀐 것을 거른다). 없는 것은 그대로 둔다('-' 로 무시됨)."""
+    out = []
+    for p, d, ino in projs:
+        try:
+            if stat.S_ISLNK(os.lstat(d).st_mode):
+                log(f'{p}: 재시작 직전 publish 가 링크라 뺌')
+                continue
+        except OSError:
+            pass
+        out.append((p, d, ino))
+    return out
+
+
+def apply_unit(unit, port, projs):
+    projs = recheck(projs)
+    write_atomic(dropin_file(unit), render_dropin(port, projs))
+    sysctl('daemon-reload')
+    r = sysctl('restart', unit)
+    if r.returncode:
+        log(f'{unit}: 재시작 실패 {r.stderr.strip()[:120]}')
+        return False
+    if not probe(port):
+        log(f'{unit}: 재시작했지만 포트 {port} 가 응답하지 않음')
+        return False
+    return True
+
+
+def stop_unit(unit):
+    sysctl('stop', unit)
+    try:
+        os.unlink(dropin_file(unit))
+        os.rmdir(os.path.dirname(dropin_file(unit)))
+    except OSError:
+        pass
+    sysctl('daemon-reload')
+
+
+def is_running(unit):
+    return sysctl('is-active', '--quiet', unit).returncode == 0
+
+
+def note_member(m, text):
+    """멤버에게 .site 상태 안내를 쓴다(NOTE 명령 = @@PFX@@-site-note). 성공하면 True — 못 쓰면 다음 분에 다시 시도한다."""
+    if not NOTE:
+        return False
+    try:
+        return subprocess.run(NOTE + [m], input=text, text=True, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def status_text(m, projs, rej, shared_mine):
+    ls = ['# @@PFX@@-site 공개 상태(서버가 1분마다 갱신 — 직접 고치지 마세요)']
+    for p, _d, _i in sorted(projs):
+        ls.append(f'공개 {p} https://{m}.@@DOMAIN@@/{p}/')
+    for p, why in sorted(rej):
+        ls.append(f'거부 {p} {why}')
+    for p, owner in shared_mine:
+        ls.append(f'공용 {p} https://@@PORTAL_HOST@@/{p}/')
+    return '\n'.join(ls) + '\n'
+
+
+# ---- 한 번 실행 -----------------------------------------------------------------------------------
+def load_state():
+    try:
+        with open(os.path.join(STATE, 'state.json'), encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def run(plan_only=False):
+    st = load_state()
+    st.setdefault('members', {}); st.setdefault('ports', {}); st.setdefault('missing', {}); st.setdefault('shared', {'projects': []})
+    actions, summary, failed = [], {'generated': int(time.time()), 'members': {}, 'shared': []}, []   # failed: 이번 회차에 샌드박스를 못 띄운 멤버(전환 스위치가 확인한다)
+    fm = managed_members()
+    for m in fm:
+        res = discover_member(m)
+        if res is None:
+            log(f'{m}: workspace 를 읽지 못해 건너뜀(이전 상태 유지)')
+            continue
+        acc, rej = res
+        unit = f'@@PFX@@-publish@{m}.service'
+        prev = [tuple(x) for x in st['members'].get(m, {}).get('projects', [])]   # (프로젝트, publish 경로, inode)
+        eff = effective(prev, acc, rej, st['missing'], unit)
+        port = alloc_port(st['ports'], m)
+        if port is None:
+            log(f'{m}: 포트 부족')
+            continue
+        running = is_running(unit) if not plan_only else bool(prev)
+        act = decide(key_of(prev), key_of(eff), running)
+        actions.append((act, unit, m, [p for p, _d, _i in eff]))
+        if not plan_only and act != 'none':
+            ok = apply_unit(unit, port, eff) if act == 'restart' else (stop_unit(unit) or True)
+            if not ok:
+                failed.append(m)
+                continue   # 상태를 갱신하지 않아 다음 분에 다시 시도한다
+        st['members'][m] = {'port': port, 'projects': [list(x) for x in eff]}
+        summary['members'][m] = {'port': port, 'projects': [p for p, _d, _i in eff], 'rejects': [list(x) for x in rej]}
+    for m in list(st['members']):
+        if m not in fm:   # 전환 목록에서 빠짐(v2 로 되돌림) — 유닛을 내린다
+            actions.append(('stop', f'@@PFX@@-publish@{m}.service', m, []))
+            if not plan_only:
+                stop_unit(f'@@PFX@@-publish@{m}.service')
+                st['members'].pop(m)
+                st['missing'].pop(f'@@PFX@@-publish@{m}.service', None); st.get('notes', {}).pop(m, None)
+    if not plan_only:
+        alive = member_names()
+        for m in list(st['ports']):   # 멤버가 삭제됐으면 포트를 돌려받는다(전환만 해제된 멤버는 블록이 같은 포트를 가리키므로 그대로)
+            if m not in alive and m not in fm:
+                st['ports'].pop(m)
+    shared_mine = {}
+    if not os.path.exists(SHARED_FLAG) and (st['shared'].get('projects') or (not plan_only and is_running('@@PFX@@-publish-shared.service'))):
+        actions.append(('stop', '@@PFX@@-publish-shared.service', 'shared', []))   # 공용 공개를 끈 경우: 유닛·매처·상태를 모두 치운다
+        if not plan_only:
+            stop_unit('@@PFX@@-publish-shared.service')
+            subprocess.run(SHARED_CADDY, input='', text=True, capture_output=True, timeout=120)
+            st['shared'] = {'projects': []}
+            st['missing'].pop('shared', None)
+    if os.path.exists(SHARED_FLAG):
+        res = discover_shared(member_names())
+        if res is not None:
+            acc, rej = res
+            prev = [tuple(x) for x in st['shared'].get('projects', [])]
+            eff = effective([(a, b, c) for a, b, c, *_ in prev], [(a, b, c) for a, b, c, _o in acc], rej, st['missing'], 'shared')
+            owners = {a: o for a, _b, _c, o in acc}
+            owners.update({a: o for a, _b, _c, o in prev})
+            effs = [(p, d, i) for p, d, i in eff]
+            unit = '@@PFX@@-publish-shared.service'
+            act = decide(key_of([(p, d, i) for p, d, i, *_ in prev]), key_of(effs), is_running(unit) if not plan_only else bool(prev))
+            actions.append((act, unit, 'shared', [p for p, _d, _i in effs]))
+            if not plan_only and act != 'none':
+                ok = apply_unit(unit, SHARED_PORT, effs) if act == 'restart' else (stop_unit(unit) or True)
+                if ok:
+                    r = subprocess.run(SHARED_CADDY, input='\n'.join(p for p, _d, _i in effs) + '\n', text=True, capture_output=True, timeout=120)
+                    if r.returncode:
+                        log(f'공용 Caddy 반영 실패: {r.stderr.strip()[:160]}')
+                        ok = False
+                if not ok:
+                    effs = [(p, d, i) for p, d, i, *_ in prev]
+                    # 샌드박스만 새 목록으로 떠 있고 Caddy 는 옛 목록일 수 있다 — 샌드박스도 이전 목록으로 되돌린다
+                    if effs:
+                        apply_unit(unit, SHARED_PORT, effs)
+                    else:
+                        stop_unit(unit)
+            st['shared'] = {'projects': [[p, d, i, owners.get(p, '')] for p, d, i in effs]}
+            summary['shared'] = [{'project': p, 'owner': owners.get(p, ''), 'url': f'https://@@PORTAL_HOST@@/{p}/'} for p, _d, _i in effs]
+            summary['shared_rejects'] = [list(x) for x in rej]
+            for p, _d, _i in effs:
+                shared_mine.setdefault(owners.get(p, ''), []).append((p, owners.get(p, '')))
+    if plan_only:
+        for a in actions:
+            print(*a[:3], ','.join(a[3]))
+        return 0
+    notes = st.setdefault('notes', {})
+    for m in fm:
+        if m in summary['members']:
+            mm = summary['members'][m]
+            text = status_text(m, [(p, '', 0) for p in mm['projects']], mm['rejects'], shared_mine.get(m, []))
+            h = hashlib.sha256(text.encode()).hexdigest()
+            if notes.get(m) != h and note_member(m, text):   # 안내문이 바뀌었을 때만 쓴다(매분 같은 파일을 다시 쓰지 않는다). 실패하면 다음 분에 다시
+                notes[m] = h
+    os.makedirs(STATE, exist_ok=True)
+    st['failed'] = failed; summary['failed'] = failed
+    write_atomic(os.path.join(STATE, 'state.json'), json.dumps(st, ensure_ascii=False, indent=1), 0o644)   # 포트·프로젝트 경로뿐(비밀 없음) — 확인 명령·@@PFX@@-site-caddy status 가 일반 사용자로도 읽는다
+    write_atomic(OUT, json.dumps(summary, ensure_ascii=False, indent=1), 0o644)
+    return 0
+
+
+def main(argv):
+    plan_only = '--plan' in argv
+    try:
+        os.makedirs(os.path.dirname(LOCKF), exist_ok=True)
+        lk = open(LOCKF, 'a')
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+    except OSError:
+        lk = None   # 비-root 시험에서 /run 에 못 쓰는 경우
+    return run(plan_only)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

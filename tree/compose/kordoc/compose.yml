@@ -1,0 +1,59 @@
+services:
+  kordoc:
+    build:
+      context: .
+    image: kordoc:4.24.68-api1.11.0-20261112r1
+    container_name: kordoc
+    restart: unless-stopped
+
+    env_file:
+      - /opt/@@PFX@@/config/env/kordoc.env
+
+    environment:
+      KORDOC_CHROMIUM_NO_SANDBOX: "1"
+      TZ: @@TZ@@
+      # 🔴 2026-09-27: 이것이 없으면 V8 기본 힙 한계 2,240MB 에서 죽는다.
+      #    컨테이너는 6g 인데 node 가 그 전에 터져 「Reached heap limit」 FATAL 로 끝났다
+      #    (OOMKilled=false · ExitCode=0 — cgroup OOM 이 아니라 V8 힙 한계다).
+      #    4096 인 이유: OCR 의 ONNX 는 «V8 힙 밖» 네이티브 메모리를 쓴다.
+      #    6g 중 힙 4g 를 주면 네이티브에 2g 가 남는다. 5120 은 900MB 밖에 안 남아
+      #    컨테이너 OOM 으로 바뀔 뿐이다.
+      NODE_OPTIONS: "--max-old-space-size=4096"
+
+    # 🔴 2026-09-20: 상한 없음(mem_limit=0) 이라 kordoc 이 4.7GB 까지 증식해
+    #    RAM+swap 을 말리고 «전역 OOM» 을 냈다 → sshd·caddy 마비, 포털 다운.
+    #    커널 로그: "Killed process (MainThread) anon-rss:4705612kB ... global_oom"
+    #    상한을 두면 전역 OOM 이 «컨테이너 국소 OOM»(6초 재시작)으로 바뀐다.
+    #    4g 인 이유: kordoc 제외 사용량이 ~10.1GB 라 4g 여야 총량(15.3GB) 전에 «먼저» 걸린다.
+    #    8g 는 도달 자체가 불가능해 상한 없음과 같다. 4g 로 검증됨(3.1GB 까지 정상).
+    mem_limit: 6g
+
+    ports:
+      - "127.0.0.1:3400:3400"
+
+    expose:
+      - "3400"
+
+    networks:
+      - @@PFX@@-service-net
+      - @@PFX@@-dev-net
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >
+          fetch('http://127.0.0.1:3400/health')
+          .then(r => process.exit(r.ok ? 0 : 1))
+          .catch(() => process.exit(1))
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  @@PFX@@-service-net:
+    external: true
+  @@PFX@@-dev-net:
+    external: true

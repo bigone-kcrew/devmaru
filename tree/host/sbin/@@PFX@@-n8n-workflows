@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+# @@PFX@@-n8n-workflows (root) — 범용 n8n 워크플로 템플릿을 n8n 에 가져온다(가져온 것은 항상 «비활성»).
+#   @@PFX@@-n8n-workflows list [--check]          템플릿 목록과 가져옴 여부(--check: 하나라도 없으면 종료 코드 1)
+#   @@PFX@@-n8n-workflows install <이름>|--all [--force]    n8n 으로 가져오기(이미 있으면 건너뜀, --force 로 덮어쓰기)
+#   @@PFX@@-n8n-workflows activate|deactivate <이름>        활성화/비활성화(n8n 을 한 번 다시 시작한다)
+#   @@PFX@@-n8n-workflows export <이름> [파일]              n8n 의 현재 내용을 파일로 저장(자격증명 값은 들어 있지 않다)
+# 자격증명(SMTP·Telegram 등)은 n8n 화면에서 직접 고른다. 토큰은 가져올 때 서버의 토큰 파일 값으로 채워진다.
+import json, os, secrets, subprocess, sys, time
+
+ROOT = os.environ.get("N8N_WF_ROOT", "")   # 시험용: 경로 앞에 붙일 접두(비우면 실제 경로)
+CTR = os.environ.get("N8N_CONTAINER", "n8n"); TPL = ROOT + "/opt/@@PFX@@/n8n-workflows"
+
+def die(m, c=1): print("실패: " + m, file=sys.stderr); sys.exit(c)
+def sh(*a, check=True):
+    r = subprocess.run(a, capture_output=True, text=True)
+    if check and r.returncode: die(f"{' '.join(a[:3])} … ({(r.stderr or r.stdout).strip()[-200:]})")
+    return r
+
+def templates():
+    try: return json.load(open(f"{TPL}/index.json"))["workflows"]
+    except Exception: die(f"템플릿 목록을 읽지 못했다: {TPL}/index.json")
+
+def running(): return sh("docker", "inspect", "-f", "{{.State.Running}}", CTR, check=False).stdout.strip() == "true"
+
+def installed():
+    if not running(): return None
+    out = sh("docker", "exec", CTR, "n8n", "list:workflow").stdout
+    return {l.split("|")[0]: l.split("|", 1)[1] for l in out.splitlines() if "|" in l and "[" not in l.split("|")[0]}
+
+def pick(name, tpls):
+    t = next((x for x in tpls if x["name"] == name), None)
+    if not t: die(f"알 수 없는 템플릿: {name} (list 로 확인)")
+    return t
+
+def token(path):
+    path = ROOT + path
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f: f.write(secrets.token_hex(24))
+    return open(path).read().strip()
+
+def cmd_list(args):
+    tpls, have = templates(), installed()
+    print("n8n:", "실행 중" if have is not None else "꺼져 있음 또는 없음")
+    miss = 0
+    for t in tpls:
+        st = "—" if have is None else ("가져옴" if t["id"] in have else "없음")
+        miss += st != "가져옴"
+        print(f"  {t['name']:<18} {st:<6} {t['title']}\n      {t['description']}\n      필요: {', '.join(t['needs'])} · 웹훅: /webhook/{t['webhook']}")
+    if "--check" in args and miss: sys.exit(1)
+
+def cmd_install(args):
+    force = "--force" in args; names = [a for a in args if not a.startswith("--")]
+    tpls = templates()
+    if "--all" in args: targets = tpls
+    elif names: targets = [pick(n, tpls) for n in names]
+    else: die("사용법: install <이름>|--all [--force]", 2)
+    have = installed()
+    if have is None: die("n8n 컨테이너가 실행 중이 아닙니다. n8n 모듈을 설치하고 켠 뒤 다시 실행하세요.")
+    for t in targets:
+        if t["id"] in have and not force: print(f"건너뜀: {t['name']} (이미 가져옴 — 덮어쓰려면 --force)"); continue
+        text = open(f"{TPL}/{t['file']}", encoding="utf-8").read()
+        for ph in ("__ONBOARDING_TOKEN__", "__NOTIFY_TOKEN__"):
+            if ph in text: text = text.replace(ph, token(t["token"]))
+        # 호스트에 파일을 남기지 않는다: 표준입력으로 n8n 컨테이너 안(node 사용자, 0600)에 쓰고 가져온 뒤 지운다
+        f = f"/tmp/wf-import-{t['id']}.json"
+        w = subprocess.run(["docker", "exec", "-i", CTR, "sh", "-c", f"umask 077; cat > {f}"], input=text, text=True, capture_output=True)
+        if w.returncode: die(f"n8n 컨테이너 안에 파일을 쓰지 못했습니다: {w.stderr.strip()[-150:]}")
+        try: out = sh("docker", "exec", CTR, "n8n", "import:workflow", f"--input={f}").stdout
+        finally: sh("docker", "exec", CTR, "rm", "-f", f, check=False)
+        if "Successfully imported" not in out: die(f"{t['name']} 가져오기 결과를 확인하지 못했습니다")
+        print(f"성공: {t['name']} 가져옴(비활성)")
+        if t.get("app_config"): link_app(t["app_config"])
+        print(f"  다음: n8n 화면에서 자격증명({', '.join(t['needs'])})을 고른 뒤 활성화 — 또는 sudo @@PFX@@-n8n-workflows activate {t['name']}")
+
+def link_app(cfg):   # 앱 도구(app-sync)가 이 알림 웹훅을 쓰도록 설정 파일에 연결(이미 있는 값은 건드리지 않는다)
+    p = ROOT + "/etc/@@PFX@@/apps/config.json"
+    try: cur = json.load(open(p))
+    except Exception: cur = {}
+    add = {k: v for k, v in cfg.items() if not cur.get(k)}
+    if not add: return
+    os.makedirs(os.path.dirname(p), exist_ok=True); cur.update(add)
+    with open(p + ".tmp", "w") as f: json.dump(cur, f, ensure_ascii=False, indent=1)
+    os.replace(p + ".tmp", p); print(f"  알림 연결: {p} 에 {', '.join(add)} 설정")
+
+def wait_webhook(path):   # 다시 시작한 직후에는 웹훅이 몇 초 뒤에 등록된다 — GET 으로 물어 «POST 전용» 안내가 나오면 등록된 것
+    js = "fetch('http://127.0.0.1:5678/webhook/%s').then(r=>r.text()).then(t=>console.log(t)).catch(()=>{})" % path
+    for _ in range(30):
+        if "not registered for GET" in sh("docker", "exec", CTR, "node", "-e", js, check=False).stdout: return True
+        time.sleep(2)
+    return False
+
+def cmd_active(on, args):
+    if not args: die("사용법: activate|deactivate <이름>", 2)
+    t = pick(args[0], templates())
+    if installed() is None: die("n8n 컨테이너가 실행 중이 아닙니다.")
+    sh("docker", "exec", CTR, "n8n", "publish:workflow" if on else "unpublish:workflow", f"--id={t['id']}")
+    sh("docker", "restart", CTR)   # 활성 상태 변경은 n8n 을 다시 시작해야 반영된다
+    if on and not wait_webhook(t["webhook"]): die(f"{t['name']} 을(를) 활성화했지만 60초 안에 웹훅 등록을 확인하지 못했습니다 — n8n 화면에서 자격증명·오류를 확인하세요")
+    print(f"성공: {t['name']} {'활성화(웹훅 등록 확인)' if on else '비활성화'}(n8n 다시 시작함)")
+
+def cmd_export(args):
+    if not args: die("사용법: export <이름> [파일]", 2)
+    t = pick(args[0], templates()); dst = args[1] if len(args) > 1 else f"{t['name']}.export.json"
+    sh("docker", "exec", CTR, "n8n", "export:workflow", f"--id={t['id']}", "--output=/tmp/wf-export.json")
+    data = sh("docker", "exec", CTR, "cat", "/tmp/wf-export.json").stdout; sh("docker", "exec", CTR, "rm", "-f", "/tmp/wf-export.json", check=False)
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(data)
+    print(f"성공: {dst} (자격증명 값은 없지만 가져올 때 넣은 웹훅 토큰이 들어 있을 수 있으니 공개하지 마세요)")
+
+if os.geteuid() != 0: die("root 로 실행하세요(sudo)", 2)
+c, a = (sys.argv[1:] + [""])[0], sys.argv[2:]
+{"list": cmd_list, "install": cmd_install, "activate": lambda x: cmd_active(True, x), "deactivate": lambda x: cmd_active(False, x), "export": cmd_export}.get(c, lambda x: die("사용법: list [--check] | install <이름>|--all [--force] | activate|deactivate <이름> | export <이름> [파일]", 2))(a)

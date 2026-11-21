@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -eq 0 ]]; then
+  echo "오류: root가 아닌 회원 계정으로 실행하세요." >&2
+  exit 1
+fi
+
+YES=0
+
+case "${1:-}" in
+  "")
+    ;;
+  --yes)
+    YES=1
+    ;;
+  *)
+    echo "사용법: @@PFX@@-github-disconnect [--yes]" >&2
+    exit 1
+    ;;
+esac
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "오류: GitHub CLI(gh)가 설치되어 있지 않습니다." >&2
+  exit 1
+fi
+
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "GitHub가 현재 연결되어 있지 않습니다."
+  exit 0
+fi
+
+LOGIN="$(gh api user --jq '.login' 2>/dev/null || echo "확인 불가")"
+
+echo "===== @@BRAND@@ GitHub 연결 해제 ====="
+echo
+echo "현재 연결 계정: $LOGIN"
+echo
+echo "이 작업은 @@BRAND@@ 개발환경에 저장된 GitHub 로그인만 해제합니다."
+echo "GitHub 저장소나 작업 파일은 삭제하지 않습니다."
+echo
+
+if [[ $YES -ne 1 ]]; then
+  read -r -p "GitHub 계정 '$LOGIN' 연결을 해제할까요? [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      echo "취소했습니다."
+      exit 0
+      ;;
+  esac
+fi
+
+gh auth logout --hostname github.com
+
+echo
+echo "GitHub 연결을 해제했습니다."

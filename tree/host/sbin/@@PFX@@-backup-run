@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# script-rev: 2026-11-04 v1
+# 백업 일괄 실행: DR → Portable Kit → (선택) 이미지 archive → (선택) Google Drive sync.
+# 사람이 수동으로 하던 순서(OPS 31.4절 Runbook)를 그대로 묶었고, 결과를 /var/lib/@@PFX@@/backup-last.status 에 남긴다.
+#   사용: @@PFX@@-backup-run [--images] [--drive]
+#   systemd: @@PFX@@-backup-weekly.timer (기본 disabled — 켜는 것은 사용자 결정)
+set -uo pipefail
+
+LOG=/var/log/@@PFX@@-backup.log
+STATUS=/var/lib/@@PFX@@/backup-last.status
+LOCK=/var/lock/@@PFX@@-backup.lock
+
+IMAGES=0; DRIVE=0
+for a in "$@"; do
+  case "$a" in
+    --images) IMAGES=1 ;;
+    --drive) DRIVE=1 ;;
+    *) echo "unknown argument: $a" >&2; exit 2 ;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || { echo "FAIL: run as root" >&2; exit 1; }
+install -d -m 0755 /var/lib/@@PFX@@
+exec 9>"$LOCK"
+flock -n 9 || { echo "이미 실행 중이다(lock)"; exit 3; }
+
+ts() { date --iso-8601=seconds; }
+RESULT="PASS"; FAILED_STEP=""
+run() {  # <label> <command...>
+  local label="$1"; shift
+  echo "[$(ts)] START $label" | tee -a "$LOG"
+  if "$@" >>"$LOG" 2>&1; then
+    echo "[$(ts)] PASS  $label" | tee -a "$LOG"
+  else
+    echo "[$(ts)] FAIL  $label (자세한 내용: $LOG)" | tee -a "$LOG"
+    RESULT="FAIL"; FAILED_STEP="$label"
+    return 1
+  fi
+}
+
+START="$(ts)"
+{
+  run "DR snapshot"  /usr/local/sbin/@@PFX@@-dr-backup-create &&
+  { [ "$IMAGES" = 0 ] || run "Image archive" /usr/local/sbin/@@PFX@@-image-archive-create; }
+
+} || true
+
+{
+  echo "result=$RESULT"
+  echo "failed_step=$FAILED_STEP"
+  echo "started=$START"
+  echo "finished=$(ts)"
+  echo "images=$IMAGES"
+  echo "drive=$DRIVE"
+} > "$STATUS"
+chmod 0644 "$STATUS"
+
+echo "RESULT: $RESULT${FAILED_STEP:+ ($FAILED_STEP)}"
+[ "$RESULT" = "PASS" ]

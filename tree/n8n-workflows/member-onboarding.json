@@ -1,0 +1,216 @@
+[
+  {
+    "id": "dmOnboardNotify01",
+    "name": "@@PFX@@-member-onboarding",
+    "active": false,
+    "nodes": [
+      {
+        "id": "b1000001-0000-4000-8000-000000000001",
+        "name": "웹훅(회원 등록 알림)",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          0,
+          0
+        ],
+        "webhookId": "a1000001-0000-4000-8000-000000000001",
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "@@PFX@@-member-onboarding",
+          "responseMode": "onReceived",
+          "options": {}
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000002",
+        "name": "입력 확인",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          240,
+          0
+        ],
+        "parameters": {
+          "jsCode": "const j = $input.first().json;\nconst tok = (j.headers && (j.headers['x-onboarding-token'] || j.headers['X-Onboarding-Token'])) || '';\nif (tok !== '__ONBOARDING_TOKEN__') throw new Error('토큰이 맞지 않습니다');   // 설치 명령이 실제 토큰으로 바꿔 넣습니다\nconst username = j.body?.username;\nconst email = j.body?.email;\nconst bootstrapPassword = j.body?.bootstrap_password;\nif (!username || !/^[a-z][a-z0-9_-]{1,31}$/.test(username)) throw new Error('잘못된 사용자 ID');\nif (!email || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) throw new Error('잘못된 이메일 주소');\nif (!bootstrapPassword || bootstrapPassword.length < 6) throw new Error('잘못된 초기 비밀번호');\nreturn [{ json: { username, email, bootstrap_password: bootstrapPassword } }];"
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000003",
+        "name": "n8n 초대 만들기",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          480,
+          0
+        ],
+        "onError": "continueRegularOutput",
+        "notes": "선택: n8n API 키(Header Auth) 자격증명을 고르세요. 쓰지 않으면 이 노드를 비활성화(회색)하세요. 실패해도 이후 단계는 계속됩니다.",
+        "parameters": {
+          "method": "POST",
+          "url": "http://localhost:5678/api/v1/users",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpHeaderAuth",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ [ { email: $('입력 확인').item.json.email, role: 'global:member' } ] }}",
+          "options": {}
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000004",
+        "name": "페어링 링크 파일",
+        "type": "n8n-nodes-base.readWriteFile",
+        "typeVersion": 1.1,
+        "position": [
+          720,
+          0
+        ],
+        "onError": "continueRegularOutput",
+        "parameters": {
+          "fileSelector": "={{ '/srv/@@PFX@@/onboarding/' + $('입력 확인').item.json.username + '/pairing-url.txt' }}",
+          "options": {}
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000005",
+        "name": "페어링 링크 읽기",
+        "type": "n8n-nodes-base.extractFromFile",
+        "typeVersion": 1.1,
+        "position": [
+          960,
+          0
+        ],
+        "parameters": {
+          "operation": "text",
+          "options": {}
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000006",
+        "name": "페어링 QR 파일",
+        "type": "n8n-nodes-base.readWriteFile",
+        "typeVersion": 1.1,
+        "position": [
+          1200,
+          0
+        ],
+        "parameters": {
+          "fileSelector": "={{ '/srv/@@PFX@@/onboarding/' + $('입력 확인').item.json.username + '/pairing.png' }}",
+          "options": {}
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000007",
+        "name": "메일 보내기",
+        "type": "n8n-nodes-base.emailSend",
+        "typeVersion": 2.1,
+        "position": [
+          1440,
+          0
+        ],
+        "notes": "SMTP 자격증명을 고르세요(설정 → Credentials → SMTP).",
+        "parameters": {
+          "fromEmail": "@@BRAND@@ <noreply@@@DOMAIN@@>",
+          "toEmail": "={{ $('입력 확인').item.json.email }}",
+          "subject": "={{ '[@@BRAND@@] ' + $('입력 확인').item.json.username + ' 온보딩 안내' }}",
+          "emailFormat": "html",
+          "html": "={{ `\n<div style=\"margin:0;padding:24px 12px;background:#f3f4f6;font-family:Arial,'Noto Sans KR',sans-serif;color:#1f2937;\">\n  <div style=\"max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;\">\n    <div style=\"padding:26px 30px;background:#1b2330;color:#ffffff;\">\n      <div style=\"font-size:12px;opacity:.75;\">@@BRAND@@</div>\n      <div style=\"font-size:22px;font-weight:700;margin-top:4px;\">개발 환경에 오신 것을 환영합니다</div>\n    </div>\n    <div style=\"padding:26px 30px;line-height:1.7;font-size:15px;\">\n      <p><b>${$('입력 확인').item.json.username}</b> 님의 계정과 접속 정보가 준비되었습니다.</p>\n      <h3 style=\"margin:22px 0 6px;font-size:16px;\">👤 계정 정보</h3>\n      <table style=\"border-collapse:collapse;font-size:15px;\">\n        <tr><td style=\"padding:3px 16px 3px 0;color:#6b7280;\">사용자 ID</td><td><b>${$('입력 확인').item.json.username}</b></td></tr>\n        <tr><td style=\"padding:3px 16px 3px 0;color:#6b7280;\">초기 비밀번호</td><td><b style=\"font-family:monospace;\">${$('입력 확인').item.json.bootstrap_password}</b></td></tr>\n      </table>\n      <p style=\"color:#b45309;\">⚠️ 첫 로그인에서 비밀번호를 바꿔야 합니다. 파일 서비스·Windows 공유는 같은 계정 비밀번호를 씁니다.</p>\n      <h3 style=\"margin:22px 0 6px;font-size:16px;\">🧭 시작하기</h3>\n      <p>접속 방법(SSH)과 사용법은 안내 포털의 Guide 를 먼저 읽어 주세요.<br><a href=\"https://@@PORTAL_HOST@@/guide/\">https://@@PORTAL_HOST@@/guide/</a></p>\n      <h3 style=\"margin:22px 0 6px;font-size:16px;\">📱 Paseo 연결</h3>\n      <p>Paseo 앱의 Pairing Link 입력란에 아래 링크를 붙여넣거나, 첨부된 QR 이미지를 스캔하세요.</p>\n      <p style=\"word-break:break-all;font-family:monospace;font-size:13px;background:#f3f4f6;padding:10px;border-radius:8px;\">${$('페어링 링크 읽기').item.json.data.trim()}</p>\n      ${$('n8n 초대 만들기').item.json?.user?.inviteAcceptUrl ? `<h3 style=\"margin:22px 0 6px;font-size:16px;\">⚙️ n8n 자동화 계정</h3><p>아래 링크에서 가입을 마치면 본인 전용 n8n 을 쓸 수 있습니다.<br><a href=\"${$('n8n 초대 만들기').item.json.user.inviteAcceptUrl}\">n8n 계정 활성화</a></p>` : ''}\n      <h3 style=\"margin:22px 0 6px;font-size:16px;\">🔐 보안 안내</h3>\n      <p>페어링 링크와 초기 비밀번호는 본인 전용입니다. 다른 사람에게 전달하거나 공유하지 마세요.</p>\n    </div>\n  </div>\n</div>\n` }}",
+          "options": {
+            "appendAttribution": false,
+            "attachments": "data"
+          }
+        }
+      },
+      {
+        "id": "b1000001-0000-4000-8000-000000000008",
+        "name": "설명",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          0,
+          -420
+        ],
+        "parameters": {
+          "content": "회원 온보딩 알림 (MAIL_MODE=n8n 일 때 사용)\n\n▶ 용도: `@@PFX@@-member-add` 가 회원을 만들면 이 웹훅(POST /webhook/@@PFX@@-member-onboarding)으로 알리고, 이 워크플로가 회원에게 안내 메일을 보냅니다. 메일에는 초기 비밀번호·Paseo 연결 링크와 QR 이 들어갑니다.\n▶ 필요한 것(노드에서 «자격증명 선택»):\n  1) '메일 보내기' 노드 — SMTP 자격증명(보내는 메일 서버)\n  2) 'n8n 초대 만들기' 노드(선택) — n8n API 키(Header Auth: X-N8N-API-KEY). 없으면 이 노드를 비활성화하세요. 실패해도 메일은 보냅니다.\n▶ 켜는 법: 위 자격증명을 고른 뒤 오른쪽 위 «Publish(활성화)». 또는 서버에서 `sudo @@PFX@@-n8n-workflows activate member-onboarding`.\n▶ 보안: 웹훅은 헤더 `X-Onboarding-Token` 이 맞을 때만 동작합니다(토큰은 /etc/@@PFX@@/secrets/onboarding-notify-token). 외부 도메인에서 이 경로는 Caddy 가 막습니다.",
+          "height": 380,
+          "width": 900
+        }
+      }
+    ],
+    "connections": {
+      "웹훅(회원 등록 알림)": {
+        "main": [
+          [
+            {
+              "node": "입력 확인",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "입력 확인": {
+        "main": [
+          [
+            {
+              "node": "n8n 초대 만들기",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "n8n 초대 만들기": {
+        "main": [
+          [
+            {
+              "node": "페어링 링크 파일",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "페어링 링크 파일": {
+        "main": [
+          [
+            {
+              "node": "페어링 링크 읽기",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "페어링 링크 읽기": {
+        "main": [
+          [
+            {
+              "node": "페어링 QR 파일",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "페어링 QR 파일": {
+        "main": [
+          [
+            {
+              "node": "메일 보내기",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "binaryMode": "separate",
+      "saveDataSuccessExecution": "none",
+      "saveDataErrorExecution": "none",
+      "saveManualExecutions": false
+    }
+  }
+]

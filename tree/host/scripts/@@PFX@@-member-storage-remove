@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SFTPGO_API="http://127.0.0.1:8080/api/v2"
+SFTPGO_KEY_FILE="/etc/@@PFX@@/secrets/sftpgo-provisioner-api-key"
+SAMBA_CONF="/srv/@@PFX@@/samba/smb.conf"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-member-storage-remove <username>"
+  exit 1
+fi
+
+USERNAME="$1"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username"
+  exit 1
+fi
+
+# SFTPGo
+if [[ -r "$SFTPGO_KEY_FILE" ]]; then
+  KEY="$(cat "$SFTPGO_KEY_FILE")"
+
+  HTTP="$(
+    curl -sS -o /dev/null -w '%{http_code}' \
+      -X DELETE \
+      -H "X-SFTPGO-API-KEY: $KEY" \
+      "$SFTPGO_API/users/$USERNAME"
+  )"
+
+  unset KEY
+
+  case "$HTTP" in
+    200|204)
+      echo "PASS: SFTPGo user removed"
+      ;;
+    404)
+      echo "PASS: SFTPGo user already absent"
+      ;;
+    *)
+      echo "ERROR: SFTPGo delete failed HTTP=$HTTP"
+      exit 1
+      ;;
+  esac
+elif ! grep -Eq "^MODULES=.*[ '\"]files[ '\"]" /etc/@@PFX@@/site.env 2>/dev/null; then
+  echo "PASS: SFTPGo 없음(files 모듈 미설치) — 건너뜀"
+else
+  echo "ERROR: SFTPGo API key unavailable"
+  exit 1
+fi
+
+# Samba
+if [[ ! -f "$SAMBA_CONF" ]] || ! command -v pdbedit >/dev/null 2>&1; then
+  echo "PASS: Samba 없음 — 건너뜀"
+elif pdbedit -s "$SAMBA_CONF" -L -u "$USERNAME" >/dev/null 2>&1; then
+  pdbedit -s "$SAMBA_CONF" -x "$USERNAME" >/dev/null
+  echo "PASS: Samba user removed"
+else
+  echo "PASS: Samba user already absent"
+fi
+
+echo "PASS: storage access removed: $USERNAME"

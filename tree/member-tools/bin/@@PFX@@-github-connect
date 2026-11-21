@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -eq 0 ]]; then
+  echo "오류: root가 아닌 회원 계정으로 실행하세요." >&2
+  exit 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "오류: git이 설치되어 있지 않습니다." >&2
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "오류: GitHub CLI(gh)가 설치되어 있지 않습니다." >&2
+  exit 1
+fi
+
+echo "===== @@BRAND@@ GitHub 연결 ====="
+echo
+echo "GitHub는 선택 기능입니다."
+echo "GitHub 저장소를 가져오거나, 작업 결과를 올리거나,"
+echo "Issue / Pull Request 기능이 필요할 때만 연결하면 됩니다."
+echo
+
+if gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "이미 GitHub에 연결되어 있습니다."
+  echo
+  exec @@PFX@@-github-status
+fi
+
+echo "아래 순서대로 진행하세요."
+echo
+echo "  1. PC나 휴대폰의 브라우저에서 아래 주소를 엽니다."
+echo
+echo "     https://github.com/login/device"
+echo
+echo "  2. 잠시 후 터미널에 표시되는 1회용 코드를 복사합니다."
+echo
+echo "  3. 브라우저 화면에 코드를 입력합니다."
+echo
+echo "  4. GitHub에서 연결을 승인합니다."
+echo
+echo "※ 이 서버 안에서는 브라우저를 직접 열지 않습니다."
+echo
+echo "GitHub 인증을 시작합니다..."
+echo
+
+# 컨테이너에서 xdg-open 등을 찾지 않도록 브라우저 실행만 무력화한다.
+GH_BROWSER=true gh auth login \
+  --hostname github.com \
+  --git-protocol https \
+  --web
+
+echo
+echo "Git 인증 설정 중..."
+gh auth setup-git
+
+echo
+echo "GitHub 연결 상태 확인 중..."
+
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "오류: GitHub 연결이 정상적으로 완료되지 않았습니다." >&2
+  exit 1
+fi
+
+echo
+echo "GitHub 연결이 완료되었습니다."
+echo
+exec @@PFX@@-github-status

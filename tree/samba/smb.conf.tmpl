@@ -1,0 +1,48 @@
+# @@BRAND@@ Samba — SMB over QUIC(기본) 네트워크 드라이브. 설치기(56 단계)가 __값__ 자리를 채워 /srv/@@PFX@@/samba/smb.conf 를 만든다.
+[global]
+    server role = standalone server
+    workgroup = @@PFX_UP@@
+__INTERFACES__
+    server smb transports = __TRANSPORTS__
+    disable netbios = yes
+
+    server min protocol = SMB3_11
+    server signing = mandatory
+
+    map to guest = never
+    usershare allow guests = no
+
+    load printers = no
+    disable spoolss = yes
+
+    state directory = /srv/@@PFX@@/samba/state
+    cache directory = /srv/@@PFX@@/samba/cache
+    lock directory = /srv/@@PFX@@/samba/lock
+    private dir = /srv/@@PFX@@/samba/private
+    pid directory = /srv/@@PFX@@/samba/pid
+    ncalrpc dir = /srv/@@PFX@@/samba/ncalrpc
+
+    log file = /srv/@@PFX@@/samba/log.%m
+    max log size = 2000
+
+    tls enabled = yes
+    tls cafile = /srv/@@PFX@@/samba/tls/ca.pem
+    tls certfile = /srv/@@PFX@@/samba/tls/cert.pem
+    tls keyfile = /srv/@@PFX@@/samba/tls/key.pem
+
+[homes]
+    path = /srv/@@PFX@@/users/%S
+    browseable = no
+    read only = no
+    guest ok = no
+    valid users = %S
+
+[shared]
+    path = /srv/@@PFX@@/shared
+    browseable = yes
+    read only = no
+    valid users = @@@PFX@@
+    force group = @@PFX@@
+    create mask = 0660
+    directory mask = 2770
+    inherit permissions = yes

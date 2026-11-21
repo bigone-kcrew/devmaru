@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# 0.4.28: paseo-agy-acp 어댑터를 이미지에서 걷어냈다. 예전 Golden 이 회원 config.json 에 넣어 둔 Antigravity ACP 제공자
+# (agents.providers.antigravity 의 extends=acp · command=/opt/paseo-agy-acp/... · env 3종)가 없는 파일을 가리키지 않게
+# «우리가 넣은 모양 그대로일 때만» 그 필드를 뺀다. 그러면 Paseo 0.11 의 내장 Antigravity 제공자가 쓰인다.
+#
+# - antigravity 항목은 «전체» 뺀다(enabled 포함 — 남으면 id 가 같은 내장 제공자를 가리거나 꺼진 것처럼 보인다). 우리가 모르는 다른 키가 있으면 그것만 남긴다.
+# - 다른 제공자·모델 설정·터미널 프로필(agy 를 쓰므로 ACP 와 무관)·인증 파일(~/.gemini/…)과 ~/.local/state/paseo-agy-acp 는 건드리지 않는다.
+# - command 가 우리 값과 다르면(회원이 직접 만든 설정) 고치지 않고 경고만 한다.
+# - 한 번만 한다(마커). 이미 깨끗하거나 우리 것이 아니어도 마커를 남겨 다시 보지 않는다.
+# - @@PFX@@-container-keeper 가 컨테이너 시작 때 멤버 계정으로 호출하며, 실패해도 컨테이너는 계속 뜬다.
+set -euo pipefail
+
+CONFIG="${HOME}/.paseo/config.json"
+MARKER="${HOME}/.paseo/.@@PFX@@-agy-acp-removed-v1"
+BACKUP="${CONFIG}.bak.pre-0.4.28-$(date +%Y%m%d-%H%M%S)"
+OLD_CMD='["node","/opt/paseo-agy-acp/dist/ACP Connector/main.js"]'
+
+[[ -e "${MARKER}" ]] && exit 0
+for _ in {1..30}; do
+    [[ -f "${CONFIG}" ]] && break
+    sleep 1
+done
+if [[ ! -f "${CONFIG}" ]]; then
+    echo "@@PFX@@-paseo-agy-acp-cleanup: config.json 이 아직 없어 건너뜀 (다음 시작 때 다시 시도)" >&2
+    exit 0
+fi
+
+ours="$(jq --argjson cmd "${OLD_CMD}" -r \
+    '((.agents.providers.antigravity // {}) | (.extends == "acp" and .command == $cmd))' "${CONFIG}")"
+
+if [[ "${ours}" != true ]]; then
+    if jq -e '(.agents.providers.antigravity.command // []) | tostring | contains("/opt/paseo-agy-acp")' "${CONFIG}" >/dev/null; then
+        echo "@@PFX@@-paseo-agy-acp-cleanup: antigravity 제공자가 이미지에서 사라진 어댑터를 가리키지만 우리가 넣은 모양이 아니라 그대로 둠" >&2
+    fi
+    touch "${MARKER}"; chmod 0600 "${MARKER}"
+    exit 0
+fi
+
+cp -a "${CONFIG}" "${BACKUP}"
+
+tmp="$(mktemp "${HOME}/.paseo/.config.XXXXXX")"
+trap 'rm -f "${tmp}"' EXIT
+jq '
+    .agents.providers.antigravity |= (
+        del(.extends, .command, .enabled)
+        | (if .label == "Antigravity" then del(.label) else . end)
+        | (if has("env") then
+               .env |= del(.PASEO_AGY_ACP_OFFICIAL_BIN, .AGY_ACP_ADMISSION_ENABLED, .AGY_ACP_STATE_DIR)
+               | (if .env == {} then del(.env) else . end)
+           else . end)
+    )
+    | (if .agents.providers.antigravity == {} then del(.agents.providers.antigravity) else . end)
+' "${CONFIG}" > "${tmp}"
+chmod 0600 "${tmp}"
+mv "${tmp}" "${CONFIG}"
+trap - EXIT
+
+touch "${MARKER}"; chmod 0600 "${MARKER}"
+
+# 데몬이 정리된 설정을 읽도록 다시 시작한다 (시험에서는 @@PFX_UP@@_SKIP_PASEO_RESTART=1)
+if [[ "${@@PFX_UP@@_SKIP_PASEO_RESTART:-0}" != 1 ]]; then
+    paseo daemon restart >/dev/null 2>&1 || echo "@@PFX@@-paseo-agy-acp-cleanup: WARNING: paseo daemon restart 실패" >&2
+fi

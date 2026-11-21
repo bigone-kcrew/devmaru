@@ -1,0 +1,4 @@
+### 변경
+- `<접두어>-service-update`: 성공(5/5)할 때마다 compose 디렉터리를 `/var/backups/<접두어>/service-update/last-good/<서비스>.tar` 로 저장하고, 올린 뒤 헬스가 실패하면 그것으로 compose 를 복원해 롤백합니다. compose 의 이미지 태그·healthcheck 를 바꿔 올린 뒤 실패해도 이전 상태로 돌아갑니다(이전에는 바뀐 compose 로 돌아가 이전 버전으로 못 돌아갔음). last-good 이 없으면 compose 의 이미지 줄만 롤백 전 실행 이미지로 되돌립니다. 실패한 변경은 `compose.yml.failed-<시각>` 으로 보존합니다. 데이터·DB 는 여전히 자동 복원하지 않습니다. 한계: `docs/SERVICE-UPDATE.md`.
+- `<접두어>-firewall`: docker 가 0.0.0.0 으로 게시한 포트(예: SFTP 2022)에도 허용 목록이 적용되도록 `apply` 가 `/etc/ufw/after.rules` 에 `DOCKER-USER` 블록을 넣습니다(자동 롤백·`rollback` 때 함께 원복). `plan` 이 docker 게시 포트의 허용/차단을 보여 줍니다. 설명·한계: `docs/FIREWALL.md`.
+- `<접두어>-member-add`: `WORKSPACE_OTHERS=read` 이고 기존 회원 컨테이너가 있으면 완료 메시지에 `sudo <접두어>-member-update-all`(작업 중인 회원이 있으면 `--check`) 안내를 냅니다. 자동 재생성은 하지 않습니다. `<접두어>-doctor` 의 접근 정책 경고에도 같은 명령을 안내합니다.

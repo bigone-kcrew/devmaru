@@ -1,0 +1,9 @@
+
+# 모듈: n8n
+@@N8N_HOST@@ {
+	import access_log
+	# 회원 등록 메일·운영 알림 웹훅은 서버 안(127.0.0.1:5678)에서만 부른다 — 공개 주소로는 열지 않는다
+	@onboarding_hook path /webhook/@@PFX@@-member-onboarding* /webhook-test/@@PFX@@-member-onboarding* /webhook/@@PFX@@-ops-notify* /webhook-test/@@PFX@@-ops-notify*
+	respond @onboarding_hook 404
+	reverse_proxy 127.0.0.1:5678
+}

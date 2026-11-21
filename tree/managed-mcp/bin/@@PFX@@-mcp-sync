@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -u
+
+warn() {
+  echo "경고: $*" >&2
+}
+
+# Antigravity 는 `agy mcp list` 가 표 형식이라 이름 열만 뽑아 확인한다.
+agy_has_mcp() {
+  agy mcp list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$1"
+}
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  warn "@@PFX@@-mcp-sync는 root가 아닌 회원 계정으로 실행해야 합니다."
+  exit 0
+fi
+
+echo "===== @@BRAND@@ MCP 동기화 ====="
+
+register_stdio_mcp() {
+  local name="$1"
+  local server="$2"
+  # 세 번째 인자는 실행기다. 비우면 기존대로 node -- python MCP 때문에 추가했다.
+  local runtime="${3:-node}"
+
+  if [[ ! -f "$server" ]]; then
+    warn "$name MCP 서버를 찾을 수 없습니다: $server"
+    return
+  fi
+
+  if command -v claude >/dev/null 2>&1; then
+    if claude mcp get "$name" >/dev/null 2>&1; then
+      echo "Claude MCP: $name 이미 등록됨"
+    elif claude mcp add \
+      --scope user \
+      "$name" \
+      -- "$runtime" "$server" >/dev/null 2>&1
+    then
+      echo "Claude MCP: $name 등록 완료"
+    else
+      warn "Claude MCP: $name 등록 실패"
+    fi
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    if codex mcp get "$name" >/dev/null 2>&1; then
+      echo "Codex MCP: $name 이미 등록됨"
+    elif codex mcp add \
+      "$name" \
+      -- "$runtime" "$server" >/dev/null 2>&1
+    then
+      echo "Codex MCP: $name 등록 완료"
+    else
+      warn "Codex MCP: $name 등록 실패"
+    fi
+  fi
+
+  if command -v agy >/dev/null 2>&1; then
+    if agy_has_mcp "$name"; then
+      echo "Antigravity MCP: $name 이미 등록됨"
+    elif agy mcp add "$name" "$runtime" "$server" >/dev/null 2>&1; then
+      echo "Antigravity MCP: $name 등록 완료"
+    else
+      warn "Antigravity MCP: $name 등록 실패"
+    fi
+  fi
+}
+
+register_http_mcp() {
+  local name="$1"
+  local url="$2"
+
+  if command -v claude >/dev/null 2>&1; then
+    if claude mcp get "$name" >/dev/null 2>&1; then
+      echo "Claude MCP: $name 이미 등록됨"
+    elif claude mcp add \
+      --scope user \
+      --transport http \
+      "$name" \
+      "$url" >/dev/null 2>&1
+    then
+      echo "Claude MCP: $name 등록 완료"
+    else
+      warn "Claude MCP: $name 등록 실패"
+    fi
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    if codex mcp get "$name" >/dev/null 2>&1; then
+      echo "Codex MCP: $name 이미 등록됨"
+    elif codex mcp add \
+      "$name" \
+      --url "$url" >/dev/null 2>&1
+    then
+      echo "Codex MCP: $name 등록 완료"
+    else
+      warn "Codex MCP: $name 등록 실패"
+    fi
+  fi
+
+  if command -v agy >/dev/null 2>&1; then
+    if agy_has_mcp "$name"; then
+      echo "Antigravity MCP: $name 이미 등록됨"
+    elif agy mcp add "$name" "$url" >/dev/null 2>&1; then
+      echo "Antigravity MCP: $name 등록 완료"
+    else
+      warn "Antigravity MCP: $name 등록 실패"
+    fi
+  fi
+}
+
+# ---- @@BRAND@@ MCP 허브 (컨테이너당 하나, keeper 가 띄움) ------------------------------
+# 등록은 «파일 상태»로 정한다(결정적): 허브 파일(hub.mjs)이 있고 그 파일이 이 이름의 경로를 선언하면 http(허브 주소),
+# 아니면 기존 stdio. 허브 프로세스가 지금 떠 있는지는 보지 않는다 — 컨테이너 시작 직후(부트스트랩·keeper 의 첫 sync)처럼
+# 허브가 아직 뜨는 중일 때 http→stdio→http 로 뒤집히던 것(2026-10-29 롤아웃)을 없앤다. 허브가 죽으면 keeper 가 15초 안에 되살린다.
+# AI_MCP_HUB=off 이거나 /opt/@@PFX@@/managed-mcp/hub/DISABLED 파일이 있으면 stdio 로 되돌린다.
+HUB_URL="http://127.0.0.1:18940"
+HUB_FILE="/opt/@@PFX@@/managed-mcp/hub/hub.mjs"
+
+hub_wanted() {
+  [[ "${AI_MCP_HUB:-on}" != "off" && -f "$HUB_FILE" && ! -e /opt/@@PFX@@/managed-mcp/hub/DISABLED ]]
+}
+
+# 허브 파일이 이 이름의 경로를 선언하는지 — 옛 허브 파일(v1)에는 kordoc·markitdown 경로가 없으므로 그 둘은 stdio 로 남는다.
+hub_serves() {
+  grep -q "\"/$1/mcp\":" "$HUB_FILE" 2>/dev/null
+}
+
+# 등록 종류: stdio | http | none. 허브가 만든 것(http, 허브 주소)과 관리형 서버(stdio, managed-mcp 경로)만
+# 우리 것으로 보고, 회원이 직접 등록한 같은 이름은 건드리지 않는다.
+claude_kind() {
+  local out
+  out="$(claude mcp get "$1" 2>/dev/null)" || { echo none; return; }
+  if grep -q "Type: stdio" <<<"$out" && grep -q "/opt/@@PFX@@/managed-mcp/" <<<"$out"; then echo stdio
+  elif grep -q "Type: http" <<<"$out" && grep -q "$HUB_URL" <<<"$out"; then echo http
+  else echo other; fi
+}
+codex_kind() {
+  local out
+  out="$(codex mcp get "$1" 2>/dev/null)" || { echo none; return; }
+  if grep -q "transport: stdio" <<<"$out" && grep -q "/opt/@@PFX@@/managed-mcp/" <<<"$out"; then echo stdio
+  elif grep -q "transport: streamable_http" <<<"$out" && grep -q "$HUB_URL" <<<"$out"; then echo http
+  else echo other; fi
+}
+agy_kind() {
+  local row
+  row="$(agy mcp list 2>/dev/null | awk -v n="$1" 'NR>1 && $1==n')"
+  if [[ -z "$row" ]]; then echo none
+  elif grep -q "stdio" <<<"$row" && grep -q "/opt/@@PFX@@/managed-mcp/" <<<"$row"; then echo stdio
+  elif grep -q "http" <<<"$row" && grep -q "$HUB_URL" <<<"$row"; then echo http
+  else echo other; fi
+}
+
+# 원하는 방식과 다른 우리 등록만 지운다. 뒤이은 register_* 가 새로 등록한다.
+migrate_mcp() {
+  local name="$1" want="$2" kind
+  if command -v claude >/dev/null 2>&1; then
+    kind="$(claude_kind "$name")"
+    if [[ "$kind" != none && "$kind" != other && "$kind" != "$want" ]]; then
+      claude mcp remove --scope user "$name" >/dev/null 2>&1 && echo "Claude MCP: $name $kind -> $want 전환"
+    fi
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    kind="$(codex_kind "$name")"
+    if [[ "$kind" != none && "$kind" != other && "$kind" != "$want" ]]; then
+      codex mcp remove "$name" >/dev/null 2>&1 && echo "Codex MCP: $name $kind -> $want 전환"
+    fi
+  fi
+  if command -v agy >/dev/null 2>&1; then
+    kind="$(agy_kind "$name")"
+    if [[ "$kind" != none && "$kind" != other && "$kind" != "$want" ]]; then
+      agy mcp remove "$name" >/dev/null 2>&1 && echo "Antigravity MCP: $name $kind -> $want 전환"
+    fi
+  fi
+}
+
+# register_hub_mcp <등록 이름> <허브 경로> <stdio 서버 파일> [실행기]
+register_hub_mcp() {
+  local name="$1" route="$2" server="$3" runtime="${4:-node}"
+  if hub_wanted && hub_serves "$route"; then
+    migrate_mcp "$name" http
+    register_http_mcp "$name" "$HUB_URL/$route/mcp"
+  else
+    migrate_mcp "$name" stdio
+    register_stdio_mcp "$name" "$server" "$runtime"
+  fi
+}
+
+register_hub_mcp \
+  "kordoc" \
+  "kordoc" \
+  "/opt/@@PFX@@/managed-mcp/kordoc/server.mjs"
+
+register_hub_mcp \
+  "markitdown" \
+  "markitdown" \
+  "/opt/@@PFX@@/managed-mcp/markitdown/server.mjs"
+
+register_hub_mcp \
+  "crawl4ai" \
+  "crawl4ai" \
+  "/opt/@@PFX@@/managed-mcp/crawl4ai/server.mjs"
+
+# memory 는 회원별 bearer 가 있을 때만 등록한다. OFF 회원에게는 bearer 를 발급하지
+# 않으므로 파일이 없고, 따라서 등록도 되지 않는다 (V3 7.9.2).
+if [[ -r /opt/@@PFX@@/memory-bearer || -r "$HOME/.@@PFX@@/memory-bearer" ]]; then
+  register_hub_mcp \
+    "@@PFX@@-memory" \
+    "memory" \
+    "/opt/@@PFX@@/managed-mcp/memory/server.py" \
+    "python3"
+else
+  echo "@@PFX@@-memory MCP: bearer 가 없어 건너뜀"
+fi
+
+# 원격 MCP 서비스: 관리자가 레지스트리(remote-services.json)에 켠 것만, 멤버 토큰 파일이 있을 때만 허브 주소로 등록한다.
+REGISTRY="/opt/@@PFX@@/managed-mcp/remote-services.json"
+if [[ -r "$REGISTRY" ]] && command -v python3 >/dev/null 2>&1; then
+  while IFS= read -r svc; do
+    [[ "$svc" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || continue
+    if [[ -r "/opt/@@PFX@@/$svc-token" || -r "$HOME/.@@PFX@@/$svc-token" ]]; then
+      if hub_wanted; then
+        migrate_mcp "$svc" http
+        register_http_mcp "$svc" "$DEVMARU_URL/$svc/mcp"
+      else
+        echo "$svc MCP: 허브가 꺼져 있어 건너뜀"
+      fi
+    else
+      echo "$svc MCP: 토큰 파일이 없어 건너뜀"
+    fi
+  done < <(python3 -c 'import json,sys;[print(s.get("name","")) for s in json.load(open(sys.argv[1])).get("services",[])]' "$REGISTRY" 2>/dev/null)
+fi

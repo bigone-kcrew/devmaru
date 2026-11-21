@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -u
+
+PLUGIN_ID="@@PFX@@-managed-mcp"
+PLUGIN_ROOT="${@@PFX_UP@@_PASEO_PLUGIN_ROOT:-/opt/@@PFX@@/paseo-plugins/@@PFX@@-managed-mcp}"
+
+PASEO_CONFIG="${HOME}/.paseo/config.json"
+BASELINE_MARKER="${HOME}/.paseo/.@@PFX@@-plugin-baseline-v1"
+
+STATE_DIR="${HOME}/.@@PFX@@/plugins"
+STATE_MARKER="${STATE_DIR}/paseo-managed-mcp.json"
+
+RESULT=0
+
+log() {
+    printf '[@@PFX@@-paseo-plugin-sync] %s\n' "$*"
+}
+
+warn() {
+    printf '[@@PFX@@-paseo-plugin-sync] 경고: %s\n' "$*" >&2
+}
+
+fail() {
+    printf '[@@PFX@@-paseo-plugin-sync] 오류: %s\n' "$*" >&2
+    RESULT=1
+}
+
+write_state_marker() {
+    local tmp
+
+    mkdir -p "${STATE_DIR}" || return 1
+    tmp="$(mktemp "${STATE_DIR}/.paseo-managed-mcp.XXXXXX")" || return 1
+
+    jq -n \
+        --arg plugin "${PLUGIN_ID}" \
+        --arg root "${PLUGIN_ROOT}" \
+        '{
+            managedBy: "@@PFX@@",
+            harness: "paseo",
+            plugin: $plugin,
+            root: $root,
+            baseline: "v1"
+        }' > "${tmp}" || {
+            rm -f "${tmp}"
+            return 1
+        }
+
+    chmod 0600 "${tmp}"
+    mv "${tmp}" "${STATE_MARKER}"
+}
+
+enable_plugin_system() {
+    local tmp
+
+    tmp="$(mktemp "${PASEO_CONFIG}.@@PFX@@-plugin.XXXXXX")" || return 1
+
+    if ! jq '.pluginsEnabled = true' "${PASEO_CONFIG}" > "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    chmod 0600 "${tmp}"
+    mv "${tmp}" "${PASEO_CONFIG}"
+
+    if ! paseo reload >/dev/null 2>&1; then
+        warn "paseo reload 실패. daemon restart를 시도합니다."
+
+        if ! paseo daemon restart >/dev/null 2>&1; then
+            return 1
+        fi
+    fi
+}
+
+if ! command -v paseo >/dev/null 2>&1; then
+    fail "Paseo CLI를 찾을 수 없습니다."
+    exit "${RESULT}"
+fi
+
+if [[ ! -f "${PLUGIN_ROOT}/paseo-plugin.json" ]]; then
+    fail "Paseo plugin manifest가 없습니다: ${PLUGIN_ROOT}"
+    exit "${RESULT}"
+fi
+
+if [[ ! -f "${PLUGIN_ROOT}/index.server.ts" ]]; then
+    fail "Paseo server plugin entrypoint가 없습니다: ${PLUGIN_ROOT}"
+    exit "${RESULT}"
+fi
+
+if [[ ! -f "${PASEO_CONFIG}" ]]; then
+    fail "Paseo config를 찾을 수 없습니다: ${PASEO_CONFIG}"
+    exit "${RESULT}"
+fi
+
+configured_path="$(
+    jq -r \
+        --arg id "${PLUGIN_ID}" \
+        '.plugins[$id].path // empty' \
+        "${PASEO_CONFIG}"
+)"
+
+configured_enabled="$(
+    jq -r \
+        --arg id "${PLUGIN_ID}" \
+        '.plugins[$id].enabled // false' \
+        "${PASEO_CONFIG}"
+)"
+
+plugins_enabled="$(
+    jq -r \
+        '.pluginsEnabled // false' \
+        "${PASEO_CONFIG}"
+)"
+
+#
+# v1 baseline:
+# - 최초 한 번은 @@BRAND@@ 표준 plugin 환경을 강제로 활성화한다.
+# - marker 생성 이후에는 사용자가 disable/remove한 상태를 보존한다.
+#
+if [[ ! -e "${BASELINE_MARKER}" ]]; then
+    log "Paseo plugin baseline v1을 적용합니다."
+
+    if [[ "${plugins_enabled}" != "true" ]]; then
+        log "Paseo plugin system을 활성화합니다."
+
+        if ! enable_plugin_system; then
+            fail "Paseo plugin system 활성화에 실패했습니다."
+            exit "${RESULT}"
+        fi
+    fi
+
+    if [[ -z "${configured_path}" ]]; then
+        log "${PLUGIN_ID}를 등록합니다."
+
+        if ! paseo plugin install "${PLUGIN_ROOT}" >/dev/null; then
+            fail "${PLUGIN_ID} 등록에 실패했습니다."
+            exit "${RESULT}"
+        fi
+
+    elif [[ "${configured_path}" != "${PLUGIN_ROOT}" ]]; then
+        fail "동일 plugin ID가 다른 경로를 사용 중입니다: ${configured_path}"
+        fail "기존 사용자 설정을 덮어쓰지 않습니다."
+        exit "${RESULT}"
+
+    else
+        log "${PLUGIN_ID}가 이미 올바른 경로에 등록되어 있습니다."
+
+        if [[ "${configured_enabled}" != "true" ]]; then
+            log "최초 baseline이므로 ${PLUGIN_ID}를 활성화합니다."
+
+            if ! paseo plugin enable "${PLUGIN_ID}" >/dev/null; then
+                fail "${PLUGIN_ID} 활성화에 실패했습니다."
+                exit "${RESULT}"
+            fi
+        fi
+    fi
+
+    if ! write_state_marker; then
+        fail "관리 상태 marker 기록에 실패했습니다."
+        exit "${RESULT}"
+    fi
+
+    touch "${BASELINE_MARKER}"
+    chmod 0600 "${BASELINE_MARKER}"
+
+    log "Paseo plugin baseline v1 적용 완료."
+    exit "${RESULT}"
+fi
+
+#
+# baseline 적용 이후에는 사용자 선택을 보존한다.
+#
+if [[ -z "${configured_path}" ]]; then
+    log "${PLUGIN_ID}가 제거된 상태입니다. 사용자 상태를 보존합니다."
+    exit 0
+fi
+
+if [[ "${configured_path}" != "${PLUGIN_ROOT}" ]]; then
+    warn "${PLUGIN_ID}가 다른 경로를 사용 중입니다: ${configured_path}"
+    warn "자동 교체하지 않습니다."
+    exit 1
+fi
+
+if [[ "${plugins_enabled}" != "true" ]]; then
+    log "Paseo plugin system이 비활성화되어 있습니다. 사용자 상태를 보존합니다."
+    exit 0
+fi
+
+if [[ "${configured_enabled}" != "true" ]]; then
+    log "${PLUGIN_ID}가 비활성화되어 있습니다. 사용자 상태를 보존합니다."
+    exit 0
+fi
+
+log "${PLUGIN_ID} 설정이 정상입니다."
+exit 0

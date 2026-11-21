@@ -1,0 +1,24 @@
+[Unit]
+Description=@@BRAND@@ member publish (sandboxed Caddy file server, 127.0.0.1:18090)
+After=network.target
+
+[Service]
+Type=simple
+User=caddy
+ExecStart=/usr/bin/caddy run --config /etc/@@PFX@@/publish/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+# 샌드박스(v2): 루트를 빈 파일시스템으로 바꾸고 /usr 와 «사본 트리»(읽기 전용)만 보인다 — 멤버 폴더(/srv/@@PFX@@/users)는 보이지 않는다
+TemporaryFileSystem=/:ro
+BindReadOnlyPaths=/usr /srv/@@PFX@@/site /etc/@@PFX@@/publish
+PrivateDevices=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+RuntimeDirectory=@@PFX@@-publish
+Environment=XDG_CONFIG_HOME=/run/@@PFX@@-publish/c XDG_DATA_HOME=/run/@@PFX@@-publish/d
+
+[Install]
+WantedBy=multi-user.target

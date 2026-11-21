@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# @@PFX@@-restore (root) — restic 스냅샷(DR 백업)에서 되돌린다. 파괴적이므로 에이전트 sudo 허용 목록에 넣지 않는다.
+#   @@PFX@@-restore list                              스냅샷 목록
+#   @@PFX@@-restore [plan] [db|config|members|all] [--snapshot ID]   무엇을 되돌리는지만 표시(기본 · 아무것도 바꾸지 않음)
+#   @@PFX@@-restore apply  <db|config|members|all> [--snapshot ID] [--yes]   실제 복원(승인 문구 입력 또는 --yes)
+# 범위: db = PostgreSQL 덤프(n8n · 회원 DB) + SFTPGo DB + n8n 데이터 / config = 설정·비밀·env / members = 회원 메타(목록은 표시만)
+# 복원 전 현재 상태는 파일은 <이름>.bak.<날짜> 로, DB 는 덤프로 보관한다. 순서: 서비스 정지 → 복원 → 기동 → doctor.
+# --from-dir DIR 는 <접두어>-migrate import 가 쓰는 내부 옵션(스냅샷 대신 풀어 둔 묶음 폴더에서 복원).
+set -uo pipefail
+PFX=@@PFX@@; O=/opt/$PFX; S=/srv/$PFX; E=/etc/$PFX; DATE=$(date +%Y%m%d-%H%M%S)
+REPO=$S/backups/restic; PASSF=$E/secrets/restic-repository-password
+die(){ echo "실패: $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "root 로 실행하세요(sudo)"
+CMD=plan; SCOPE=all; SNAP=latest; YES=0; FROM=""
+while [ $# -gt 0 ]; do case "$1" in
+  list|plan|apply) CMD=$1;; --plan) CMD=plan;; db|config|members|all) SCOPE=$1;;
+  --snapshot) SNAP=${2:?--snapshot 값 필요}; shift;; --yes) YES=1;; --from-dir) FROM=${2:?--from-dir 값 필요}; shift;;
+  -h|--help) sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 0;; *) die "알 수 없는 인자: $1 (-h)";; esac; shift; done
+if [ -z "$FROM" ]; then
+  command -v restic >/dev/null 2>&1 || die "restic 이 없습니다(backup 모듈을 선택하지 않았나요?)"
+  [ -f "$REPO/config" ] && [ -s "$PASSF" ] || die "restic 저장소($REPO) 또는 암호 파일($PASSF)이 없습니다"
+  export RESTIC_REPOSITORY=$REPO RESTIC_PASSWORD_FILE=$PASSF
+fi
+
+if [ "$CMD" = list ]; then
+  restic snapshots --json | python3 -I -c '
+import json, sys
+for s in sorted(json.load(sys.stdin), key=lambda s: s["time"]):
+    p = (s.get("paths") or [""])[0]
+    kind = "DR" if "/dr-stage/" in p else ("이미지" if "image" in p else "기타")
+    print("%-9s %s  %-6s %s" % (s["short_id"], s["time"][:19].replace("T", " "), kind, p))' | sed '1i ID        시각(UTC)            종류   경로'
+  echo "안내: 복원 대상은 종류 DR 인 스냅샷입니다. 미리보기: sudo $PFX-restore plan all [--snapshot ID]"; exit 0
+fi
+
+# ---- 스테이지(풀어 낸 DR 폴더) 준비
+TMP=""; trap '[ -n "$TMP" ] && rm -rf "$TMP"' EXIT
+if [ -n "$FROM" ]; then STAGE=$FROM; [ -d "$STAGE/meta" ] || die "$FROM 은 복원 묶음 폴더가 아닙니다"; SID="묶음 폴더"
+else
+  JS=$(restic snapshots --json) || die "restic 스냅샷 조회 실패"
+  read -r SID SPATH < <(printf '%s' "$JS" | python3 -I -c '
+import json, sys
+a = sys.argv[1]; ss = [s for s in json.load(sys.stdin) if "/dr-stage/" in (s.get("paths") or [""])[0]]
+ss.sort(key=lambda s: s["time"])
+if a == "latest": s = ss[-1:]
+else: s = [x for x in ss if x["short_id"] == a or x["id"].startswith(a)]
+print(s[0]["short_id"], s[0]["paths"][0]) if s else print("")' "$SNAP")
+  [ -n "${SID:-}" ] || die "DR 스냅샷을 찾지 못했습니다(--snapshot $SNAP) — $PFX-restore list"
+  case "$SCOPE" in db) INC=(postgres sftpgo n8n meta);; config) INC=(config secrets etc-$PFX config-extra compose-env meta);;
+    members) INC=(config-extra accounts meta);; all) INC=(postgres sftpgo n8n config secrets etc-$PFX config-extra compose-env accounts meta);; esac
+  TMP=$(mktemp -d "$S/backups/restore-tmp.XXXXXX"); chmod 0700 "$TMP"
+  A=(); for i in "${INC[@]}"; do A+=(--include "$SPATH/$i"); done
+  echo "== 스냅샷 $SID 에서 범위($SCOPE) 파일을 임시 폴더로 꺼냅니다"
+  restic restore "$SID" --target "$TMP" "${A[@]}" >/dev/null 2>&1 || die "restic restore 실패"
+  STAGE=$TMP$SPATH; [ -d "$STAGE/meta" ] || die "스냅샷에 DR 메타가 없습니다"
+fi
+( cd "$STAGE" && sha256sum --ignore-missing -c meta/STAGE-SHA256SUMS >/dev/null 2>&1 ) && echo "성공: 스냅샷 파일 무결성(sha256) 확인" || die "무결성 검사 실패 — 이 스냅샷으로 복원하지 않습니다"
+echo "== 대상: $SID · 범위 $SCOPE · $(grep -m1 '^Created:' "$STAGE/meta/VERSIONS.txt" 2>/dev/null || echo '생성 시각 불명')"
+
+want(){ [ "$SCOPE" = all ] || [ "$SCOPE" = "$1" ]; }
+cmpf(){ # <스냅샷 파일> <현재 파일> → 상태 문구(내용은 출력하지 않는다)
+  if [ ! -e "$2" ]; then echo "새로 만듦"; elif cmp -s "$1" "$2"; then echo "동일"; else echo "다름 → 덮어씀(이전 것은 .bak.$DATE)"; fi; }
+SECRET_RE='\.env$|^secrets/|^config-extra/mcp-tokens'
+list_tree(){ # <스냅샷 하위 폴더> <현재 폴더> <표시 접두어> — 파일 단위 비교 표
+  local sub=$1 dst=$2 pre=$3 f rel
+  [ -d "$STAGE/$sub" ] || return 0
+  while IFS= read -r -d '' f; do rel=${f#"$STAGE/$sub/"}; printf '  %-8s %-46s %s\n' "[$pre]" "$rel" "$(cmpf "$f" "$dst/$rel")"; done < <(find "$STAGE/$sub" -type f -print0 | sort -z)
+}
+DBS=(); if [ -d "$STAGE/postgres" ]; then [ -f "$STAGE/postgres/n8n.dump" ] && DBS+=(n8n); for f in "$STAGE"/postgres/extra/*.dump; do [ -f "$f" ] && DBS+=("$(basename "$f" .dump)"); done; fi
+
+show_plan(){
+  echo; echo "== 계획(읽기 전용)"
+  if want db; then
+    echo "[db] PostgreSQL 덤프 복원(pg_restore --clean --if-exists). 기본 postgres DB 와 역할(globals)은 건드리지 않습니다."
+    for d in "${DBS[@]}"; do
+      if docker exec postgres psql -U postgres -tAc "select 1 from pg_database where datname='$d'" 2>/dev/null | grep -q 1; then echo "  덤프 $d → 현재 DB 의 같은 이름 테이블을 덮어씀(현재 것은 복원 전 덤프로 보관)"; else echo "  덤프 $d → 현재 DB 없음: 건너뜀(회원/서비스를 먼저 만든 뒤 다시)"; fi; done
+    [ -f "$STAGE/sftpgo/sftpgo.db" ] && echo "  [sftpgo] sftpgo.db  $(cmpf "$STAGE/sftpgo/sftpgo.db" "$S/services/sftpgo/data/sftpgo.db")"
+    [ -d "$STAGE/n8n/data" ] && echo "  [n8n] 데이터 폴더 파일 덮어쓰기(스냅샷에 없는 현재 파일은 그대로 둠, 바뀌는 파일은 .bak.$DATE)"
+  fi
+  if want config; then
+    echo "[config] 설정·비밀 — 내용은 표시하지 않고 같은지만 비교합니다"
+    for f in dev-container.env platform.env; do [ -f "$STAGE/config/$f" ] && printf '  %-8s %-46s %s\n' "[config]" "$f" "$(cmpf "$STAGE/config/$f" "$O/config/$f")"; done
+    list_tree config/env "$O/config/env" env; list_tree secrets "$E/secrets" secrets; list_tree etc-$PFX "$E" etc
+    for d in mcp-tokens memory agent-defaults; do list_tree config-extra/$d "$O/config/$d" "extra"; done
+    list_tree compose-env "$O/compose" compose
+    for f in site.env dev-container.env platform.env; do  # 비밀 없는 설정만 줄 단위 차이를 보인다
+      s=$STAGE/etc-$PFX/$f; [ "$f" = site.env ] || s=$STAGE/config/$f; c=$E/$f; [ "$f" = site.env ] || c=$O/config/$f
+      [ -f "$s" ] && [ -f "$c" ] && ! cmp -s "$s" "$c" && { echo "  -- $f 차이(< 현재 · > 스냅샷, 비밀 없는 파일)"; diff <(sed 's/^/  /' "$c") <(sed 's/^/  /' "$s") | sed -n '1,30p' | sed 's/^/     /'; }
+    done
+    echo "  ※ postgres.env/n8n.env 의 DB 암호는 복원 뒤 DB 역할 암호에 맞춰 동기화합니다."
+  fi
+  if want members; then
+    echo "[members] 회원 메타(/opt/$PFX/config/members)"; list_tree config-extra/members "$O/config/members" members
+    if [ -f "$STAGE/accounts/member-list.txt" ]; then
+      echo "  스냅샷 시점 회원: $(tr '\n' ' ' < "$STAGE/accounts/member-list.txt")"
+      echo "  현재 회원 폴더: $(ls "$S/users" 2>/dev/null | tr '\n' ' ')"
+      echo "  ※ 리눅스 계정·컨테이너는 되살리지 않습니다. 없는 회원은 sudo $PFX-member-add 로 만든 뒤 db 범위를 다시 복원하세요."
+    fi
+  fi
+  echo "순서: 서비스 정지 → 복원 → 서비스 기동 → $PFX-doctor"
+}
+show_plan
+[ "$CMD" = apply ] || { echo; echo "안내: 아무것도 바꾸지 않았습니다(plan). 되돌리려면 sudo $PFX-restore apply $SCOPE${FROM:+ ...} [--snapshot $SID]"; exit 0; }
+
+# ---- 승인
+PHRASE="복원 $PFX $SCOPE"
+if [ "$YES" != 1 ]; then
+  [ -t 0 ] || die "대화형 터미널이 아니면 --yes 가 필요합니다"
+  echo; echo "경고: 위 파일·DB 를 되돌립니다(현재 상태는 .bak.$DATE · $S/backups/pre-restore.$DATE 에 보관). 계속하려면 아래 문구를 그대로 입력하세요."
+  read -r -p "  $PHRASE : " ans; [ "$ans" = "$PHRASE" ] || die "승인 문구가 달라 취소했습니다(아무것도 바꾸지 않음)"
+fi
+
+# ---- 서비스 정지(postgres 는 DB 복원에 필요해 둔다). 정지 전 실행 중이던 compose 만 나중에 올린다
+BAK=$S/backups/pre-restore.$DATE; install -d -m 0700 "$BAK"
+RUN=(); for d in "$O"/compose/*/; do n=$(basename "$d"); [ "$n" = postgres ] && continue; [ -f "$d/compose.yml" ] || continue
+  [ -n "$(cd "$d" && docker compose ps -q 2>/dev/null)" ] && { RUN+=("$n"); ( cd "$d" && docker compose stop >/dev/null 2>&1 ); }; done
+echo "== 서비스 정지: ${RUN[*]:-(실행 중인 것 없음)}"
+rs(){ rsync -a --backup --suffix=".bak.$DATE" "$@"; }
+rc=0
+
+if want db && [ "${#DBS[@]}" -gt 0 ] || { want db && [ -f "$STAGE/sftpgo/sftpgo.db" ]; } || { want db && [ -d "$STAGE/n8n/data" ]; }; then
+  install -d -m 0700 "$BAK/postgres"
+  for d in "${DBS[@]}"; do
+    if docker exec postgres psql -U postgres -tAc "select 1 from pg_database where datname='$d'" | grep -q 1; then
+      dump=$STAGE/postgres/$([ "$d" = n8n ] && echo n8n.dump || echo extra/$d.dump)
+      docker exec postgres pg_dump -U postgres -Fc "$d" > "$BAK/postgres/$d.dump" && [ -s "$BAK/postgres/$d.dump" ] || { echo "실패: $d 현재 상태 보관 실패 — 이 DB 는 건너뜀"; rc=1; continue; }
+      docker exec -i postgres pg_restore -U postgres --clean --if-exists -d "$d" < "$dump" >/dev/null 2>"$BAK/postgres/$d.restore.err" && echo "성공: DB $d 복원(이전 상태 $BAK/postgres/$d.dump)" || { echo "실패: DB $d pg_restore 오류 — $BAK/postgres/$d.restore.err (이전 상태는 $BAK/postgres/$d.dump 로 되돌릴 수 있음)"; rc=1; }
+    else echo "안내: DB $d 는 현재 없어 건너뜀"; fi
+  done
+  if [ -f "$STAGE/sftpgo/sftpgo.db" ] && [ -d "$S/services/sftpgo/data" ]; then
+    rm -f "$S"/services/sftpgo/data/sftpgo.db-wal "$S"/services/sftpgo/data/sftpgo.db-shm
+    rs "$STAGE/sftpgo/sftpgo.db" "$S/services/sftpgo/data/sftpgo.db" && chown 1000:1000 "$S/services/sftpgo/data/sftpgo.db" && echo "성공: SFTPGo DB 복원" || { echo "실패: SFTPGo DB"; rc=1; }
+  fi
+  if [ -d "$STAGE/n8n/data" ] && [ -d "$S/services/n8n/data" ]; then rs "$STAGE/n8n/data/" "$S/services/n8n/data/" && echo "성공: n8n 데이터 복원" || { echo "실패: n8n 데이터"; rc=1; }; fi
+fi
+
+if want config; then
+  [ -d "$STAGE/config/env" ] && rs "$STAGE/config/env/" "$O/config/env/"
+  for f in dev-container.env platform.env; do [ -f "$STAGE/config/$f" ] && rs "$STAGE/config/$f" "$O/config/$f"; done
+  [ -d "$STAGE/secrets" ] && rs "$STAGE/secrets/" "$E/secrets/"
+  [ -d "$STAGE/etc-$PFX" ] && rs --exclude=secrets --exclude=backups "$STAGE/etc-$PFX/" "$E/"
+  for d in mcp-tokens memory agent-defaults; do [ -d "$STAGE/config-extra/$d" ] && rs "$STAGE/config-extra/$d/" "$O/config/$d/"; done
+  [ -d "$STAGE/compose-env" ] && for f in "$STAGE"/compose-env/*.env; do [ -f "$f" ] && [ -d "$O/compose/$(basename "$f" .env)" ] && rs "$f" "$O/compose/$(basename "$f" .env)/.env"; done
+  chmod 0700 "$E/secrets" "$O/config/env" 2>/dev/null; find "$O/config/env" "$E/secrets" -type f -exec chmod 0600 {} + 2>/dev/null
+  echo "성공: 설정·비밀 복원"
+  # DB 역할 암호를 복원된 env 에 맞춘다(새 서버에서 가져온 경우 DB 는 새 암호로 만들어져 있다). 값은 출력하지 않는다
+  PE=$O/config/env/postgres.env
+  if [ -f "$PE" ] && docker exec postgres pg_isready -U postgres >/dev/null 2>&1; then
+    ( . "$PE"; for r in "postgres:${POSTGRES_PASSWORD:-}" "${N8N_DB_USER:-n8n}:${N8N_DB_PASSWORD:-}"; do u=${r%%:*}; p=${r#*:}; [ -n "$p" ] || continue
+        printf "ALTER ROLE \"%s\" PASSWORD '%s';\n" "$u" "$p" | docker exec -i postgres psql -U postgres -q >/dev/null 2>&1 && echo "성공: DB 역할 $u 암호를 env 에 맞춤" || echo "경고: DB 역할 $u 암호 동기화 실패" ; done )
+  fi
+fi
+
+if want members; then
+  [ -d "$STAGE/config-extra/members" ] && { rs "$STAGE/config-extra/members/" "$O/config/members/" && echo "성공: 회원 메타 복원"; }
+fi
+
+# ---- 기동 → doctor
+echo "== 서비스 기동: ${RUN[*]:-(없음)}"
+for n in "${RUN[@]}"; do ( cd "$O/compose/$n" && docker compose up -d >/dev/null 2>&1 ) && echo "성공: $n 기동" || { echo "실패: $n 기동"; rc=1; }; done
+sleep 5
+echo "== $PFX-doctor"; "/usr/local/sbin/$PFX-doctor" || rc=1
+[ "$rc" = 0 ] && echo "결과: 통과(이전 상태 보관: .bak.$DATE · $BAK)" || echo "결과: 일부 실패 — 위 메시지와 $BAK 를 확인하세요"
+exit "$rc"

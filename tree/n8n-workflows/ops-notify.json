@@ -1,0 +1,100 @@
+[
+  {
+    "id": "dmOpsNotify00001",
+    "name": "@@PFX@@-ops-notify",
+    "active": false,
+    "nodes": [
+      {
+        "id": "b2000001-0000-4000-8000-000000000001",
+        "name": "운영 알림 수신",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          0,
+          0
+        ],
+        "webhookId": "a2000001-0000-4000-8000-000000000001",
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "@@PFX@@-ops-notify",
+          "responseMode": "onReceived",
+          "options": {}
+        }
+      },
+      {
+        "id": "b2000001-0000-4000-8000-000000000002",
+        "name": "토큰 확인",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          240,
+          0
+        ],
+        "parameters": {
+          "jsCode": "const j = $input.first().json;\nconst tok = (j.headers && (j.headers['x-token'] || j.headers['X-Token'])) || '';\nif (tok !== '__NOTIFY_TOKEN__') return [];   // 설치 명령이 실제 토큰으로 바꿔 넣습니다\nconst text = String((j.body && j.body.text) || '').slice(0, 3500);\nif (!text) return [];\nreturn [{ json: { text: '🛠 @@BRAND@@ 운영\\n' + text } }];"
+        }
+      },
+      {
+        "id": "b2000001-0000-4000-8000-000000000003",
+        "name": "텔레그램 보내기",
+        "type": "n8n-nodes-base.telegram",
+        "typeVersion": 1.2,
+        "position": [
+          480,
+          0
+        ],
+        "notes": "Telegram API 자격증명을 고르고 Chat ID 를 바꾸세요.",
+        "parameters": {
+          "chatId": "여기에 텔레그램 채팅 ID 를 입력",
+          "text": "={{ $json.text }}",
+          "additionalFields": {
+            "appendAttribution": false
+          }
+        }
+      },
+      {
+        "id": "b2000001-0000-4000-8000-000000000004",
+        "name": "설명",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          0,
+          -340
+        ],
+        "parameters": {
+          "content": "운영 알림 → 텔레그램\n\n▶ 용도: 서버 도구가 보내는 운영 알림(앱 만료·공개 종료·Caddy 검증 실패 등)을 텔레그램 채팅으로 전달합니다. `@@PFX@@-app-sync` 가 이 웹훅(POST /webhook/@@PFX@@-ops-notify)을 호출합니다(/etc/@@PFX@@/apps/config.json 의 notify_url).\n▶ 필요한 것: 1) '텔레그램 보내기' 노드 — Telegram API 자격증명(BotFather 로 만든 봇 토큰)  2) 같은 노드의 «Chat ID» 를 받을 채팅 ID 로 바꾸기.\n▶ 다른 채널(Slack·메일 등)을 쓰려면 '텔레그램 보내기' 노드를 해당 노드로 교체하세요. 앞의 '토큰 확인' 노드는 그대로 둡니다.\n▶ 켜는 법: 자격증명·Chat ID 를 정한 뒤 «Publish(활성화)». 또는 `sudo @@PFX@@-n8n-workflows activate ops-notify`.\n▶ 보안: 헤더 `X-Token` 이 맞을 때만 전달합니다(토큰은 /etc/@@PFX@@/apps/notify.token). 외부 도메인에서 이 경로는 Caddy 가 막습니다.",
+          "height": 300,
+          "width": 720
+        }
+      }
+    ],
+    "connections": {
+      "운영 알림 수신": {
+        "main": [
+          [
+            {
+              "node": "토큰 확인",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "토큰 확인": {
+        "main": [
+          [
+            {
+              "node": "텔레그램 보내기",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "saveDataSuccessExecution": "none"
+    }
+  }
+]

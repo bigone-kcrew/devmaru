@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/opt/@@PFX@@/config/dev-container.env"
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "ERROR: config file not found or unreadable: $CONFIG_FILE"
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+required_vars=(
+  GOLDEN_IMAGE
+  DEV_NETWORK
+  AI_GROUP
+  USER_ROOT_BASE
+  SHARED_PATH
+  TERM_DEFAULT
+  SECCOMP_PROFILE
+  APPARMOR_PROFILE
+)
+
+for var in "${required_vars[@]}"; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "ERROR: required config variable is missing: $var"
+    exit 1
+  fi
+done
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-user-add <username>"
+  exit 1
+fi
+
+if [[ $# -ne 3 || "$2" != "--password-file" ]]; then
+  echo "Usage: @@PFX@@-user-add <username> --password-file <file>"
+  exit 1
+fi
+
+USERNAME="$1"
+PASSWORD_FILE="$3"
+
+if [[ ! -f "$PASSWORD_FILE" ]]; then
+  echo "ERROR: password file missing"
+  exit 1
+fi
+
+if [[ "$(stat -c '%U:%a' "$PASSWORD_FILE")" != "root:600" ]]; then
+  echo "ERROR: password file must be root-owned mode 600"
+  exit 1
+fi
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+CONTAINER_NAME="dev-${USERNAME}"
+USER_ROOT="${USER_ROOT_BASE}/${USERNAME}"
+WORKSPACE="${USER_ROOT}/workspace"
+AGENT_CONFIG="${USER_ROOT}/agent-config"
+USER_HOME="/home/${USERNAME}"
+
+# --------------------------------------------------------------------
+# Preflight
+# --------------------------------------------------------------------
+
+if id "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: user already exists: $USERNAME"
+  exit 1
+fi
+
+if ! getent group "$AI_GROUP" >/dev/null 2>&1; then
+  echo "ERROR: group does not exist: $AI_GROUP"
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: Docker daemon is not available"
+  exit 1
+fi
+
+if ! docker image inspect "$GOLDEN_IMAGE" >/dev/null 2>&1; then
+  echo "ERROR: Golden Image not found: $GOLDEN_IMAGE"
+  exit 1
+fi
+
+if ! docker network inspect "$DEV_NETWORK" >/dev/null 2>&1; then
+  echo "ERROR: Docker network not found: $DEV_NETWORK"
+  exit 1
+fi
+
+if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  echo "ERROR: container already exists: $CONTAINER_NAME"
+  exit 1
+fi
+
+if [[ -e "$USER_ROOT" ]]; then
+  if [[ ! -d "$USER_ROOT" ]]; then
+    echo "ERROR: user data path exists but is not a directory: $USER_ROOT"
+    exit 1
+  fi
+  echo "INFO: existing user data directory will be reused: $USER_ROOT"
+fi
+
+# --------------------------------------------------------------------
+# Provisioning
+# --------------------------------------------------------------------
+
+echo "[1/7] Creating Linux user..."
+adduser --disabled-password --gecos "" "$USERNAME"
+
+echo "[1.5/7] Setting bootstrap password and forcing change..."
+
+IFS= read -r BOOTSTRAP_PASSWORD < "$PASSWORD_FILE"
+
+if [[ -z "$BOOTSTRAP_PASSWORD" ]]; then
+  echo "ERROR: empty bootstrap password"
+  exit 1
+fi
+
+printf '%s:%s\n' "$USERNAME" "$BOOTSTRAP_PASSWORD" | chpasswd
+unset BOOTSTRAP_PASSWORD
+
+chage -d 0 "$USERNAME"
+
+echo "[2/7] Adding user to $AI_GROUP..."
+usermod -aG "$AI_GROUP" "$USERNAME"
+
+echo "[3/7] Creating persistent workspace..."
+mkdir -p "$USER_ROOT" "$WORKSPACE"
+
+echo "[4/7] Applying ownership and permissions..."
+chown -R "$USERNAME:$AI_GROUP" "$USER_ROOT"
+chmod 2750 "$USER_ROOT"
+chmod 2750 "$WORKSPACE"
+
+echo "[5/7] Applying workspace and SFTPGo ACL (접근 정책 WORKSPACE_OTHERS)..."
+# shellcheck disable=SC1091
+. /opt/@@PFX@@/scripts/@@PFX@@-access-lib.sh; acc_load
+acc_member "$USERNAME"; acc_members_map
+
+echo "[5.25/7] Preparing quiet member login..."
+install -o "$USERNAME" -g "$USERNAME" -m 0644 /dev/null "$USER_HOME/.hushlogin"
+
+echo "[5.5/7] Provisioning agent defaults..."
+/opt/@@PFX@@/scripts/@@PFX@@-agent-config-provision "$USERNAME"
+
+# Prepare the nested bind-mount target inside the persistent HOME.
+install -d -o "$USERNAME" -g "$USERNAME" -m 0750   "$USER_HOME/.@@PFX@@"   "$USER_HOME/.@@PFX@@/agent-config"
+
+echo "[6/7] Resolving UID/GID..."
+
+USER_UID="$(id -u "$USERNAME")"
+USER_GID="$(id -g "$USERNAME")"
+
+echo "  user:      $USERNAME"
+echo "  uid:       $USER_UID"
+echo "  gid:       $USER_GID"
+echo "  home:         $USER_HOME"
+echo "  workspace:    $WORKSPACE"
+echo "  agent-config: $AGENT_CONFIG"
+
+echo "[7/7] Creating dev container..."
+
+if ! /opt/@@PFX@@/scripts/@@PFX@@-dev-container-create "$USERNAME"; then
+  echo "ERROR: dev container creation failed"
+  exit 1
+fi
+
+echo
+echo "User created successfully."
+echo
+echo "User:      $USERNAME"
+echo "UID:GID:   ${USER_UID}:${USER_GID}"
+echo "Home:      $USER_HOME"
+echo "Workspace: $WORKSPACE"
+echo "Container: $CONTAINER_NAME"
+echo "Image:     $GOLDEN_IMAGE"
+echo "Network:   $DEV_NETWORK"
+echo
+echo "Start container:"
+echo "  docker start $CONTAINER_NAME"
+echo
+echo "Open member shell:"
+echo "  sudo docker exec --user $USERNAME -it $CONTAINER_NAME bash -l"

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# 페어링 URL 은 접속 비밀이다 — 만들어지는 순간부터 root 만 읽게 한다(마지막에 n8n·onboarding 용으로 640 root:@@PFX@@)
+umask 077
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-paseo-pair-create <username>"
+  exit 1
+fi
+
+USERNAME="$1"
+
+CONTAINER_NAME="dev-${USERNAME}"
+USER_HOME="/home/${USERNAME}"
+ONBOARDING_DIR="/srv/@@PFX@@/onboarding/${USERNAME}"
+
+USER_UID="$(id -u "$USERNAME")"
+USER_GID="$(id -g "$USERNAME")"
+
+if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" != "true" ]]; then
+  echo "ERROR: container not running: $CONTAINER_NAME"
+  exit 1
+fi
+
+echo "[1/2] Creating pairing..."
+
+mkdir -p "$ONBOARDING_DIR"
+
+TMP_JSON="$(mktemp)"
+trap 'rm -f "$TMP_JSON"' EXIT
+
+docker exec "$CONTAINER_NAME" \
+  setpriv \
+  --reuid="$USER_UID" \
+  --regid="$USER_GID" \
+  --init-groups \
+  -- env \
+  HOME="$USER_HOME" \
+  USER="$USERNAME" \
+  LOGNAME="$USERNAME" \
+  paseo daemon pair --relay --json \
+  > "$TMP_JSON"
+
+python3 - "$TMP_JSON" "$ONBOARDING_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+out = Path(sys.argv[2])
+
+data = json.loads(src.read_text())
+
+(out / "pairing.json").write_text(
+    json.dumps(
+        {
+            "relayEnabled": data["relayEnabled"],
+            "url": data["url"]
+        },
+        indent=2
+    ) + "\n"
+)
+
+(out / "pairing-url.txt").write_text(data["url"] + "\n")
+PY
+
+if [[ ! -f "$ONBOARDING_DIR/pairing.json" ]] || \
+   [[ ! -f "$ONBOARDING_DIR/pairing-url.txt" ]]; then
+  echo "ERROR: pairing artifact creation failed"
+  exit 1
+fi
+
+# URL 이 새로 만들어졌으니 옛 QR 은 지운다(남으면 이전 URL 의 QR 이 계속 유효해 보인다)
+rm -f "$ONBOARDING_DIR/pairing.png"
+
+chown root:@@PFX@@ "$ONBOARDING_DIR"
+chmod 750 "$ONBOARDING_DIR"
+
+chown root:@@PFX@@ \
+  "$ONBOARDING_DIR/pairing.json" \
+  "$ONBOARDING_DIR/pairing-url.txt"
+
+chmod 640 \
+  "$ONBOARDING_DIR/pairing.json" \
+  "$ONBOARDING_DIR/pairing-url.txt"
+
+echo "[2/2] Complete  (QR 은 @@PFX@@-paseo-pair-qr-create 로 다시 만든다)"

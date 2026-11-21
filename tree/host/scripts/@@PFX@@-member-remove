@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-member-remove <username> [--force]"
+  exit 1
+fi
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: @@PFX@@-member-remove <username> [--force]"
+  exit 1
+fi
+
+USERNAME="$1"
+FORCE=0
+
+if [[ "${2:-}" == "--force" ]]; then
+  FORCE=1
+fi
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+CONTAINER_NAME="dev-${USERNAME}"
+
+USER_ROOT="/srv/@@PFX@@/users/${USERNAME}"
+ONBOARDING_DIR="/srv/@@PFX@@/onboarding/${USERNAME}"
+SECRET_FILE="/run/@@PFX@@/member-secrets/${USERNAME}.password"
+MEMBER_META="/opt/@@PFX@@/config/members/${USERNAME}.json"
+
+confirm() {
+  if [[ "$FORCE" == "1" ]]; then
+    return 0
+  fi
+
+  echo
+  echo "WARNING"
+  echo "======="
+  echo
+  echo "User:"
+  echo "  $USERNAME"
+  echo
+  echo "Container:"
+  echo "  $CONTAINER_NAME"
+  echo
+  echo "Workspace:"
+  echo "  $USER_ROOT"
+  echo
+  echo "Onboarding:"
+  echo "  $ONBOARDING_DIR"
+  echo
+  read -r -p "Continue? [y/N] " ANSWER
+
+  if [[ "$ANSWER" != "y" && "$ANSWER" != "Y" ]]; then
+    echo "Cancelled."
+    exit 0
+  fi
+}
+
+confirm
+
+echo "[1/7] Removing container..."
+
+if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker rm "$CONTAINER_NAME" >/dev/null
+fi
+
+echo "OK"
+
+
+if [[ -f "/etc/caddy/sites.d/${USERNAME}.caddy" ]]; then
+  /usr/local/sbin/@@PFX@@-site-caddy remove "$USERNAME" \
+    || echo "WARNING: site block removal failed - delete /etc/caddy/sites.d/${USERNAME}.caddy by hand"
+fi
+
+if [[ -f "/etc/caddy/members.d/${USERNAME}.caddy" ]]; then
+  flock /run/@@PFX@@-paseo-caddy.lock /usr/local/sbin/@@PFX@@-paseo-caddy remove "$USERNAME" \
+    || echo "WARNING: Paseo Caddy block removal failed - delete /etc/caddy/members.d/${USERNAME}.caddy by hand"
+fi
+
+# 멤버 PostgreSQL 보관(90일 뒤 덤프 후 정리): role 을 잠그고 보관 표시를 남긴다. 실패해도 삭제는 계속한다.
+if [[ -x /usr/local/sbin/@@PFX@@-db-retire ]]; then
+  /usr/local/sbin/@@PFX@@-db-retire "$USERNAME" || echo "WARNING: PostgreSQL retire failed (run: sudo @@PFX@@-db-retire $USERNAME)"
+fi
+
+echo "[2/7] Removing storage access..."
+
+if ! /opt/@@PFX@@/scripts/@@PFX@@-member-storage-remove "$USERNAME"; then
+  echo "ERROR: storage access cleanup failed"
+  exit 1
+fi
+
+echo "OK"
+
+
+echo "[3/7] Removing Linux user..."
+
+if id "$USERNAME" >/dev/null 2>&1; then
+  userdel -r "$USERNAME" || true
+fi
+
+echo "OK"
+
+
+echo "[4/7] Removing workspace..."
+
+rm -rf "$USER_ROOT"
+
+echo "OK"
+
+
+echo "[5/7] Removing onboarding..."
+
+rm -rf "$ONBOARDING_DIR"
+rm -f "$SECRET_FILE"
+
+echo "OK"
+
+
+echo "[6/7] Removing member metadata..."
+
+rm -f "$MEMBER_META"
+
+echo "OK"
+
+
+echo "[7/7] Verifying cleanup..."
+
+FAIL=0
+
+if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  echo "ERROR: container still exists"
+  FAIL=1
+fi
+
+if id "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: user still exists"
+  FAIL=1
+fi
+
+if [[ -e "$USER_ROOT" ]]; then
+  echo "ERROR: user root still exists"
+  FAIL=1
+fi
+
+if [[ -e "/home/$USERNAME" ]]; then
+  echo "ERROR: home directory still exists"
+  FAIL=1
+fi
+
+if [[ -e "$ONBOARDING_DIR" ]]; then
+  echo "ERROR: onboarding directory still exists"
+  FAIL=1
+fi
+
+if [[ -e "$MEMBER_META" ]]; then
+  echo "ERROR: member metadata still exists"
+  FAIL=1
+fi
+
+if [[ -e "$SECRET_FILE" ]]; then
+  echo "ERROR: secret file still exists"
+  FAIL=1
+fi
+
+curl_hdr() { local v=${2//\\/\\\\}; v=${v//\"/\\\"}; printf 'header = "%s: %s"\n' "$1" "$v"; }   # 비밀 헤더를 argv(ps)에 싣지 않으려 curl -K 로 넘긴다
+SFTPGO_KEY_FILE="/etc/@@PFX@@/secrets/sftpgo-provisioner-api-key"
+if [[ -r "$SFTPGO_KEY_FILE" ]]; then
+  SFTPGO_KEY="$(cat "$SFTPGO_KEY_FILE")"
+  HTTP="$(
+    curl -sS -o /dev/null -w '%{http_code}' \
+      -K <(curl_hdr X-SFTPGO-API-KEY "$SFTPGO_KEY") \
+      "http://127.0.0.1:8080/api/v2/users/$USERNAME"
+  )"
+  unset SFTPGO_KEY
+
+  if [[ "$HTTP" != "404" ]]; then
+    echo "ERROR: SFTPGo user still exists or lookup failed (HTTP=$HTTP)"
+    FAIL=1
+  fi
+elif ! grep -Eq "^MODULES=.*[ '\"]files[ '\"]" /etc/@@PFX@@/site.env 2>/dev/null; then
+  echo "PASS: SFTPGo 없음(files 모듈 미설치) — 확인 건너뜀"
+else
+  echo "ERROR: SFTPGo API key unavailable for verification"
+  FAIL=1
+fi
+
+if pdbedit -s /srv/@@PFX@@/samba/smb.conf -L -u "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: Samba user still exists"
+  FAIL=1
+fi
+
+if [[ "$FAIL" -ne 0 ]]; then
+  exit 1
+fi
+
+echo "OK"
+
+
+echo
+echo "================================="
+echo " Member Removed"
+echo "================================="
+echo
+echo "User:"
+echo "  $USERNAME"
+echo
+echo "Logs preserved:"
+echo "  /srv/@@PFX@@/logs"

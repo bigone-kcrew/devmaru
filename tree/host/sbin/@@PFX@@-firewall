@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# @@PFX@@-firewall — 방화벽(ufw) 기본 구성. 기본은 보기만 하고, 적용은 자동 롤백 타이머가 걸린 채로 한다.
+#   @@PFX@@-firewall plan                 넣을 규칙·현재 상태·막힐 수 있는 포트를 보여 준다(아무것도 바꾸지 않는다)
+#   @@PFX@@-firewall apply [--timeout N]  규칙을 적용한다(root). N초(기본 120) 안에 confirm 이 없으면 자동으로 이전 상태로 되돌린다
+#   @@PFX@@-firewall confirm              새 규칙을 확정한다(타이머 해제). 새 SSH 접속이 되는 것을 확인한 뒤에 실행한다
+#   @@PFX@@-firewall rollback             즉시 이전 상태로 되돌린다
+#   @@PFX@@-firewall status               ufw 상태와 대기 중인 롤백 타이머
+# 규칙: SSH(sshd 가 듣는 포트 ∪ site.env 의 SSH_PORT — 회원이 접속하므로 어디서나 허용) · 80/443(웹·인증서) · SMB 모듈이면 SMB_TRANSPORTS 포트 ·
+#       ADMIN_CIDRS(site.env) 대역은 전체 허용 · 도커 내부망(172.16.0.0/12) 허용. 그 외 들어오는 연결은 차단.
+#       docker 가 0.0.0.0 으로 게시한 포트(예: SFTP 2022)는 ufw 규칙이 닿지 않으므로 /etc/ufw/after.rules 의 DOCKER-USER 블록으로 같은 허용 목록을 적용한다
+#       (apply 때 넣고 rollback 때 /etc/ufw 와 함께 원복). compose 서비스의 127.0.0.1 바인딩은 영향 없다.
+set -uo pipefail
+PFX=@@PFX@@; SITE=/etc/$PFX/site.env; ST=/var/lib/$PFX/firewall; UNIT=$PFX-firewall-rollback; SELF=/usr/local/sbin/$PFX-firewall
+CMD=${1:-plan}; shift || true; TMO=120
+AUTO=""
+while [ $# -gt 0 ]; do case "$1" in --timeout) TMO=${2:-}; shift;; --auto) AUTO=" (자동)";; *) echo "실패: 알 수 없는 인자: $1" >&2; exit 2;; esac; shift; done
+[[ "$TMO" =~ ^[0-9]+$ ]] && [ "$TMO" -ge 10 ] || { echo "실패: --timeout 은 10 이상의 정수(초)" >&2; exit 2; }
+[ -r "$SITE" ] || { echo "실패: $SITE 없음 — 설치되지 않았습니다" >&2; exit 1; }
+sv() { sed -n "s/^$1=//p" "$SITE" | tail -1 | tr -d "\"'"; }
+MODULES=$(sv MODULES); ADMIN_CIDRS=$(sv ADMIN_CIDRS); SMBT=$(sv SMB_TRANSPORTS); SMBT=${SMBT:-quic:1443}
+
+# 규칙 목록: "포트/프로토콜|설명" 또는 "from CIDR|설명"
+SSHP=$({ sshd -T 2>/dev/null | awk '$1=="port"{print $2}'; sv SSH_PORT; } | grep -E '^[0-9]+$' | sort -un); SSHP=${SSHP:-22}
+sshports() { echo "$SSHP"; }
+rules() {
+  for p in $(sshports | sort -un); do echo "$p/tcp|SSH"; done
+  echo "80/tcp|웹·인증서(ACME)"; echo "443/tcp|웹(HTTPS)"; echo "443/udp|웹(HTTP/3)"
+  case " $MODULES " in *" smb "*) local t; for t in ${SMBT//,/ }; do case "${t%%:*}" in quic|udp) echo "${t##*:}/udp|SMB(QUIC)";; *) echo "${t##*:}/tcp|SMB";; esac; done;; esac
+  for c in $ADMIN_CIDRS; do [ "$c" = 127.0.0.1/32 ] || echo "from $c|관리자 대역(전체)"; done
+  echo "from 172.16.0.0/12|도커 내부망(컨테이너 → 호스트)"
+}
+ssh_peers() { # 현재 SSH 로 붙은 클라이언트: "IP 로컬포트" (sshd 프로세스 소켓 기준 — 설정과 다른 포트도 잡는다)
+  ss -Htnp state established 2>/dev/null | grep '"sshd' | awk '{l=$3; sub(/.*:/,"",l); r=$4; sub(/:[0-9]+$/,"",r); print r, l}' | sort -u; }
+DU=ufw-$PFX-docker; AR=/etc/ufw/after.rules; MK="$PFX-firewall docker"
+docker_pub() { # docker 가 외부(0.0.0.0 · ::)로 게시한 포트: "포트/프로토콜 컨테이너"
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | while read -r n rest; do
+    grep -oE '(0\.0\.0\.0|\[::\]):[0-9]+->[0-9]+/(tcp|udp)' <<<"$rest" | sed -E 's#^[^:]*(:[^:]*)*:([0-9]+)->[0-9]+/(tcp|udp)$#\2/\3#' | sort -u | sed "s#\$# $n#"
+  done | sort -u; }
+docker_block() { # after.rules 에 붙일 DOCKER-USER 블록(허용 목록 = rules). 게시 포트로 들어오는 새 연결(DNAT)만 판정하고 나머지는 건드리지 않는다
+  echo "# BEGIN $MK"; echo "*filter"; echo ":DOCKER-USER - [0:0]"; echo ":$DU - [0:0]"
+  echo "-A DOCKER-USER -j $DU"
+  echo "-A $DU -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN"
+  echo "-A $DU -i docker0 -j RETURN"; echo "-A $DU -i br-+ -j RETURN"     # 컨테이너 쪽에서 오는 것
+  rules | while IFS='|' read -r r d; do case "$r" in
+    from*) echo "-A $DU -s ${r#from } -j RETURN";;
+    *) echo "-A $DU -p ${r#*/} -m conntrack --ctstate DNAT --ctorigdstport ${r%/*} -j RETURN";; esac; done
+  echo "-A $DU -m conntrack --ctstate DNAT -j DROP"; echo "-A $DU -j RETURN"; echo "COMMIT"; echo "# END $MK"; }
+docker_cleanup() { # 실행 중인 DOCKER-USER 점프와 체인 제거(중복 점프 포함)
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -D DOCKER-USER -j "$DU" 2>/dev/null; do :; done; iptables -F "$DU" 2>/dev/null; iptables -X "$DU" 2>/dev/null; return 0; }
+pend() { systemctl is-active --quiet "$UNIT.timer" 2>/dev/null; }
+
+check_ssh() { # apply 전 점검: 현재 SSH 세션의 로컬 포트가 허용 목록에 있어야 한다
+  local ip port ok=0 bad=0 allowed; allowed=$(rules | cut -d'|' -f1)
+  while read -r ip port; do [ -n "$port" ] || continue
+    if grep -qx "$port/tcp" <<<"$allowed"; then echo "  성공: 현재 SSH 접속 $ip → :$port 은 허용됩니다"; ok=1; else echo "  실패: 현재 SSH 접속 $ip → :$port 이 허용 규칙에 없습니다"; bad=1; fi
+  done < <(ssh_peers)
+  [ "$ok" = 0 ] && [ "$bad" = 0 ] && echo "  안내: 현재 SSH 접속이 감지되지 않았습니다(콘솔·로컬 실행). SSH 포트 $(sshports | tr '\n' ' ')는 허용됩니다"
+  [ "$bad" = 0 ]; }
+
+cmd_plan() {
+  echo "== $PFX-firewall plan (ufw — 적용하지 않습니다)"
+  echo "기본 정책: 들어오는 연결 차단 · 나가는 연결 허용"
+  echo "넣을 규칙:"; rules | while IFS='|' read -r r d; do printf '  allow %-22s # %s\n' "$r" "$d"; done
+  echo "현재 ufw: $(command -v ufw >/dev/null && ufw status 2>/dev/null | head -1 || echo '설치 안 됨 — apt install ufw 필요')"
+  command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' && echo "  주의: 이미 켜져 있는 규칙은 apply 때 위 규칙으로 교체됩니다(롤백 때 복원)"
+  echo "현재 SSH 접속:"; check_ssh
+  echo "외부에서 듣고 있지만 허용 규칙에 없어 막힐 포트:"
+  local allowed; allowed=$(rules | cut -d'|' -f1); local n=0
+  while read -r proto addr; do p=${addr##*:}; case "$addr" in 127.*|"[::1]"*|"::1"*) continue;; esac
+    grep -qx "$p/$proto" <<<"$allowed" || { echo "  $proto $addr"; n=$((n+1)); }
+  done < <(ss -Hltnu 2>/dev/null | awk '{print $1, $5}' | sed 's/^tcp/tcp/;s/^udp/udp/' | sort -u | grep -E '^(tcp|udp)' | grep -v '%lo')
+  [ "$n" = 0 ] && echo "  (없음)"
+  local dp; dp=$(docker_pub); if [ -n "$dp" ]; then echo "docker 가 외부로 게시한 포트(apply 가 DOCKER-USER 규칙으로 같은 허용 목록을 적용):"
+    while read -r pp c; do grep -qx "$pp" <<<"$allowed" && echo "  $pp  $c  → 허용" || echo "  $pp  $c  → 차단"; done <<<"$dp"; fi
+  echo "안내: 적용은 sudo $PFX-firewall apply — ${TMO}초 안에 confirm 이 없으면 자동 롤백됩니다."
+}
+
+cmd_status() {
+  command -v ufw >/dev/null || { echo "ufw 설치 안 됨"; return 0; }
+  ufw status verbose 2>/dev/null || echo "(root 로 실행하면 규칙이 보입니다)"
+  if pend; then echo "롤백 대기 중: $(systemctl list-timers "$UNIT.timer" --no-legend 2>/dev/null | awk '{print $1,$2,$3,"(",$4,")"}') — 확인했다면 sudo $PFX-firewall confirm"; else echo "롤백 타이머 없음"; fi
+  [ -f "$ST/last" ] && echo "마지막 기록: $(cat "$ST/last")"; return 0; }
+
+[ "$CMD" = plan ] && { cmd_plan; exit 0; }
+[ "$CMD" = status ] && { cmd_status; exit 0; }
+[ "$(id -u)" = 0 ] || { echo "실패: root 로 실행하세요(sudo)" >&2; exit 1; }
+log() { mkdir -p "$ST"; echo "$(date '+%F %T') $*" > "$ST/last"; logger -t "$PFX-firewall" "$*"; }
+
+case "$CMD" in
+  apply)
+    command -v ufw >/dev/null || { echo "실패: ufw 가 설치되어 있지 않습니다 — sudo apt install ufw" >&2; exit 1; }
+    pend && { echo "실패: 이미 적용 대기 중입니다 — confirm 또는 rollback 을 먼저 실행하세요" >&2; exit 1; }
+    echo "== 적용 전 점검"; check_ssh || { echo "실패: 현재 접속이 끊길 수 있어 적용하지 않습니다" >&2; exit 1; }
+    install -d -m 0700 "$ST"; rm -f "$ST/backup.tar" "$ST/was-active"
+    ufw status | grep -q '^Status: active' && touch "$ST/was-active"
+    tar -C / -cf "$ST/backup.tar" etc/ufw etc/default/ufw 2>/dev/null || { echo "실패: 이전 설정 백업" >&2; exit 1; }
+    # 롤백 타이머 먼저(적용 중 연결이 끊겨도 돌아간다)
+    systemd-run --quiet --unit="$UNIT" --on-active="${TMO}s" --description="$PFX-firewall auto rollback" "$SELF" rollback --auto >/dev/null || { echo "실패: 롤백 타이머를 만들지 못했습니다 — 적용하지 않습니다" >&2; exit 1; }
+    ufw --force reset >/dev/null; ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
+    while IFS='|' read -r r d; do
+      case "$r" in from*) ufw allow from "${r#from }" comment "$d" >/dev/null;; *) ufw allow "$r" comment "$d" >/dev/null;; esac || { echo "실패: 규칙 $r — 롤백합니다"; "$SELF" rollback --auto; exit 1; }
+    done < <(rules)
+    if command -v docker >/dev/null 2>&1; then docker_cleanup; { echo; docker_block; } >> "$AR" || { echo "실패: DOCKER-USER 규칙 쓰기 — 롤백합니다"; "$SELF" rollback --auto; exit 1; }; fi
+    ufw --force enable >/dev/null || { echo "실패: ufw 켜기 — 롤백합니다"; "$SELF" rollback --auto; exit 1; }
+    log "apply: ${TMO}초 안에 confirm 없으면 롤백"
+    ufw status numbered | sed 's/^/  /'
+    echo "적용했습니다. 이 접속과 별개로 새 SSH 접속이 되는지 확인한 뒤 ${TMO}초 안에: sudo $PFX-firewall confirm"
+    echo "(확인이 없으면 자동으로 이전 상태로 돌아갑니다)";;
+  confirm)
+    pend || { echo "안내: 대기 중인 적용이 없습니다"; exit 0; }
+    systemctl stop "$UNIT.timer" "$UNIT.service" 2>/dev/null; rm -f "$ST/backup.tar" "$ST/was-active"; log "confirm: 확정"
+    echo "확정했습니다. 롤백 타이머를 해제했습니다.";;
+  rollback)
+    [ -f "$ST/backup.tar" ] || { echo "안내: 되돌릴 백업이 없습니다"; exit 0; }
+    systemctl stop "$UNIT.timer" 2>/dev/null
+    ufw --force disable >/dev/null 2>&1; tar -C / -xf "$ST/backup.tar"; docker_cleanup; [ -f "$ST/was-active" ] && ufw --force enable >/dev/null
+    rm -f "$ST/backup.tar" "$ST/was-active"; log "rollback$AUTO: 이전 상태 복원"
+    echo "이전 방화벽 상태로 되돌렸습니다.";;
+  *) echo "사용법: $PFX-firewall plan|apply [--timeout N]|confirm|rollback|status" >&2; exit 2;;
+esac

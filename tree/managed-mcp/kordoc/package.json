@@ -1,0 +1,10 @@
+{
+  "name": "@@@PFX@@/kordoc-thin-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "@@BRAND@@ thin stdio MCP adapter for the central Kordoc service",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2"
+  }
+}

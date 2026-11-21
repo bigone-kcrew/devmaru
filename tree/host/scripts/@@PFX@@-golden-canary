@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# @@PFX@@-golden-canary — isolated canary 두 대 + E2E
+#
+#   @@PFX@@-golden-canary @@PFX@@-dev:0.4.19-rc1 0.4.19
+#
+# root 로 실행한다 (/srv/@@PFX@@/canary 가 root 전용이다).
+# 회원 서비스를 건드리지 않는다. 회원 home/workspace 도 mount 하지 않는다.
+set -u
+IMG="${1:?이미지 태그를 달라}"
+VER="${2:?버전을 달라}"
+[[ $VER =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: 버전은 X.Y.Z 형식이어야 한다(rm -rf 경로에 쓰인다): $VER" >&2; exit 2; }
+
+CROOT=${AI_CANARY_ROOT:-/srv/@@PFX@@/canary}   # 시험용 덮어쓰기(운영에서는 비어 있다)
+R=$CROOT/$VER
+NET=@@PFX@@-dev-net
+ENVF=/opt/@@PFX@@/config/env/catalog-api.env
+# CANARY_USER=<호스트 회원> 이면 그 회원의 uid/gid 와 ~/.paseo/config.json «파일 하나» 를 복제 원본으로 쓴다.
+# 없으면 컨테이너 안에 임시 사용자 canary 를 만든다(회원 데이터 없음 · 호스트에 계정을 만들지 않는다).
+if [[ -n ${CANARY_USER:-} ]]; then
+  U=$CANARY_USER; UID_M=$(id -u "$U") && GID_M=$(id -g "$U") || { echo "ERROR: CANARY_USER 를 찾을 수 없다: $U" >&2; exit 2; }
+  SRC_CFG=$(getent passwd "$U" | cut -d: -f6)/.paseo/config.json
+else
+  U=canary; UID_M=59001; GID_M=59001; SRC_CFG=
+fi
+CLUB_GID=$(getent group @@PFX@@ | cut -d: -f3); CLUB_GID=${CLUB_GID:-@@GID@@}
+pass=0; fail=0
+ok(){ printf "  OK    %-26s %s\n" "$1" "${2:-}"; pass=$((pass+1)); }
+no(){ printf "  FAIL  %-26s %s\n" "$1" "${2:-}"; fail=$((fail+1)); }
+inm(){ docker exec -u "$U" "$1" bash -lc "$2" 2>&1; }
+
+[[ $EUID -eq 0 ]] || { echo "ERROR: root 로 실행한다: sudo @@PFX@@-golden-canary <이미지> <버전>"; exit 1; }
+
+# prune-begin (C8: 2026-10-04 에 ~/patches 사본에만 들어갔던 정리 블록의 복구판 — 기본은 «목록만»)
+# canary 데이터는 복제본뿐이라 다시 만들 수 있다. 버전마다 쌓이면 디스크를 먹는다(2026-10-04 에 11GB 적재).
+# 보존: 이번 버전 · 높은 쪽 KEEP 개(기본 2) 버전 · canary 컨테이너가 떠 있는 버전 · X.Y.Z 가 아닌 이름(손대지 않는다).
+# 지우기: AI_CANARY_PRUNE=apply (sudo AI_CANARY_PRUNE=apply @@PFX@@-golden-canary <이미지> <버전>). 그 밖에는 목록만 보여 준다.
+prune_old_canary() {
+  local keep=${AI_CANARY_KEEP:-2} mode=${AI_CANARY_PRUNE:-list} d v n=0 running
+  [[ $keep =~ ^[0-9]+$ ]] || { echo "  (AI_CANARY_KEEP 이 숫자가 아니다 — 정리 건너뜀)"; return 0; }
+  running=$(docker ps --format '{{.Names}}' 2>/dev/null | sed -n 's/^canary-\([0-9][0-9.]*\)-[ab]$/\1/p' | sort -u)
+  local all=() kept=()
+  for d in "$CROOT"/*/; do v=$(basename "$d"); [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -d ${d%/} && ! -L ${d%/} ]] && all+=("$v"); done
+  [[ " ${all[*]} " == *" $VER "* ]] || all+=("$VER")
+  mapfile -t kept < <(printf '%s\n' "${all[@]}" | sort -rV | head -n "$keep")
+  for v in "${all[@]}"; do
+    [[ $v == "$VER" || " ${kept[*]} " == *" $v "* ]] && continue
+    [[ -d $CROOT/$v ]] || continue
+    if grep -qx "$v" <<<"$running"; then echo "  (canary-$v 컨테이너가 떠 있어 $CROOT/$v 는 남김)"; continue; fi
+    n=$((n+1))
+    if [[ $mode == apply ]]; then rm -rf --one-file-system "${CROOT:?}/$v" && echo "  옛 canary 데이터 삭제: $v"
+    else echo "  옛 canary 데이터(정리 후보, 지우지 않음): $v  $(du -sh "$CROOT/$v" 2>/dev/null | cut -f1)"; fi
+  done
+  if [[ $mode != apply && $n -gt 0 ]]; then echo "  → 지우려면: sudo AI_CANARY_PRUNE=apply @@PFX@@-golden-canary $IMG $VER  (보존 기준: 이번 버전 + 높은 ${keep}개)"; fi
+}
+prune_old_canary
+# prune-end
+
+# ---- canary 데이터 (복제본만 만든다) --------------------------------
+rm -rf "$R"; install -d -m 0755 "$R"
+install -d -o $UID_M -g $GID_M -m 0750 "$R/a/home" "$R/a/workspace" \
+                                       "$R/b/home" "$R/b/workspace" "$R/b/home/.paseo"
+[[ -r "$SRC_CFG" ]] && install -o $UID_M -g $GID_M -m 0600 "$SRC_CFG" "$R/b/home/.paseo/config.json" \
+  || echo "  (설정 원본 없음 — canary b 도 빈 홈으로 돈다. CANARY_USER=<회원> 을 주면 그 회원의 ~/.paseo/config.json 을 복제한다)"
+
+MNT=(-v /opt/@@PFX@@/managed-mcp:/opt/@@PFX@@/managed-mcp:ro
+     -v /opt/@@PFX@@/managed-mcp/bin/@@PFX@@-mcp-sync:/usr/local/bin/@@PFX@@-mcp-sync:ro
+     -v /opt/@@PFX@@/api-catalog/bin/api-catalog-search:/usr/local/bin/api-catalog-search:ro
+     -v /srv/@@PFX@@/shared:/shared:ro)
+[[ -d /opt/@@PFX@@/api-catalog/data ]] && MNT+=(-v /opt/@@PFX@@/api-catalog/data:/opt/@@PFX@@/api-catalog/data:ro)
+start(){  # start <이름> <home> <workspace>
+  docker rm -f "$1" >/dev/null 2>&1
+  docker run -d --name "$1" --network "$NET" --env-file "$ENVF" \
+    -e AI_USER=$U -e AI_UID=$UID_M -e AI_GID=$GID_M -e @@PFX_UP@@_GID=$CLUB_GID \
+    -e TERM=xterm-256color \
+    --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+    -v "$2":/home/$U -v "$3":/workspace \
+    "${MNT[@]}" \
+    "$IMG" >/dev/null 2>&1
+}
+
+for c in a b; do
+  name="canary-$VER-$c"
+  echo "=== canary $c ($name) ==="
+  start "$name" "$R/$c/home" "$R/$c/workspace" && ok "기동" "$name" || { no "기동" "$name"; continue; }
+  sleep 20
+
+  # AGY 스킬은 «읽히는 경로» 에 있어야 한다. 옛 경로에 있으면 개수가 맞아도 인식은 0이다.
+  newp=$(inm "$name" 'ls ~/.gemini/config/skills 2>/dev/null | wc -l' | tr -d '\r')
+  oldp=$(inm "$name" 'ls ~/.gemini/skills 2>/dev/null | wc -l' | tr -d '\r')
+  [ "${newp:-0}" -ge 21 ] && ok "AGY 스킬 (config/skills)" "$newp" || no "AGY 스킬 (config/skills)" "$newp"
+  [ "${oldp:-0}" -eq 0 ]  && ok "옛 경로 비었음" || no "옛 경로 비었음" "$oldp 개 남음"
+  cl=$(inm "$name" 'ls ~/.claude/skills 2>/dev/null | wc -l' | tr -d '\r')
+  [ "${cl:-0}" -ge 21 ] && ok "Core Skills (claude)" "$cl" || no "Core Skills (claude)" "$cl"
+
+  # 0.5.5-wait-begin (2026-10-28): 20초에 한 번만 보면 데몬이 20~22초에 뜨는 서버에서 흔들린다 → 최대 60초 기다리며 뜬 시각을 적는다. 끝내 안 뜨면 FAIL.
+  st=""; t0=$SECONDS
+  while :; do
+    st=$(inm "$name" 'paseo status 2>&1 | head -20')
+    echo "$st" | grep -q "localDaemon: running" && break
+    [ $((SECONDS - t0)) -ge 40 ] && break
+    sleep 1
+  done
+  echo "$st" | grep -q "localDaemon: running" && ok "Paseo daemon (기동 직후)" "+$((20 + SECONDS - t0))초" || no "Paseo daemon (기동 직후)" "60초 안에 안 뜸"
+  # 0.5.5-wait-end
+  echo "$st" | grep -qiE "Invalid config|Worker exited" \
+    && no "config 오류 없음" "$(echo "$st" | grep -iE 'Invalid config|Worker exited' | head -1)" \
+    || ok "config 오류 없음"
+
+  if [ "$c" = b ] && [ -r "$SRC_CFG" ]; then
+    want=$(python3 -c "
+import json;d=json.load(open('$SRC_CFG'))
+print(' '.join(x['id'] for x in d['daemon']['terminalProfiles']))")
+    got=$(inm "$name" "python3 -c \"
+import json;d=json.load(open('/home/$U/.paseo/config.json'))
+print(' '.join(x['id'] for x in d['daemon']['terminalProfiles']))\"" | tr -d '\r')
+    [ "$want" = "$got" ] && ok "사용자 정의 프로파일 보존" "$got" || no "사용자 정의 프로파일 보존" "기대 [$want] 실측 [$got]"
+  fi
+
+  # 재생성 직후만 보지 말고 restart 후에도 본다 (0.4.0 사례)
+  docker restart "$name" >/dev/null 2>&1; sleep 20
+  st2=$(inm "$name" 'paseo status 2>&1 | head -20')
+  echo "$st2" | grep -qi stale && no "재기동 후 stale 없음" || ok "재기동 후 stale 없음"
+  echo "$st2" | grep -qiE "reachable|running" && ok "Paseo daemon (재기동 후)" || no "Paseo daemon (재기동 후)"
+  echo
+done
+
+echo "=== MCP 등록 (canary b) ==="
+# @@PFX@@-mcp-sync 는 entrypoint 가 자동 호출하지 않는다. 회원도 명시 실행이다.
+inm "canary-$VER-b" '@@PFX@@-mcp-sync' >/dev/null 2>&1
+m=$(inm "canary-$VER-b" 'claude mcp list 2>&1 | head -12')
+echo "$m" | sed 's/^/    /'
+for s in kordoc markitdown crawl4ai; do
+  echo "$m" | grep -qi "$s" && ok "MCP $s" || no "MCP $s"
+done
+
+echo
+printf "  === PASS %s · FAIL %s ===\n" "$pass" "$fail"
+echo "  canary 정리는 승격 후에 한다: docker rm -f canary-$VER-a canary-$VER-b"
+echo "  (canary 데이터 $R: 다음 실행이 보존 기준 밖 버전을 «목록으로» 보여 준다. 지우려면 AI_CANARY_PRUNE=apply 로 실행하거나 승격 뒤 sudo rm -rf $R)"
+[ "$fail" -eq 0 ]

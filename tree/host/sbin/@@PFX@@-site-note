@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""@@PFX@@-site-note <멤버> — 표준입력의 공개 상태 안내를 멤버 홈의 ~/.@@PFX@@/apps/.site 에 «멤버 권한으로» 쓴다.
+@@PFX@@-site-sync(3)가 매분 바뀐 멤버에게만 부른다. 쓰기는 기존 헬퍼 @@PFX@@-app-sync-member write 를 setpriv 로 멤버 uid 로 실행해 한다(root 가 멤버 폴더를 직접 만지지 않는다).
+환경(시험용): AI_SITE_NOTE_HOMES(기본 /home) · AI_SITE_NOTE_HELPER(기본 /usr/local/libexec/@@PFX@@-app-sync-member) · AI_SITE_NOTE_NO_SETPRIV=1"""
+import os, pwd, re, subprocess, sys
+
+HOMES = os.environ.get('AI_SITE_NOTE_HOMES', '/home')
+HELPER = os.environ.get('AI_SITE_NOTE_HELPER', '/usr/local/libexec/@@PFX@@-app-sync-member')
+if len(sys.argv) != 2 or not re.fullmatch(r'[a-z][a-z0-9-]{1,30}', sys.argv[1]):
+    sys.exit('사용: @@PFX@@-site-note <멤버>  (표준입력 = 안내 본문)')
+m = sys.argv[1]
+text = sys.stdin.read()[:4000]
+cmd = [HELPER, 'write', os.path.join(HOMES, m), '.site']
+if os.geteuid() == 0 and not os.environ.get('AI_SITE_NOTE_NO_SETPRIV'):   # NO_SETPRIV 는 시험용(root 로 시험을 돌릴 때 멤버 계정이 없다)
+    try:
+        pw = pwd.getpwnam(m)
+    except KeyError:
+        sys.exit(f'멤버 계정 없음: {m}')
+    cmd = ['setpriv', f'--reuid={pw.pw_uid}', f'--regid={pw.pw_gid}', '--init-groups', '--'] + cmd
+r = subprocess.run(cmd, input=text, text=True, capture_output=True, timeout=30)
+if r.returncode:
+    print(r.stderr.strip()[:200], file=sys.stderr)
+sys.exit(r.returncode)

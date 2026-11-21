@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/opt/@@PFX@@/config/dev-container.env"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-member-tmux-kill-all --yes"
+  exit 1
+fi
+
+if [[ $# -ne 1 || "$1" != "--yes" ]]; then
+  echo "Usage: @@PFX@@-member-tmux-kill-all --yes"
+  echo
+  echo "WARNING:"
+  echo "  This terminates ALL active tmux sessions for @@BRAND@@ members."
+  echo "  Claude, Codex and other processes running inside tmux will stop."
+  echo
+  echo "Run @@PFX@@-member-tmux-status first."
+  exit 1
+fi
+
+source "$CONFIG_FILE"
+
+KILLED_USERS=0
+KILLED_SESSIONS=0
+
+shopt -s nullglob
+
+echo "=============================================="
+echo " @@BRAND@@ Member tmux Kill All"
+echo "=============================================="
+echo
+
+for user_path in "$USER_ROOT_BASE"/*; do
+  [[ -d "$user_path" ]] || continue
+
+  username="$(basename "$user_path")"
+
+  excluded=0
+  for excluded_user in ${UPDATE_EXCLUDE_USERS:-}; do
+    if [[ "$username" == "$excluded_user" ]]; then
+      excluded=1
+      break
+    fi
+  done
+
+  (( excluded == 1 )) && continue
+
+  id "$username" >/dev/null 2>&1 || continue
+
+  container="dev-${username}"
+
+  docker container inspect "$container" >/dev/null 2>&1 || continue
+
+  state="$(docker inspect "$container" --format '{{.State.Status}}')"
+  [[ "$state" == "running" ]] || continue
+
+  uid="$(id -u "$username")"
+  gid="$(id -g "$username")"
+
+  sessions="$(
+    docker exec "$container" \
+      setpriv \
+      --reuid="$uid" \
+      --regid="$gid" \
+      --init-groups \
+      -- env \
+      HOME="/home/$username" \
+      USER="$username" \
+      LOGNAME="$username" \
+      tmux list-sessions -F '#S' 2>/dev/null || true
+  )"
+
+  [[ -n "$sessions" ]] || continue
+
+  count="$(printf '%s\n' "$sessions" | sed '/^$/d' | wc -l)"
+
+  echo "$username:"
+  printf '%s\n' "$sessions" | sed 's/^/  - /'
+
+  docker exec "$container" \
+    setpriv \
+    --reuid="$uid" \
+    --regid="$gid" \
+    --init-groups \
+    -- env \
+    HOME="/home/$username" \
+    USER="$username" \
+    LOGNAME="$username" \
+    tmux kill-server
+
+  KILLED_USERS=$((KILLED_USERS + 1))
+  KILLED_SESSIONS=$((KILLED_SESSIONS + count))
+
+  echo "  killed"
+  echo
+done
+
+echo "=============================================="
+echo " Complete"
+echo "=============================================="
+echo
+echo "Users affected:    $KILLED_USERS"
+echo "Sessions stopped:  $KILLED_SESSIONS"

@@ -1,0 +1,12 @@
+[Unit]
+Description=@@BRAND@@ weekly backup (DR snapshot + Portable Kit + Google Drive sync)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 이미지 archive(수십 GB)는 매주 돌리지 않는다 — 필요하면 수동: @@PFX@@-backup-run --images --drive
+ExecStart=/usr/local/sbin/@@PFX@@-backup-run --drive
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3h

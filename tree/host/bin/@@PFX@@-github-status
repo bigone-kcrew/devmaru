@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -eq 0 ]]; then
+  echo "ERROR: run as the member user, not root." >&2
+  exit 1
+fi
+
+echo "===== @@BRAND@@ GitHub Status ====="
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Git: MISSING"
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "GitHub CLI: MISSING"
+  exit 1
+fi
+
+echo "Git: $(git --version)"
+echo "GitHub CLI: $(gh --version | head -n 1)"
+echo "Home: $HOME"
+echo
+
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  echo "Status: NOT CONNECTED"
+  echo
+  echo "GitHub is optional."
+  echo "Connect only when you need repositories, push, issues, or pull requests."
+  echo
+  echo "To connect:"
+  echo "  @@PFX@@-github-connect"
+  exit 2
+fi
+
+LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
+NAME="$(gh api user --jq '.name // empty' 2>/dev/null || true)"
+PROTOCOL="$(gh config get git_protocol --host github.com 2>/dev/null || true)"
+
+echo "Status: CONNECTED"
+echo "Account: ${LOGIN:-unknown}"
+[[ -n "$NAME" ]] && echo "Name: $NAME"
+echo "Git protocol: ${PROTOCOL:-unknown}"
+echo
+echo "Ready for:"
+echo "  - Claude Code"
+echo "  - Codex"
+echo "  - Paseo sessions"
+echo "  - git clone / push"
+echo "  - gh repo / issue / pr"

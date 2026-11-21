@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# @@PFX@@-migrate (root) — 다른 서버로 옮기기. 파괴적이므로 에이전트 sudo 허용 목록에 넣지 않는다.
+#   옛 서버:  @@PFX@@-migrate export [--out 파일] [--passfile 암호파일]
+#   새 서버:  @@PFX@@-migrate import 파일 [--passfile 암호파일] [--plan|--apply] [--yes] [--with-site-env]
+# 묶음 = 설정·비밀·DB 덤프·회원 메타·SFTPGo·n8n 데이터를 tar 로 묶어 gpg 대칭 암호(AES256)로 암호화한 파일 하나.
+#   암호는 화면에 출력하지 않는다: --passfile(없으면 export 가 만들어 0600 으로 저장) 또는 입력 프롬프트.
+#   회원 workspace 같은 대용량은 묶음에 넣지 않는다 — export 가 rsync 명령을 안내한다.
+# import 는 --plan 이 기본. 접두어·킷·Golden 버전이 다르면 중단한다. 적용 순서: 서비스 정지 → 복원 → 기동 → doctor($PFX-restore 가 수행).
+set -uo pipefail
+PFX=@@PFX@@; O=/opt/$PFX; S=/srv/$PFX; E=/etc/$PFX; DATE=$(date +%Y%m%d-%H%M%S)
+die(){ echo "실패: $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "root 로 실행하세요(sudo)"
+MODE=${1:-}; shift || true
+OUT=""; PASSF=""; FILE=""; DO=plan; YES=0; SITEENV=0
+while [ $# -gt 0 ]; do case "$1" in
+  --out) OUT=${2:?}; shift;; --passfile) PASSF=${2:?}; shift;; --plan) DO=plan;; --apply) DO=apply;; --yes) YES=1;; --with-site-env) SITEENV=1;;
+  -h|--help) sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  -*) die "알 수 없는 옵션: $1";; *) FILE=$1;; esac; shift; done
+case "$MODE" in export|import) ;; -h|--help|"") sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 0;; *) die "export 또는 import (-h)";; esac
+command -v gpg >/dev/null 2>&1 || { apt-get -o DPkg::Lock::Timeout=120 install -y -qq gnupg >/dev/null 2>&1 || die "gnupg 설치 실패"; }
+WORK=$(mktemp -d "$S/backups/migrate.XXXXXX" 2>/dev/null) || { install -d -m 0700 "$S/backups"; WORK=$(mktemp -d "$S/backups/migrate.XXXXXX"); }
+chmod 0700 "$WORK"; PW=$WORK/.pw; trap 'rm -rf "$WORK"' EXIT
+
+getpass(){ # <export|import> → $PW (0600). 암호는 화면에 나오지 않는다
+  umask 077
+  if [ -n "$PASSF" ]; then
+    if [ -s "$PASSF" ]; then cp "$PASSF" "$PW"
+    elif [ "$1" = export ]; then ( umask 077; openssl rand -base64 33 > "$PASSF" ) && cp "$PASSF" "$PW" && echo "안내: 암호를 새로 만들어 $PASSF 에 저장했습니다(0600). 서버 밖 안전한 곳에 따로 보관하고, 묶음과 다른 경로로 전달하세요."
+    else die "암호 파일 $PASSF 가 없거나 비어 있습니다"; fi
+  else
+    [ -t 0 ] || die "대화형이 아니면 --passfile 이 필요합니다"
+    local a b; read -r -s -p "묶음 암호: " a </dev/tty; echo
+    if [ "$1" = export ]; then read -r -s -p "암호 확인: " b </dev/tty; echo; [ "$a" = "$b" ] || die "암호가 서로 다릅니다"; fi
+    [ "${#a}" -ge 12 ] || { [ "$1" = import ] || die "암호는 12자 이상"; }
+    printf '%s' "$a" > "$PW"
+  fi
+  [ -s "$PW" ] || die "암호가 비어 있습니다"
+}
+site(){ ( . "$E/site.env" 2>/dev/null; eval "printf '%s' \"\${$1:-}\"" ); }
+
+if [ "$MODE" = export ]; then
+  [ -r "$E/site.env" ] || die "$E/site.env 없음 — 이 서버에 $PFX 가 설치되어 있지 않습니다"
+  docker exec postgres pg_isready -U postgres >/dev/null 2>&1 || die "postgres 컨테이너가 응답하지 않습니다"
+  OUT=${OUT:-$S/backups/migrate-$PFX-$(hostname -s)-$DATE.mig}; [ -e "$OUT" ] && die "$OUT 가 이미 있습니다(덮어쓰지 않음)"
+  getpass export
+  ST=$WORK/stage; install -d -m 0700 "$ST"/{config/env,secrets,postgres/extra,sftpgo,n8n,config-extra,etc-$PFX,compose-env,accounts,meta}
+  echo "== 묶음 만들기(옛 서버: $(hostname -s))"
+  cp -a "$O"/config/dev-container.env "$O"/config/platform.env "$ST/config/"
+  find "$O/config/env" -maxdepth 1 -type f -name '*.env' ! -name '*.bak*' -exec cp -a {} "$ST/config/env/" \;
+  rsync -a --exclude=restic-repository-password "$E/secrets/" "$ST/secrets/"
+  rsync -a --exclude=secrets/ --exclude=backups/ --exclude='*.bak*' "$E/" "$ST/etc-$PFX/"
+  for d in members mcp-tokens memory agent-defaults; do [ -d "$O/config/$d" ] && rsync -a --exclude='*.bak*' "$O/config/$d/" "$ST/config-extra/$d/"; done
+  for f in "$O"/compose/*/.env; do [ -f "$f" ] && cp -a "$f" "$ST/compose-env/$(basename "$(dirname "$f")").env"; done
+  echo "성공: 설정·비밀·회원 메타·compose .env 담음"
+  docker exec postgres pg_dumpall -U postgres --globals-only > "$ST/postgres/globals.sql" || die "globals 덤프 실패"
+  DBS=$(docker exec postgres psql -U postgres -Atc "select datname from pg_database where not datistemplate order by 1")
+  for db in $DBS; do
+    t=$ST/postgres/$db.dump; case "$db" in postgres|n8n) ;; *) t=$ST/postgres/extra/$db.dump;; esac
+    docker exec postgres pg_dump -U postgres -Fc "$db" > "$t" && [ -s "$t" ] && docker exec -i postgres pg_restore -l < "$t" >/dev/null || die "DB $db 덤프 실패"
+  done
+  echo "성공: PostgreSQL 덤프 $(echo $DBS | wc -w)개($(echo $DBS))"
+  [ -f "$S/services/sftpgo/data/sftpgo.db" ] && { sqlite3 "$S/services/sftpgo/data/sftpgo.db" ".backup '$ST/sftpgo/sftpgo.db'" && [ "$(sqlite3 "$ST/sftpgo/sftpgo.db" 'PRAGMA integrity_check;')" = ok ] && echo "성공: SFTPGo DB" || die "SFTPGo DB 백업 실패"; }
+  [ -d "$S/services/n8n/data" ] && { rsync -a --exclude='*.log' --exclude=crash.journal --exclude='*.bak*' "$S/services/n8n/data/" "$ST/n8n/data/" && echo "성공: n8n 데이터"; }
+  ls -1 "$S/users" > "$ST/accounts/member-list.txt" 2>/dev/null
+  while read -r u; do getent passwd "$u"; done < "$ST/accounts/member-list.txt" > "$ST/accounts/passwd.txt"   # uid/gid 대응용(비밀번호 해시는 담지 않는다)
+  { echo "Created: $(date --iso-8601=seconds)"; echo "Hostname: $(hostname)"; echo "Kernel: $(uname -r)"; } > "$ST/meta/VERSIONS.txt"
+  { echo "PFX=$PFX"; echo "KIT_VERSION=$(cat /opt/devmaru-kit/VERSION 2>/dev/null || echo unknown)"; echo "GOLDEN_IMAGE=$(sed -n 's/^GOLDEN_IMAGE=//p' "$O/config/dev-container.env")"
+    echo "DOMAIN=$(site DOMAIN)"; echo "MODULES=\"$(site MODULES)\""; echo "CREATED=$(date +%s)"; } > "$ST/meta/MIGRATE-MANIFEST"
+  ( cd "$ST" && find . -type f ! -path ./meta/STAGE-SHA256SUMS -print0 | sort -z | xargs -0 sha256sum ) > "$ST/meta/STAGE-SHA256SUMS"
+  ( umask 077; tar -C "$ST" -cf - . | gpg --batch --yes --quiet --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-file "$PW" -o "$OUT" ) || die "암호화 실패"
+  chmod 0600 "$OUT"; echo "성공: 암호화 묶음 $OUT ($(du -h "$OUT" | cut -f1), sha256 $(sha256sum "$OUT" | cut -c1-16)…)"
+  echo; echo "== 옮겨야 할 것"
+  echo "1) 이 묶음 파일과 암호(--passfile 로 만든 파일)를 새 서버로 — 서로 다른 경로로 전달"
+  echo "2) 새 서버에 같은 접두어($PFX)·같은 킷 버전($(cat /opt/devmaru-kit/VERSION 2>/dev/null))으로 설치한 뒤: sudo $PFX-migrate import <묶음> --passfile <암호파일>   (기본은 --plan)"
+  echo "3) 대용량은 묶음에 없습니다. 새 서버에서 아래처럼 가져오세요(서비스 정지 후 마지막 한 번 더 실행하면 증분만 옮겨집니다):"
+  echo "   현재 크기: users $(du -sh "$S/users" 2>/dev/null | cut -f1) · shared $(du -sh "$S/shared" 2>/dev/null | cut -f1)"
+  echo "   sudo rsync -aHAX --numeric-ids --info=progress2 <옛서버>:$S/users/ $S/users/"
+  echo "   sudo rsync -aHAX --numeric-ids --info=progress2 <옛서버>:$S/shared/ $S/shared/"
+  echo "4) 회원 리눅스 계정·컨테이너는 묶음으로 되살리지 않습니다(회원 목록: 묶음 안 accounts/). 새 서버에서 sudo $PFX-member-add 로 만든 뒤 db 범위를 다시 복원하세요."
+  exit 0
+fi
+
+# ---- import
+[ -f "$FILE" ] || die "묶음 파일을 지정하세요: $PFX-migrate import <파일>"
+[ -r "$E/site.env" ] || die "$E/site.env 없음 — 새 서버에 먼저 같은 접두어로 설치하세요"
+getpass import
+ST=$WORK/stage; install -d -m 0700 "$ST"
+gpg --batch --quiet --decrypt --pinentry-mode loopback --passphrase-file "$PW" "$FILE" 2>/dev/null | tar -C "$ST" -xf - 2>/dev/null || die "복호화 실패 — 암호가 틀렸거나 파일이 손상되었습니다"
+M=$ST/meta/MIGRATE-MANIFEST; [ -f "$M" ] || die "묶음에 매니페스트가 없습니다"
+( cd "$ST" && sha256sum -c meta/STAGE-SHA256SUMS >/dev/null 2>&1 ) && echo "성공: 묶음 무결성(sha256) 확인" || die "묶음 무결성 검사 실패"
+mv_(){ sed -n "s/^$1=//p" "$M" | tr -d '"' | head -1; }
+BP=$(mv_ PFX); BK=$(mv_ KIT_VERSION); BG=$(mv_ GOLDEN_IMAGE); BD=$(mv_ DOMAIN); BM=$(mv_ MODULES)
+NK=$(cat /opt/devmaru-kit/VERSION 2>/dev/null || echo unknown); NG=$(sed -n 's/^GOLDEN_IMAGE=//p' "$O/config/dev-container.env"); ND=$(site DOMAIN); NM=$(site MODULES)
+echo "== 점검(옛 서버 → 이 서버)"; bad=0
+chk(){ # <이름> <옛> <새> <hard|warn>
+  if [ "$2" = "$3" ]; then echo "성공: $1 같음($3)"; else if [ "$4" = hard ]; then echo "실패: $1 불일치 — 묶음 $2 / 이 서버 $3"; bad=1; else echo "경고: $1 다름 — 묶음 $2 / 이 서버 $3"; fi; fi; }
+chk 접두어 "$BP" "$PFX" hard; chk 킷버전 "$BK" "$NK" hard; chk Golden이미지 "$BG" "$NG" hard
+chk 도메인 "$BD" "$ND" warn; [ "$BD" != "$ND" ] && echo "     ※ 도메인이 다르면 복원된 env(n8n.env 의 N8N_HOST 등)에 옛 도메인이 남습니다 — 적용 뒤 확인하세요"
+for m in $BM; do case " $NM " in *" $m "*) ;; *) echo "경고: 옛 서버 모듈 '$m' 이 이 서버에 없음 — 해당 데이터는 건너뜁니다/실패할 수 있음"; esac; done
+[ -n "$NG" ] && ! docker image inspect "$NG" >/dev/null 2>&1 && echo "경고: Golden 이미지 $NG 가 이 서버에 없음(설치 60단계 확인)"
+echo "묶음 생성: $(date -d "@$(mv_ CREATED)" '+%F %T' 2>/dev/null) · 회원 $(wc -l < "$ST/accounts/member-list.txt")명: $(tr '\n' ' ' < "$ST/accounts/member-list.txt")"
+[ "$bad" = 0 ] || die "접두어·킷·Golden 버전이 맞아야 가져올 수 있습니다 — 새 서버를 옛 서버와 같은 킷 버전으로 설치하세요"
+# 새 서버의 site.env(도메인·IP·포트)는 기본으로 유지한다
+if [ "$SITEENV" = 1 ]; then echo "안내: --with-site-env — site.env 도 묶음 값으로 덮어씁니다"; else
+  [ -f "$ST/etc-$PFX/site.env" ] && { echo "안내: site.env 는 이 서버 값을 유지합니다(차이는 아래 계획에 표시)"; cp "$ST/etc-$PFX/site.env" "$WORK/site.env.old"; rm -f "$ST/etc-$PFX/site.env"; }
+  [ -f "$WORK/site.env.old" ] && { echo "  -- site.env 차이(< 이 서버 · > 묶음, 비밀 없는 파일)"; diff "$E/site.env" "$WORK/site.env.old" | sed 's/^/     /' | head -30; }
+fi
+A=(all --from-dir "$ST"); [ "$DO" = apply ] && { A=(apply all --from-dir "$ST"); }
+if [ "$DO" = apply ] && [ "$YES" != 1 ]; then
+  [ -t 0 ] || die "대화형이 아니면 --yes 가 필요합니다"
+  "/usr/local/sbin/$PFX-restore" plan all --from-dir "$ST" || exit 1
+  PH="가져오기 $PFX"; echo; echo "경고: 이 서버의 현재 설정·DB 를 묶음 내용으로 덮어씁니다. 계속하려면 아래 문구를 입력하세요."
+  read -r -p "  $PH : " ans; [ "$ans" = "$PH" ] || die "승인 문구가 달라 취소했습니다"
+fi
+[ "$DO" = apply ] && A+=(--yes)
+"/usr/local/sbin/$PFX-restore" "${A[@]}"; rc=$?
+if [ "$DO" = plan ]; then echo; echo "안내: 계획만 표시했습니다. 적용: sudo $PFX-migrate import $FILE --passfile <암호파일> --apply"
+else echo; echo "남은 일: 회원 workspace 는 rsync 로(export 안내), 회원 계정은 sudo $PFX-member-add 로 만든 뒤 이 import 를 다시 --apply 하면 회원 DB 도 복원됩니다."; fi
+exit "$rc"

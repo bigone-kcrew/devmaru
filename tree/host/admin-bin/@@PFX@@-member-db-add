@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 멤버 공용 PostgreSQL 발급 — 네트워크 연결 · 역할/DB 생성 · 격리 · 검증을 한 번에.
+#
+# 왜 스크립트인가 (2026-09-21):
+#   수작업 4단계였을 때 «격리(REVOKE)» 를 빠뜨렸다. 문서에는 적혀 있었는데 실행을 안 했고,
+#   그 결과 한 멤버 DB 가 PUBLIC 에 CONNECT 가 열린 채로 남았다 — 다음에 발급할 멤버가
+#   그 DB 에 접속할 수 있는 상태였다. 사람이 기억해야 하는 단계는 언젠가 빠진다.
+#
+# 사용:
+#   @@PFX@@-member-db-add <username> [--db <dbname>] [--no-createdb] [--dry-run]
+
+PG_CONTAINER="${PG_CONTAINER:-postgres}"
+NET="${DB_NET:-db-clients}"
+PROTECTED_DBS="${PROTECTED_DBS:-$(grep -Eq "^MODULES=.*[ '\"]n8n[ '\"]" /etc/@@PFX@@/site.env 2>/dev/null && echo n8n || true)}"
+
+usage() { echo "usage: @@PFX@@-member-db-add <username> [--db <dbname>] [--no-createdb] [--dry-run]" >&2; exit 2; }
+
+USER_NAME=""; DB_NAME=""; CREATEDB=1; DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --db) DB_NAME="${2:-}"; shift 2 ;;
+    --no-createdb) CREATEDB=0; shift ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) usage ;;
+    -*) echo "ERROR: unknown option: $1" >&2; usage ;;
+    *) [ -n "$USER_NAME" ] && usage; USER_NAME="$1"; shift ;;
+  esac
+done
+[ -n "$USER_NAME" ] || usage
+[ -n "$DB_NAME" ] || DB_NAME="${USER_NAME}_db"
+CONTAINER="dev-${USER_NAME}"
+
+# 역할·DB 이름은 SQL 에 그대로 들어간다. 식별자로 안전한 문자만 허용한다.
+case "$USER_NAME$DB_NAME" in
+  *[!a-zA-Z0-9_]*) echo "ERROR: 이름에 영숫자와 밑줄만 쓸 수 있습니다: $USER_NAME / $DB_NAME" >&2; exit 1 ;;
+esac
+
+psql_q() { docker exec "$PG_CONTAINER" psql -U postgres -tAc "$1"; }
+run()    { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
+
+echo "===== PRECHECK ====="
+command -v docker >/dev/null 2>&1 || { echo "ERROR: docker 없음" >&2; exit 1; }
+docker inspect "$PG_CONTAINER" >/dev/null 2>&1 || { echo "ERROR: 컨테이너 없음: $PG_CONTAINER" >&2; exit 1; }
+docker inspect "$CONTAINER"    >/dev/null 2>&1 || { echo "ERROR: 멤버 컨테이너 없음: $CONTAINER" >&2; exit 1; }
+docker network inspect "$NET"  >/dev/null 2>&1 || { echo "ERROR: 네트워크 없음: $NET (docker network create $NET)" >&2; exit 1; }
+psql_q 'select 1' >/dev/null || { echo "ERROR: postgres 응답 없음" >&2; exit 1; }
+
+if [ "$(psql_q "select count(*) from pg_roles where rolname='$USER_NAME'")" != "0" ]; then
+  echo "ERROR: 역할이 이미 있습니다: $USER_NAME" >&2
+  echo "       암호 재설정은 ALTER ROLE ... PASSWORD 로 따로 하세요(이 스크립트는 덮어쓰지 않습니다)." >&2
+  exit 1
+fi
+if [ "$(psql_q "select count(*) from pg_database where datname='$DB_NAME'")" != "0" ]; then
+  echo "ERROR: DB 가 이미 있습니다: $DB_NAME" >&2; exit 1
+fi
+echo "PASS  container=$CONTAINER  role=$USER_NAME  db=$DB_NAME  createdb=$CREATEDB"
+
+echo
+echo "===== 1. NETWORK ====="
+if docker inspect "$CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -qw "$NET"; then
+  echo "SKIP  이미 $NET 에 연결됨"
+else
+  run docker network connect "$NET" "$CONTAINER"
+  echo "OK    $CONTAINER → $NET"
+fi
+if ! docker inspect "$PG_CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -qw "$NET"; then
+  run docker network connect "$NET" "$PG_CONTAINER"
+  echo "OK    $PG_CONTAINER → $NET (최초 1회)"
+fi
+
+echo
+echo "===== 2. ROLE / DATABASE ====="
+PW="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)"
+if [ "$DRY" = 1 ]; then
+  echo "  [dry-run] CREATE ROLE $USER_NAME LOGIN PASSWORD '<생성됨>'"
+  echo "  [dry-run] CREATE DATABASE $DB_NAME OWNER $USER_NAME"
+else
+  docker exec "$PG_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "CREATE ROLE \"$USER_NAME\" LOGIN PASSWORD '$PW'" >/dev/null
+  [ "$CREATEDB" = 1 ] && docker exec "$PG_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "ALTER ROLE \"$USER_NAME\" CREATEDB" >/dev/null
+  docker exec "$PG_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "CREATE DATABASE \"$DB_NAME\" OWNER \"$USER_NAME\"" >/dev/null
+  echo "OK    role=$USER_NAME  db=$DB_NAME"
+fi
+
+echo
+echo "===== 3. ISOLATION ====="
+# 🔴 새로 만든 DB 는 기본값이라 PUBLIC 에 CONNECT 가 열려 있다. 반드시 회수한다.
+for d in $DB_NAME $PROTECTED_DBS; do
+  if [ "$DRY" = 1 ]; then echo "  [dry-run] REVOKE CONNECT ON DATABASE $d FROM PUBLIC"; continue; fi
+  docker exec "$PG_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 \
+    -c "REVOKE CONNECT ON DATABASE \"$d\" FROM PUBLIC" >/dev/null
+  acl="$(psql_q "select coalesce(array_to_string(datacl,','),'') from pg_database where datname='$d'")"
+  case "$acl" in
+    *"=Tc/"*) echo "FAIL  $d — CONNECT 가 아직 열려 있습니다: $acl" >&2; exit 1 ;;
+    "")       echo "FAIL  $d — datacl 이 비어 있습니다(회수 실패)" >&2; exit 1 ;;
+    *)        echo "OK    $d  $acl" ;;
+  esac
+done
+
+[ "$DRY" = 1 ] && { echo; echo "dry-run 종료 — 아무것도 바꾸지 않았습니다."; exit 0; }
+
+echo
+echo "===== 4. VERIFY ====="
+own="$(docker exec -e PGPASSWORD="$PW" "$CONTAINER" psql -h "$PG_CONTAINER" -U "$USER_NAME" -d "$DB_NAME" -tAc 'select current_database()' 2>&1 | tail -1)"
+[ "$own" = "$DB_NAME" ] && echo "OK    본인 DB 접속: $own" || { echo "FAIL  본인 DB 접속 실패: $own" >&2; exit 1; }
+
+for d in $PROTECTED_DBS; do
+  out="$(docker exec -e PGPASSWORD="$PW" "$CONTAINER" psql -h "$PG_CONTAINER" -U "$USER_NAME" -d "$d" -tAc 'select 1' 2>&1 | tail -2 || true)"
+  case "$out" in
+    *"does not have CONNECT privilege"*) echo "OK    $d 차단 확인" ;;
+    *) echo "FAIL  $d 가 차단되지 않았습니다: $out" >&2; exit 1 ;;
+  esac
+done
+
+echo
+echo "===== RESULT PASS ====="
+cat <<EOF
+
+멤버에게 전달할 접속 정보 (암호는 이 화면에만 나옵니다):
+
+  PGHOST=$PG_CONTAINER
+  PGPORT=5432
+  PGUSER=$USER_NAME
+  PGDATABASE=$DB_NAME
+  PGPASSWORD=$PW
+
+암호를 문서나 git 에 남기지 말고 당사자에게 직접 전달하세요.
+멤버용 규약: /srv/@@PFX@@/shared/documents/DB_ACCESS_규약.md
+EOF

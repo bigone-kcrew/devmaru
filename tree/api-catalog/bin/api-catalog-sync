@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path("/opt/@@PFX@@/api-catalog")
+SRC_ROOT = ROOT / "src"
+DATA_ROOT = ROOT / "data"
+REPORT_ROOT = ROOT / "reports"
+
+REPO_URL = "https://github.com/yybmion/public-apis-4Kr.git"
+REPO_DIR = SRC_ROOT / "public-apis-4Kr"
+
+CATALOG_JSON = DATA_ROOT / "catalog.json"
+CATALOG_NDJSON = DATA_ROOT / "catalog.ndjson"
+SOURCE_STATE = DATA_ROOT / "source-state.json"
+DIFF_REPORT = REPORT_ROOT / "sync-diff.json"
+
+
+def run(*args, cwd=None):
+    return subprocess.check_output(
+        list(args),
+        cwd=cwd,
+        text=True,
+        stderr=subprocess.STDOUT,
+    ).strip()
+
+
+def atomic_write_text(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        delete=False,
+    ) as f:
+        f.write(content)
+        tmp = Path(f.name)
+
+    tmp.chmod(0o644)
+    tmp.replace(path)
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def stable_id(source: str, name: str) -> str:
+    raw = f"{source}\n{name.casefold()}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def ensure_repo():
+    SRC_ROOT.mkdir(parents=True, exist_ok=True)
+
+    if not (REPO_DIR / ".git").exists():
+        if REPO_DIR.exists():
+            shutil.rmtree(REPO_DIR)
+
+        print("Cloning upstream...")
+        subprocess.check_call([
+            "git", "clone",
+            "--depth", "1",
+            REPO_URL,
+            str(REPO_DIR),
+        ])
+        return
+
+    print("Fetching upstream...")
+    subprocess.check_call(
+        ["git", "fetch", "--depth", "1", "origin", "main"],
+        cwd=REPO_DIR,
+    )
+    subprocess.check_call(
+        ["git", "reset", "--hard", "origin/main"],
+        cwd=REPO_DIR,
+    )
+
+
+def parse_readme():
+    readme = REPO_DIR / "README.md"
+    if not readme.exists():
+        raise RuntimeError(f"README missing: {readme}")
+
+    lines = readme.read_text(encoding="utf-8").splitlines()
+
+    category = ""
+    entries = []
+
+    for lineno, line in enumerate(lines, start=1):
+        if line.startswith("### "):
+            category = normalize_text(line[4:])
+            continue
+
+        if not line.startswith("|"):
+            continue
+
+        cells = [normalize_text(x) for x in line.split("|")[1:-1]]
+
+        if len(cells) != 3:
+            continue
+
+        if cells[0].lower() == "api":
+            continue
+
+        if set(cells[0].replace(" ", "")) <= {"-"}:
+            continue
+
+        match = re.search(
+            r"\[([^\]]+)\]\((https?://[^)]+)\)",
+            cells[0],
+        )
+        if not match:
+            continue
+
+        name = normalize_text(match.group(1))
+        url = normalize_text(match.group(2))
+        description = normalize_text(cells[1])
+
+        auth = normalize_text(cells[2])
+        auth = auth.strip("`").strip()
+
+        entry = {
+            "id": stable_id("public-apis-4Kr", name),
+            "name": name,
+            "category": category or None,
+            "description": description or None,
+            "auth": auth or None,
+            "url": url,
+            "source": {
+                "name": "public-apis-4Kr",
+                "repository": REPO_URL,
+                "line": lineno,
+            },
+        }
+
+        entries.append(entry)
+
+    return entries
+
+
+def validate(entries):
+    if not entries:
+        raise RuntimeError("catalog is empty")
+
+    ids = set()
+    keys = set()
+
+    for entry in entries:
+        if not entry["name"]:
+            raise RuntimeError("entry without name")
+
+        if not entry["url"].startswith(("http://", "https://")):
+            raise RuntimeError(f"invalid URL: {entry['url']}")
+
+        if entry["id"] in ids:
+            raise RuntimeError(f"duplicate ID: {entry['id']}")
+        ids.add(entry["id"])
+
+        semantic_key = (
+            entry["name"].casefold(),
+            entry["url"].casefold(),
+        )
+        if semantic_key in keys:
+            raise RuntimeError(
+                f"duplicate entry: {entry['name']} {entry['url']}"
+            )
+        keys.add(semantic_key)
+
+
+def build_diff(old_entries, new_entries):
+    old_by_id = {x["id"]: x for x in old_entries}
+    new_by_id = {x["id"]: x for x in new_entries}
+
+    added_ids = sorted(set(new_by_id) - set(old_by_id))
+    removed_ids = sorted(set(old_by_id) - set(new_by_id))
+    common_ids = sorted(set(old_by_id) & set(new_by_id))
+
+    changed = []
+
+    compare_fields = [
+        "name",
+        "category",
+        "description",
+        "auth",
+        "url",
+    ]
+
+    for entry_id in common_ids:
+        old = old_by_id[entry_id]
+        new = new_by_id[entry_id]
+
+        delta = {}
+        for field in compare_fields:
+            if old.get(field) != new.get(field):
+                delta[field] = {
+                    "old": old.get(field),
+                    "new": new.get(field),
+                }
+
+        if delta:
+            changed.append({
+                "id": entry_id,
+                "name": new["name"],
+                "changes": delta,
+            })
+
+    return {
+        "added": [
+            {
+                "id": x,
+                "name": new_by_id[x]["name"],
+                "url": new_by_id[x]["url"],
+            }
+            for x in added_ids
+        ],
+        "removed": [
+            {
+                "id": x,
+                "name": old_by_id[x]["name"],
+                "url": old_by_id[x]["url"],
+            }
+            for x in removed_ids
+        ],
+        "changed": changed,
+    }
+
+
+def main():
+    ensure_repo()
+
+    commit = run("git", "rev-parse", "HEAD", cwd=REPO_DIR)
+    commit_time = run(
+        "git",
+        "log",
+        "-1",
+        "--format=%cI",
+        cwd=REPO_DIR,
+    )
+
+    entries = parse_readme()
+    validate(entries)
+
+    for entry in entries:
+        entry["source"]["commit"] = commit
+
+    old_catalog = load_json(CATALOG_JSON, {})
+    old_entries = old_catalog.get("entries", [])
+
+    diff = build_diff(old_entries, entries)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    catalog = {
+        "schema_version": 1,
+        "generated_at": now,
+        "source": {
+            "name": "public-apis-4Kr",
+            "repository": REPO_URL,
+            "commit": commit,
+            "commit_time": commit_time,
+            "entry_count": len(entries),
+        },
+        "entries": entries,
+    }
+
+    ndjson = "".join(
+        json.dumps(x, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for x in entries
+    )
+
+    source_state = {
+        "schema_version": 1,
+        "source": "public-apis-4Kr",
+        "repository": REPO_URL,
+        "branch": "main",
+        "commit": commit,
+        "commit_time": commit_time,
+        "synced_at": now,
+        "entry_count": len(entries),
+    }
+
+    diff_report = {
+        "schema_version": 1,
+        "generated_at": now,
+        "source_commit": commit,
+        "previous_entry_count": len(old_entries),
+        "current_entry_count": len(entries),
+        "summary": {
+            "added": len(diff["added"]),
+            "removed": len(diff["removed"]),
+            "changed": len(diff["changed"]),
+        },
+        **diff,
+    }
+
+    atomic_write_text(
+        CATALOG_JSON,
+        json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+    )
+    atomic_write_text(CATALOG_NDJSON, ndjson)
+    atomic_write_text(
+        SOURCE_STATE,
+        json.dumps(source_state, ensure_ascii=False, indent=2) + "\n",
+    )
+    atomic_write_text(
+        DIFF_REPORT,
+        json.dumps(diff_report, ensure_ascii=False, indent=2) + "\n",
+    )
+
+    print("===== API CATALOG SYNC =====")
+    print(f"COMMIT={commit}")
+    print(f"ENTRIES={len(entries)}")
+    print(f"ADDED={len(diff['added'])}")
+    print(f"REMOVED={len(diff['removed'])}")
+    print(f"CHANGED={len(diff['changed'])}")
+    print("RESULT=PASS")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        print(e.output or str(e), file=sys.stderr)
+        sys.exit(e.returncode or 1)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)

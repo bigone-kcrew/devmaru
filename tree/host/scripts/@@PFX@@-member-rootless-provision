@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER_NAME=${1:?usage: sudo $0 <member>}
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo $0 <member>" >&2
+  exit 1
+fi
+if ! id "$USER_NAME" >/dev/null 2>&1; then
+  echo "ERROR: unknown user: $USER_NAME" >&2
+  exit 1
+fi
+
+UID_NUM=$(id -u "$USER_NAME")
+HOME_DIR=$(getent passwd "$USER_NAME" | cut -d: -f6)
+DATA_ROOT="/srv/@@PFX@@/nvme/members/${USER_NAME}/docker"
+SOCKET="/run/user/${UID_NUM}/docker.sock"
+CONTEXT="${USER_NAME}-rootless"
+
+for cmd in newuidmap newgidmap slirp4netns fuse-overlayfs dockerd-rootless.sh dockerd-rootless-setuptool.sh runuser; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: missing command: $cmd" >&2; exit 1; }
+done
+grep -q "^${USER_NAME}:" /etc/subuid || { echo "ERROR: no subuid range" >&2; exit 1; }
+grep -q "^${USER_NAME}:" /etc/subgid || { echo "ERROR: no subgid range" >&2; exit 1; }
+
+install -d -o "$USER_NAME" -g "$USER_NAME" -m 0700 "$DATA_ROOT"
+install -d -o "$USER_NAME" -g "$USER_NAME" -m 0700 "$HOME_DIR/.config/docker"
+CONFIG="$HOME_DIR/.config/docker/daemon.json"
+if [[ -e "$CONFIG" ]]; then
+  echo "ERROR: refusing to overwrite existing $CONFIG" >&2
+  exit 1
+fi
+printf '%s\n' "{\"data-root\":\"$DATA_ROOT\",\"storage-driver\":\"fuse-overlayfs\"}" | runuser -u "$USER_NAME" -- tee "$CONFIG" >/dev/null
+chown "$USER_NAME:$USER_NAME" "$CONFIG"
+chmod 0600 "$CONFIG"
+
+loginctl enable-linger "$USER_NAME"
+runuser -u "$USER_NAME" -- env HOME="$HOME_DIR" XDG_RUNTIME_DIR="/run/user/$UID_NUM" DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns dockerd-rootless-setuptool.sh install
+
+if ! runuser -u "$USER_NAME" -- env HOME="$HOME_DIR" XDG_RUNTIME_DIR="/run/user/$UID_NUM" docker context inspect "$CONTEXT" >/dev/null 2>&1; then
+  runuser -u "$USER_NAME" -- env HOME="$HOME_DIR" XDG_RUNTIME_DIR="/run/user/$UID_NUM" docker context create "$CONTEXT" --docker "host=unix://$SOCKET" >/dev/null
+fi
+
+runuser -u "$USER_NAME" -- env HOME="$HOME_DIR" XDG_RUNTIME_DIR="/run/user/$UID_NUM" DOCKER_HOST="unix://$SOCKET" docker info >/dev/null
+echo "ROOTLESS PASS"
+echo "member=$USER_NAME"
+echo "data_root=$DATA_ROOT"
+echo "socket=$SOCKET"
+echo "context=$CONTEXT"

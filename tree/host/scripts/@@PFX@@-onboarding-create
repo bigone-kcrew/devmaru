@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-onboarding-create <username>"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-onboarding-create <username>"
+  exit 1
+fi
+
+USERNAME="$1"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+ONBOARDING_DIR="/srv/@@PFX@@/onboarding/${USERNAME}"
+
+if [[ ! -d "$ONBOARDING_DIR" ]]; then
+  echo "ERROR: onboarding directory not found: $ONBOARDING_DIR"
+  exit 1
+fi
+
+for file in pairing.json pairing-url.txt pairing.png; do
+  if [[ ! -f "$ONBOARDING_DIR/$file" ]]; then
+    echo "ERROR: missing artifact: $file"
+    exit 1
+  fi
+done
+
+GENERATED_AT="$(date --iso-8601=seconds)"
+
+cat > "${ONBOARDING_DIR}/README.md" <<EOF2
+# @@BRAND@@ Onboarding
+
+## Member
+
+${USERNAME}
+
+## Container
+
+dev-${USERNAME}
+
+## Workspace
+
+/srv/@@PFX@@/users/${USERNAME}/workspace
+
+## Getting Started
+
+https://@@PORTAL_HOST@@/
+
+## Paseo Connection
+
+1. Open Paseo application.
+2. Scan \`pairing.png\`.
+3. Or use \`pairing-url.txt\`.
+
+## Resources
+
+- Skills Hub: https://@@PORTAL_HOST@@/skills/
+- Tools Hub: https://@@PORTAL_HOST@@/tools/
+- Files: https://@@FILES_HOST@@/
+- Service Status: https://@@UPTIME_HOST@@/
+
+## Generated
+
+$(date --iso-8601=seconds)
+EOF2
+
+chown root:@@PFX@@ "${ONBOARDING_DIR}/README.md"
+chmod 640 "${ONBOARDING_DIR}/README.md"
+
+echo "Onboarding document created:"
+echo "${ONBOARDING_DIR}/README.md"

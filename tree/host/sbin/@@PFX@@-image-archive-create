@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# script-rev: 2026-11-04 v1
+# 로컬 빌드 이미지(Golden · kordoc · @@PFX@@-* )를 docker save → zstd 로 묶는다.
+# 출력 이름은 @@PFX@@-backup-gdrive-sync 가 «최신» 으로 고르는 @@PFX_UP@@-GOLDEN-IMAGES-*.tar.zst 와 같다.
+#   사용: @@PFX@@-image-archive-create [--plan]
+#         --plan   아무것도 쓰지 않고 대상 이미지 · 예상 크기 · 여유 공간만 출력
+# 공개 이미지(n8n · sftpgo · caddy · ollama · crawl4ai 등)는 pull 로 되살릴 수 있어 기본 제외.
+#   포함하려면 /etc/@@PFX@@/image-archive.extra 에 한 줄에 이미지 하나(image:tag)를 적는다.
+set -euo pipefail
+
+OUT_DIR="/srv/@@PFX@@/backups/docker-images"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+ARCHIVE="$OUT_DIR/@@PFX_UP@@-GOLDEN-IMAGES-$STAMP.tar.zst"
+EXTRA="/etc/@@PFX@@/image-archive.extra"
+ENVFILE="/opt/@@PFX@@/config/dev-container.env"
+LOCAL_RE='^(@@PFX@@-|kordoc:)'
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+pass() { echo "PASS: $*"; }
+warn() { echo "WARN: $*" >&2; }
+
+PLAN=0
+for a in "$@"; do
+  case "$a" in
+    --plan) PLAN=1 ;;
+    *) fail "unknown argument: $a" ;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+for c in docker zstd jq; do command -v "$c" >/dev/null 2>&1 || fail "$c missing"; done
+
+echo '===== IMAGE ARCHIVE ====='
+
+# ---- 대상
+GOLDEN="$(sed -n 's/^GOLDEN_IMAGE=//p' "$ENVFILE" | head -1)"
+[ -n "$GOLDEN" ] || fail "GOLDEN_IMAGE not found in $ENVFILE"
+docker image inspect "$GOLDEN" >/dev/null 2>&1 || fail "golden image missing locally: $GOLDEN"
+
+IMAGES=("$GOLDEN")
+while IFS= read -r im; do
+  case "$im" in @@PFX@@-dev:*) continue ;; esac   # 옛 Golden 태그는 제외 — 현재 포인터만
+  IMAGES+=("$im")
+done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | grep -E "$LOCAL_RE" | sort -u)
+
+if [ -f "$EXTRA" ]; then
+  while IFS= read -r im; do
+    case "$im" in ''|\#*) continue ;; esac
+    docker image inspect "$im" >/dev/null 2>&1 || fail "extra image missing locally: $im"
+    IMAGES+=("$im")
+  done < "$EXTRA"
+fi
+
+mapfile -t IMAGES < <(printf '%s\n' "${IMAGES[@]}" | sort -u)
+
+RAW=0
+echo
+echo "대상 이미지 (${#IMAGES[@]}개):"
+for im in "${IMAGES[@]}"; do
+  sz="$(docker image inspect --format '{{.Size}}' "$im")"
+  RAW=$((RAW + sz))
+  printf '  %-52s %8s MB\n' "$im" "$((sz / 1048576))"
+done
+echo "원본 합계: $((RAW / 1073741824)).$(( (RAW % 1073741824) * 10 / 1073741824 )) GB (압축 후 대략 절반)"
+
+install -d -o root -g root -m 0755 "$OUT_DIR"
+FREE=$(df --output=avail -B1 "$OUT_DIR" | tail -1 | tr -d ' ')
+NEED=$((RAW * 7 / 10 + 2147483648))
+echo "여유 공간: $((FREE / 1073741824)) GB · 필요(추정): $((NEED / 1073741824)) GB"
+[ "$FREE" -ge "$NEED" ] || fail "디스크 여유 부족"
+
+echo
+echo "기존 archive:"
+ls -1t "$OUT_DIR"/@@PFX_UP@@-GOLDEN-IMAGES-*.tar.zst 2>/dev/null | head -5 | while read -r f; do
+  printf '  %s  %s MB\n' "$(basename "$f")" "$(( $(stat -c %s "$f") / 1048576 ))"
+done || true
+
+if [ "$PLAN" = 1 ]; then
+  echo
+  echo "PLAN: docker save ${#IMAGES[@]}개 → zstd -T4 → $ARCHIVE"
+  echo 'RESULT: PLAN-ONLY'
+  exit 0
+fi
+
+# ---- 생성 (서버 부하를 줄이려 CPU 4개·낮은 우선순위로 압축)
+echo
+echo "생성 중: $ARCHIVE (수 분~십수 분 걸린다)"
+trap 'rm -f "$ARCHIVE.part"' EXIT
+docker save "${IMAGES[@]}" | nice -n 10 zstd -T4 -3 -q -o "$ARCHIVE.part"
+mv "$ARCHIVE.part" "$ARCHIVE"
+trap - EXIT
+
+# ---- 검증: zstd 스트림 · manifest 의 태그가 요청한 목록과 같은가
+zstd -t -q "$ARCHIVE" || fail "zstd stream test failed"
+pass "zstd stream"
+
+TAGS="$(zstd -dc "$ARCHIVE" | tar -xOf - manifest.json | jq -r '.[].RepoTags[]?' | sort -u)"
+MISSING=0
+for im in "${IMAGES[@]}"; do
+  echo "$TAGS" | grep -Fxq "$im" || { echo "MISSING in archive: $im"; MISSING=1; }
+done
+[ "$MISSING" = 0 ] || fail "manifest RepoTags 에 요청한 이미지가 모두 있지 않다"
+pass "manifest RepoTags (${#IMAGES[@]}개 모두 포함)"
+
+sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"     # 절대경로를 기록한다(@@PFX@@-backup-gdrive-sync 가 그대로 -c 로 검증)
+{
+  echo "Created: $(date --iso-8601=seconds)"
+  for im in "${IMAGES[@]}"; do echo "$im $(docker image inspect --format '{{.Id}}' "$im")"; done
+} > "$ARCHIVE.images.txt"
+chmod 0600 "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.images.txt"
+
+echo
+echo '================================='
+echo 'Image Archive Complete'
+echo '================================='
+echo "Archive:  $ARCHIVE ($(( $(stat -c %s "$ARCHIVE") / 1048576 )) MB)"
+echo "Checksum: $ARCHIVE.sha256"
+echo
+echo 'RESULT: PASS'

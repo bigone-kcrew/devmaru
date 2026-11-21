@@ -1,0 +1,12 @@
+
+# 모듈: smb (SMB over QUIC 인증서 발급용 80 포트 챌린지)
+http://@@SMB_HOST@@ {
+	import access_log
+	handle /.well-known/acme-challenge/* {
+		root * /var/lib/@@PFX@@/acme-webroot
+		file_server
+	}
+	handle {
+		respond 404
+	}
+}

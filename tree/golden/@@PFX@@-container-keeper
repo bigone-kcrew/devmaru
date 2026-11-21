@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+shutdown_started=0
+sleep_pid=""
+
+# @@BRAND@@ MCP 허브(컨테이너당 하나): 원격 MCP·memory·crawl4ai 를 세션들이 나눠 쓴다.
+# 허브가 죽으면 15초 안에 다시 띄운다. 파일이 없거나 DISABLED 가 있으면 띄우지 않는다(stdio 로 되돌림).
+HUB=/opt/@@PFX@@/managed-mcp/hub/hub.mjs
+HUB_OFF=/opt/@@PFX@@/managed-mcp/hub/DISABLED
+HUB_LOG=/tmp/@@PFX@@-mcp-hub.log
+hub_pid=""
+hub_state=""
+
+stop_hub() {
+    if [[ -n "${hub_pid}" ]]; then
+        kill "${hub_pid}" 2>/dev/null || true
+        hub_pid=""
+    fi
+}
+
+# 허브가 뜨거나 꺼질 때 한 번, 등록(Claude·Codex·Antigravity)을 새 상태에 맞춘다.
+sync_mcp() {
+    if [[ "${hub_state}" == on ]]; then
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS -m 2 http://127.0.0.1:18940/healthz >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+    if command -v @@PFX@@-mcp-sync >/dev/null 2>&1; then
+        @@PFX@@-mcp-sync >>"${HUB_LOG}" 2>&1 || true
+    fi
+}
+
+ensure_hub() {
+    local want=on
+    if [[ ! -f "${HUB}" || -e "${HUB_OFF}" ]]; then
+        want=off
+    fi
+    if [[ "${want}" == on ]]; then
+        # 이미 응답하는 허브(entrypoint 가 Paseo 보다 먼저 띄운 것)는 새로 띄우지 않고 이어받는다.
+        if { [[ -z "${hub_pid}" ]] || ! kill -0 "${hub_pid}" 2>/dev/null; } \
+            && ! curl -fsS -m 2 http://127.0.0.1:18940/healthz >/dev/null 2>&1; then
+            node "${HUB}" >>"${HUB_LOG}" 2>&1 &
+            hub_pid=$!
+            hub_state=""
+        fi
+    else
+        stop_hub
+    fi
+    if [[ "${want}" != "${hub_state}" ]]; then
+        hub_state="${want}"
+        sync_mcp &
+    fi
+}
+
+shutdown_container() {
+    local signal="${1:-TERM}"
+
+    if (( shutdown_started )); then
+        return 0
+    fi
+    shutdown_started=1
+
+    # Prevent a second signal from re-entering the shutdown handler.
+    trap - TERM INT HUP
+
+    echo "[@@PFX@@-container-keeper] ${signal} received; stopping member services..." >&2
+
+    if [[ -n "${sleep_pid}" ]]; then
+        kill "${sleep_pid}" 2>/dev/null || true
+    fi
+
+    stop_hub
+
+    if command -v paseo >/dev/null 2>&1; then
+        if paseo daemon stop --timeout 15 >/dev/null 2>&1; then
+            echo "[@@PFX@@-container-keeper] Paseo daemon stopped gracefully." >&2
+        else
+            echo "[@@PFX@@-container-keeper] WARNING: Paseo graceful stop did not complete." >&2
+        fi
+    fi
+
+    echo "[@@PFX@@-container-keeper] shutdown complete." >&2
+    exit 0
+}
+
+trap 'shutdown_container TERM' TERM
+trap 'shutdown_container INT'  INT
+trap 'shutdown_container HUP'  HUP
+
+# 컨테이너가 시작할 때마다: 멤버 개별 설치본(~/.local/bin/<cli>)이 Golden 보다 낮으면 그 심링크만 치워
+# Golden 이 쓰이게 한다. 같거나 높으면 그대로 둔다(개별 업데이트 허용). 패키지(~/.local/lib)는 지우지 않는다.
+# 심링크가 ~/.local/lib 밖(예: workspace)을 가리키거나 버전을 못 읽으면 건드리지 않는다.
+prefer_newer_cli() {
+    local name="$1" golden="/usr/bin/$1" link="${HOME}/.local/bin/$1" lv gv
+
+    [[ -L "${link}" ]] || return 0
+    if [[ "$(readlink -f "${link}")" != "${HOME}/.local/lib/"* ]]; then
+        echo "[@@PFX@@-container-keeper] ${name}: ${link} 가 ~/.local/lib 밖을 가리켜 건너뜀." >&2
+        return 0
+    fi
+
+    gv="$(timeout 20 "${golden}" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    lv="$(timeout 20 "${link}" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    if [[ -z "${gv}" || -z "${lv}" ]]; then
+        echo "[@@PFX@@-container-keeper] ${name}: 버전 확인 실패(golden=${gv:-?} local=${lv:-?}); 건너뜀." >&2
+        return 0
+    fi
+
+    if [[ "${lv}" != "${gv}" && "$(printf '%s\n%s\n' "${lv}" "${gv}" | sort -V | head -1)" == "${lv}" ]]; then
+        rm -f "${link}"
+        echo "[@@PFX@@-container-keeper] ${name}: 개별 ${lv} < Golden ${gv}; 개별 심링크를 제거(Golden 사용)." >&2
+    fi
+}
+
+# 컨테이너가 시작할 때마다: 멤버 개별 CLI 가 Golden 보다 낮으면 Golden 을 쓰게 한다.
+for cli in codex claude; do
+    prefer_newer_cli "${cli}" \
+        || echo "[@@PFX@@-container-keeper] WARNING: prefer_newer_cli ${cli} failed; continuing." >&2
+done
+
+# 첫 기동 때 한 번: Paseo 로컬 음성 모델 경로를 이미지의 읽기 전용 모델로 지정한다.
+# 실패해도 멤버 컨테이너는 계속 띄운다.
+if [[ -x /usr/local/bin/@@PFX@@-paseo-models-config ]]; then
+    /usr/local/bin/@@PFX@@-paseo-models-config \
+        || echo "[@@PFX@@-container-keeper] WARNING: @@PFX@@-paseo-models-config failed; continuing." >&2
+fi
+
+: >"${HUB_LOG}" 2>/dev/null || true
+echo "[@@PFX@@-container-keeper] ready." >&2
+
+while :; do
+    ensure_hub || true
+    sleep 15 &
+    sleep_pid=$!
+
+    # A signal interrupts wait; the corresponding trap performs shutdown.
+    wait "${sleep_pid}" || true
+    sleep_pid=""
+done

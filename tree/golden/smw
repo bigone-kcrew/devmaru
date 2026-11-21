@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  smw <project>
+
+Shared Git worktree launcher.
+
+Repository:
+  /shared/repos/<project>.git
+
+Worktree:
+  /shared/worktrees/<project>/<user>
+
+Branch:
+  users/<user>
+
+tmux session:
+  w-<project>
+USAGE
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+[[ $# -eq 1 ]] || {
+  usage >&2
+  exit 2
+}
+
+PROJECT="$1"
+
+[[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+  || die "invalid project name: $PROJECT"
+
+USER_NAME="$(id -un)"
+
+CREATE_CMD="@@PFX@@-shared-worktree-create"
+WORKTREE="/shared/worktrees/${PROJECT}/${USER_NAME}"
+SESSION="w-${PROJECT}"
+
+command -v tmux >/dev/null 2>&1 || die "tmux not found"
+command -v "$CREATE_CMD" >/dev/null 2>&1 || die "$CREATE_CMD not found"
+
+if [[ ! -d "$WORKTREE" ]]; then
+  "$CREATE_CMD" "$PROJECT"
+fi
+
+[[ -d "$WORKTREE" ]] || die "worktree does not exist: $WORKTREE"
+
+create_workstation() {
+  tmux new-session \
+    -d \
+    -s "$SESSION" \
+    -n claude \
+    -c "$WORKTREE" \
+    "bash -lc 'claude; exec bash'"
+
+  tmux new-window \
+    -t "${SESSION}:" \
+    -n codex \
+    -c "$WORKTREE" \
+    "bash -lc 'codex; exec bash'"
+
+  tmux new-window \
+    -t "${SESSION}:" \
+    -n antigravity \
+    -c "$WORKTREE" \
+    "bash -lc 'agy; exec bash'"
+
+  tmux new-window \
+    -t "${SESSION}:" \
+    -n shell \
+    -c "$WORKTREE"
+
+  tmux select-window -t "${SESSION}:1"
+}
+
+if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+  create_workstation
+fi
+
+if [[ -n "${TMUX:-}" ]]; then
+  tmux switch-client -t "=$SESSION"
+else
+  tmux attach-session -t "=$SESSION"
+fi

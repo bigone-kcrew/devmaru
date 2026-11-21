@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+  echo "오류: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "경고: $*" >&2
+}
+
+[[ "$(id -u)" -ne 0 ]] || die "root가 아닌 회원 계정으로 실행하세요."
+
+SOURCE_ROOT="/opt/@@PFX@@/skills"
+CLAUDE_ROOT="${HOME}/.claude/skills"
+CODEX_ROOT="${HOME}/.agents/skills"
+# AGY 의 전역 customization 루트는 ~/.gemini/config 다 (AGY 자체 문서 · 바이너리 문자열 ·
+# 기능 시험 3종으로 확인). 2026-09-25 이전에는 ~/.gemini/skills 로 뿌렸는데 그 경로는
+# «읽히지 않는다» — 파일은 있고 인식은 0이었다.
+GEMINI_ROOT="${HOME}/.gemini/config/skills"
+GEMINI_LEGACY_ROOT="${HOME}/.gemini/skills"
+MANAGED_MARKER=".@@PFX@@-managed"
+
+[[ -d "$SOURCE_ROOT" ]] || die "@@BRAND@@ Skill 원본 경로를 찾을 수 없습니다: $SOURCE_ROOT"
+
+mkdir -p "$CLAUDE_ROOT" "$CODEX_ROOT" "$GEMINI_ROOT"
+
+# 옛 경로에 남은 것을 치운다. 안 치우면 «22개 있음» 이라는 거짓 신호가 계속 남아
+# 이 결함을 다시 숨긴다. marker 가 있는 것 = 우리가 만든 것만 지우므로
+# 회원이 직접 둔 Skill 은 건드리지 않는다.
+if [[ -d "$GEMINI_LEGACY_ROOT" ]]; then
+  for legacy in "$GEMINI_LEGACY_ROOT"/*/; do
+    [[ -d "$legacy" ]] || continue
+    [[ -f "${legacy}${MANAGED_MARKER}" ]] || continue
+    rm -rf -- "$legacy"
+  done
+  rmdir "$GEMINI_LEGACY_ROOT" 2>/dev/null || true
+fi
+
+prepare_target() {
+  local target="$1"
+  local name="$2"
+
+  if [[ ! -e "$target" ]]; then
+    mkdir -p "$target"
+    return 0
+  fi
+
+  [[ -d "$target" ]] || die "Skill 대상 경로가 디렉터리가 아닙니다: $target"
+
+  if [[ ! -f "$target/$MANAGED_MARKER" ]]; then
+    warn "개인 또는 비관리 Skill이 이미 있어 덮어쓰지 않습니다: $name"
+    return 1
+  fi
+
+  find "$target" -mindepth 1 -maxdepth 1 \
+    ! -name "$MANAGED_MARKER" \
+    -exec rm -rf -- {} +
+}
+
+sync_target() {
+  local src="$1"
+  local target="$2"
+  local name="$3"
+
+  if ! prepare_target "$target" "$name"; then
+    return 1
+  fi
+
+  cp -a "$src/." "$target/"
+  printf '%s\n' "managed-by=@@PFX@@" > "$target/$MANAGED_MARKER"
+
+  chmod -R u+rwX,go-rwx "$target"
+}
+
+sync_skill() {
+  local src="$1"
+  local name
+  local failed=0
+
+  name="$(basename "$src")"
+
+  [[ -f "$src/SKILL.md" ]] || die "SKILL.md를 찾을 수 없습니다: $src"
+
+  if ! sync_target "$src" "$CLAUDE_ROOT/$name" "$name"; then
+    failed=1
+  fi
+
+  if ! sync_target "$src" "$CODEX_ROOT/$name" "$name"; then
+    failed=1
+  fi
+
+  if ! sync_target "$src" "$GEMINI_ROOT/$name" "$name"; then
+    failed=1
+  fi
+
+  if [[ "$failed" -eq 0 ]]; then
+    echo "동기화됨: $name"
+  else
+    warn "Skill을 완전히 동기화하지 못했습니다: $name"
+  fi
+}
+
+found=0
+
+while IFS= read -r -d '' skill_dir; do
+  found=1
+  sync_skill "$skill_dir"
+done < <(
+  find "$SOURCE_ROOT" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    -print0 |
+  sort -z
+)
+
+if [[ "$found" -eq 0 ]]; then
+  echo "동기화할 @@BRAND@@ Skill이 없습니다."
+  exit 0
+fi
+
+echo
+echo "@@BRAND@@ Skill 동기화가 완료되었습니다."

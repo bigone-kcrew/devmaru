@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+[[ "${EUID}" -eq 0 ]] || die "must run via sudo wrapper"
+
+MEMBER="${SUDO_USER:-}"
+[[ -n "$MEMBER" && "$MEMBER" != "root" ]] || die "cannot determine member"
+
+[[ "$MEMBER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid username"
+
+id "$MEMBER" >/dev/null 2>&1 || die "unknown user: $MEMBER"
+
+id -nG "$MEMBER" | tr ' ' '\n' | grep -qx '@@PFX@@' \
+  || die "$MEMBER is not an @@BRAND@@ member"
+
+[[ -d "/srv/@@PFX@@/users/$MEMBER" ]] \
+  || die "member workspace not found"
+
+CONTAINER="dev-$MEMBER"
+
+RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
+[[ "$RUNNING" == "true" ]] || die "$CONTAINER is not running"
+
+CMD=(bash -l); [[ "${1:-}" == "-c" ]] && CMD=(bash -lc "${2:-true}")
+TTY_ARGS=(-i)
+if [[ -t 0 && -t 1 ]]; then
+  TTY_ARGS=(-it)
+fi
+
+exec docker exec \
+  "${TTY_ARGS[@]}" \
+  --user "$MEMBER" \
+  -e "HOME=/home/$MEMBER" \
+  -e "@@PFX_UP@@_DEV=1" \
+  -e "TERM=${TERM:-xterm-256color}" \
+  -w /workspace \
+  "$CONTAINER" \
+  "${CMD[@]}"

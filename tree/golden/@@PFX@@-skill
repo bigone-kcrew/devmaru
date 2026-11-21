@@ -1,0 +1,767 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${AI_SKILL_HUB_URL:-https://@@PORTAL_HOST@@/skills}"
+CATALOG_ROOT="${AI_SKILL_CATALOG_ROOT:-${HOME}/.@@PFX@@/catalog}"
+SKILLS_ROOT="${CATALOG_ROOT}/skills"
+STATE_FILE="${CATALOG_ROOT}/state.json"
+
+GOLDEN_ROOT="/opt/@@PFX@@/skills"
+CLAUDE_ROOT="${HOME}/.claude/skills"
+CODEX_ROOT="${HOME}/.agents/skills"
+
+CLEANUP_DIR=""
+
+cleanup() {
+    if [[ -n "${CLEANUP_DIR}" && -d "${CLEANUP_DIR}" ]]; then
+        rm -rf -- "${CLEANUP_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
+die() {
+    printf '[@@PFX@@-skill] 오류: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf '[@@PFX@@-skill] 경고: %s\n' "$*" >&2
+}
+
+info() {
+    printf '[@@PFX@@-skill] %s\n' "$*"
+}
+
+require_non_root() {
+    [[ "$(id -u)" -ne 0 ]] || die "root가 아닌 회원 계정으로 실행하세요."
+}
+
+init_state() {
+    mkdir -p "$SKILLS_ROOT"
+    chmod 700 "$CATALOG_ROOT" "$SKILLS_ROOT" 2>/dev/null || true
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+        printf '%s\n' '{"schema_version":1,"installed":{}}' > "$STATE_FILE"
+        chmod 600 "$STATE_FILE"
+    fi
+
+    jq -e '
+        .schema_version == 1 and
+        (.installed | type == "object")
+    ' "$STATE_FILE" >/dev/null ||
+        die "Catalog 상태 파일이 올바르지 않습니다: $STATE_FILE"
+}
+
+fetch_index() {
+    curl -fsSL "${BASE_URL}/index.json"
+}
+
+index_entry() {
+    local name="$1"
+    fetch_index | jq -c --arg name "$name" '
+        .skills[]? | select(.name == $name)
+    ' | head -n 1
+}
+
+resolve_url() {
+    local path="$1"
+
+    case "$path" in
+        http://*|https://*)
+            printf '%s\n' "$path"
+            ;;
+        /*)
+            printf '%s%s\n' "$BASE_URL" "$path"
+            ;;
+        *)
+            printf '%s/%s\n' "$BASE_URL" "$path"
+            ;;
+    esac
+}
+
+catalog_cmd() {
+    fetch_index | jq -r '
+        if (.skills | length) == 0 then
+            "사용 가능한 Catalog Skill이 없습니다."
+        else
+            .skills[]
+            | [
+                .name,
+                (.latest // "-"),
+                (.category // "-"),
+                (.description // "")
+              ]
+            | @tsv
+        end
+    '
+}
+
+list_cmd() {
+    init_state
+
+    if [[ "$(jq '.installed | length' "$STATE_FILE")" -eq 0 ]]; then
+        echo "설치된 Catalog Skill이 없습니다."
+        return 0
+    fi
+
+    jq -r '
+        .installed
+        | to_entries[]
+        | [
+            .key,
+            (.value.version // "-"),
+            (.value.installed_at // "-")
+          ]
+        | @tsv
+    ' "$STATE_FILE"
+}
+
+info_cmd() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "사용법: @@PFX@@-skill info <name>"
+
+    local entry manifest_ref manifest_url
+    entry="$(index_entry "$name")"
+
+    [[ -n "$entry" ]] || die "Catalog에서 Skill을 찾을 수 없습니다: $name"
+
+    manifest_ref="$(jq -r '.manifest // empty' <<<"$entry")"
+    [[ -n "$manifest_ref" ]] ||
+        die "Catalog 항목에 manifest가 없습니다: $name"
+
+    manifest_url="$(resolve_url "$manifest_ref")"
+
+    echo "===== CATALOG 정보 ====="
+    jq . <<<"$entry"
+
+    echo
+    echo "===== MANIFEST 정보 ====="
+    curl -fsSL "$manifest_url" | jq .
+}
+
+check_name_collision() {
+    local name="$1"
+    local skill_dir="${SKILLS_ROOT}/${name}"
+    local expected="${skill_dir}/current"
+    local target
+
+    if [[ -d "${GOLDEN_ROOT}/${name}" ]]; then
+        die "Golden/Core Skill은 Catalog에서 다시 설치할 수 없습니다: $name"
+    fi
+
+    for target in \
+        "${CLAUDE_ROOT}/${name}" \
+        "${CODEX_ROOT}/${name}"
+    do
+        if [[ -L "$target" ]]; then
+            local link_target
+            link_target="$(readlink "$target")"
+
+            [[ "$link_target" == "$expected" ]] ||
+                die "기존 비관리 symlink가 Catalog Skill과 충돌합니다: $target"
+        elif [[ -e "$target" ]]; then
+            die "개인 또는 비관리 Skill이 Catalog Skill과 충돌합니다: $target"
+        fi
+    done
+}
+
+validate_zip_paths() {
+    local zipfile="$1"
+
+    unzip -Z1 "$zipfile" |
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+
+        case "$path" in
+            /*)
+                die "Skill archive에 안전하지 않은 절대경로가 있습니다: $path"
+                ;;
+        esac
+
+        if [[ "$path" == ".." ||
+              "$path" == ../* ||
+              "$path" == */../* ||
+              "$path" == */.. ]]; then
+            die "Skill archive에 안전하지 않은 상위경로 참조가 있습니다: $path"
+        fi
+    done
+}
+
+find_skill_root() {
+    local unpacked="$1"
+    local matches=()
+    local file
+
+    while IFS= read -r -d '' file; do
+        matches+=("$file")
+    done < <(
+        find "$unpacked" -maxdepth 3 -type f -name SKILL.md -print0
+    )
+
+    [[ "${#matches[@]}" -eq 1 ]] ||
+        die "archive에는 SKILL.md가 정확히 1개 있어야 합니다. 발견: ${#matches[@]}개"
+
+    dirname "${matches[0]}"
+}
+
+validate_skill_name() {
+    local skill_root="$1"
+    local expected="$2"
+    local declared
+
+    declared="$(
+        awk '
+            NR == 1 && $0 == "---" { in_yaml=1; next }
+            in_yaml && $0 == "---" { exit }
+            in_yaml && /^name:[[:space:]]*/ {
+                sub(/^name:[[:space:]]*/, "")
+                gsub(/^["'\'' ]+|["'\'' ]+$/, "")
+                print
+                exit
+            }
+        ' "${skill_root}/SKILL.md"
+    )"
+
+    [[ -n "$declared" ]] ||
+        die "SKILL.md frontmatter에 name이 없습니다."
+
+    [[ "$declared" == "$expected" ]] ||
+        die "Skill 이름이 일치하지 않습니다. 기대값='$expected', archive='$declared'"
+}
+
+write_state() {
+    local name="$1"
+    local version="$2"
+    local sha256="$3"
+    local manifest_url="$4"
+    local tmp
+
+    tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+
+    jq \
+        --arg name "$name" \
+        --arg version "$version" \
+        --arg sha256 "$sha256" \
+        --arg manifest "$manifest_url" \
+        --arg installed_at "$(date --iso-8601=seconds)" \
+        '
+        .installed[$name] = {
+            version: $version,
+            sha256: $sha256,
+            manifest: $manifest,
+            installed_at: $installed_at
+        }
+        ' "$STATE_FILE" > "$tmp"
+
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+link_agent_target() {
+    local target="$1"
+    local expected="$2"
+    local parent
+
+    parent="$(dirname "$target")"
+    mkdir -p "$parent"
+
+    if [[ -L "$target" ]]; then
+        [[ "$(readlink "$target")" == "$expected" ]] ||
+            die "비관리 symlink를 덮어쓰지 않습니다: $target"
+        rm -f "$target"
+    elif [[ -e "$target" ]]; then
+        die "비관리 Skill을 덮어쓰지 않습니다: $target"
+    fi
+
+    ln -s "$expected" "$target"
+}
+
+install_latest() {
+    local name="$1"
+
+    init_state
+
+    local entry latest manifest_ref manifest_url
+    local manifest artifact_filename artifact_url expected_sha
+    local tmpdir zipfile unpacked skill_root actual_sha
+    local skill_dir version_dir stage_dir current_tmp
+
+    entry="$(index_entry "$name")"
+    [[ -n "$entry" ]] || die "Catalog에서 Skill을 찾을 수 없습니다: $name"
+
+    latest="$(jq -r '.latest // empty' <<<"$entry")"
+    manifest_ref="$(jq -r '.manifest // empty' <<<"$entry")"
+
+    [[ -n "$latest" ]] || die "Catalog 항목에 latest 버전이 없습니다: $name"
+    [[ -n "$manifest_ref" ]] || die "Catalog 항목에 manifest가 없습니다: $name"
+
+    check_name_collision "$name"
+
+    manifest_url="$(resolve_url "$manifest_ref")"
+    manifest="$(curl -fsSL "$manifest_url")"
+
+    [[ "$(jq -r '.schema_version // empty' <<<"$manifest")" == "1" ]] ||
+        die "지원하지 않는 manifest schema입니다: $name"
+
+    [[ "$(jq -r '.name // empty' <<<"$manifest")" == "$name" ]] ||
+        die "manifest의 Skill 이름이 일치하지 않습니다: $name"
+
+    [[ "$(jq -r '.catalog_version // empty' <<<"$manifest")" == "$latest" ]] ||
+        die "manifest와 Catalog의 버전이 일치하지 않습니다: $name"
+
+    artifact_filename="$(jq -r '.artifact.filename // empty' <<<"$manifest")"
+    expected_sha="$(jq -r '.artifact.sha256 // empty' <<<"$manifest")"
+
+    [[ -n "$artifact_filename" ]] ||
+        die "manifest에 artifact 파일명이 없습니다: $name"
+
+    [[ "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] ||
+        die "manifest의 artifact SHA256 값이 올바르지 않습니다: $name"
+
+    artifact_url="$(
+        resolve_url "$(
+            dirname "$manifest_ref"
+        )/${artifact_filename}"
+    )"
+
+    tmpdir="$(mktemp -d "${CATALOG_ROOT}/tmp.XXXXXX")"
+    CLEANUP_DIR="$tmpdir"
+
+    zipfile="${tmpdir}/skill.zip"
+    unpacked="${tmpdir}/unpacked"
+
+    mkdir -p "$unpacked"
+
+    info "다운로드 중: $name $latest"
+    curl -fsSL "$artifact_url" -o "$zipfile"
+
+    actual_sha="$(sha256sum "$zipfile" | awk '{print $1}')"
+
+    [[ "${actual_sha,,}" == "${expected_sha,,}" ]] ||
+        die "SHA256 검증에 실패했습니다: $name"
+
+    validate_zip_paths "$zipfile"
+    unzip -q "$zipfile" -d "$unpacked"
+
+    skill_root="$(find_skill_root "$unpacked")"
+    validate_skill_name "$skill_root" "$name"
+
+    skill_dir="${SKILLS_ROOT}/${name}"
+    version_dir="${skill_dir}/${latest}"
+
+    mkdir -p "$skill_dir"
+
+    if [[ ! -d "$version_dir" ]]; then
+        stage_dir="${skill_dir}/.${latest}.new.$$"
+        rm -rf "$stage_dir"
+        mkdir -p "$stage_dir"
+        cp -a "${skill_root}/." "$stage_dir/"
+        chmod -R u+rwX,go-rwx "$stage_dir"
+        mv "$stage_dir" "$version_dir"
+    fi
+
+    current_tmp="${skill_dir}/.current.new.$$"
+    rm -f "$current_tmp"
+    ln -s "$latest" "$current_tmp"
+    mv -Tf "$current_tmp" "${skill_dir}/current"
+
+    link_agent_target \
+        "${CLAUDE_ROOT}/${name}" \
+        "${skill_dir}/current"
+
+    link_agent_target \
+        "${CODEX_ROOT}/${name}" \
+        "${skill_dir}/current"
+
+    write_state \
+        "$name" \
+        "$latest" \
+        "${actual_sha,,}" \
+        "$manifest_url"
+
+    rm -rf -- "$tmpdir"
+    CLEANUP_DIR=""
+
+    info "설치 완료: $name $latest"
+}
+
+install_cmd() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "사용법: @@PFX@@-skill install <name>"
+
+    init_state
+
+    if jq -e --arg name "$name" \
+        '.installed[$name] != null' "$STATE_FILE" >/dev/null; then
+        die "이미 설치된 Skill입니다. 업데이트하려면 '@@PFX@@-skill update $name'을 사용하세요."
+    fi
+
+    install_latest "$name"
+}
+
+update_one() {
+    local name="$1"
+
+    init_state
+
+    jq -e --arg name "$name" \
+        '.installed[$name] != null' "$STATE_FILE" >/dev/null ||
+        die "설치되어 있지 않은 Skill입니다: $name"
+
+    local current entry latest
+
+    current="$(
+        jq -r --arg name "$name" \
+            '.installed[$name].version' "$STATE_FILE"
+    )"
+
+    entry="$(index_entry "$name")"
+    [[ -n "$entry" ]] || die "설치된 Skill이 현재 Catalog에 없습니다: $name"
+
+    latest="$(jq -r '.latest // empty' <<<"$entry")"
+    [[ -n "$latest" ]] || die "Catalog 항목에 latest 버전이 없습니다: $name"
+
+    if [[ "$current" == "$latest" ]]; then
+        info "최신 상태입니다: $name $current"
+        return 0
+    fi
+
+    info "업데이트 중: $name $current -> $latest"
+    install_latest "$name"
+}
+
+update_check() {
+    init_state
+
+    local count
+    count="$(jq '.installed | length' "$STATE_FILE")"
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "설치된 Catalog Skill이 없습니다."
+        return 0
+    fi
+
+    local name current entry latest
+
+    while IFS= read -r name; do
+        current="$(
+            jq -r --arg name "$name" \
+                '.installed[$name].version' "$STATE_FILE"
+        )"
+
+        entry="$(index_entry "$name")"
+
+        if [[ -z "$entry" ]]; then
+            printf '%s\t%s\t%s\n' "$name" "$current" "MISSING_FROM_CATALOG"
+            continue
+        fi
+
+        latest="$(jq -r '.latest // empty' <<<"$entry")"
+
+        if [[ "$current" == "$latest" ]]; then
+            printf '%s\t%s\t%s\n' "$name" "$current" "CURRENT"
+        else
+            printf '%s\t%s -> %s\t%s\n' "$name" "$current" "$latest" "UPDATE_AVAILABLE"
+        fi
+    done < <(jq -r '.installed | keys[]' "$STATE_FILE")
+}
+
+update_all() {
+    init_state
+
+    local names=()
+    local name
+
+    while IFS= read -r name; do
+        names+=("$name")
+    done < <(jq -r '.installed | keys[]' "$STATE_FILE")
+
+    if [[ "${#names[@]}" -eq 0 ]]; then
+        echo "설치된 Catalog Skill이 없습니다."
+        return 0
+    fi
+
+    for name in "${names[@]}"; do
+        update_one "$name"
+    done
+}
+
+update_cmd() {
+    local arg="${1:-}"
+
+    case "$arg" in
+        --check)
+            update_check
+            ;;
+        --all)
+            update_all
+            ;;
+        "")
+            die "사용법: @@PFX@@-skill update <name>|--check|--all"
+            ;;
+        *)
+            update_one "$arg"
+            ;;
+    esac
+}
+
+remove_cmd() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "사용법: @@PFX@@-skill remove <name>"
+
+    init_state
+
+    jq -e --arg name "$name" \
+        '.installed[$name] != null' "$STATE_FILE" >/dev/null ||
+        die "설치되어 있지 않은 Catalog Skill입니다: $name"
+
+    local skill_dir="${SKILLS_ROOT}/${name}"
+    local expected="${skill_dir}/current"
+    local target tmp
+
+    for target in \
+        "${CLAUDE_ROOT}/${name}" \
+        "${CODEX_ROOT}/${name}"
+    do
+        if [[ -L "$target" ]]; then
+            if [[ "$(readlink "$target")" == "$expected" ]]; then
+                rm -f "$target"
+            else
+                warn "예상하지 못한 symlink는 변경하지 않습니다: $target"
+            fi
+        elif [[ -e "$target" ]]; then
+            warn "비관리 경로는 변경하지 않습니다: $target"
+        fi
+    done
+
+    rm -rf "$skill_dir"
+
+    tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+    jq --arg name "$name" \
+        'del(.installed[$name])' "$STATE_FILE" > "$tmp"
+
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+
+    info "삭제 완료: $name"
+}
+
+
+doctor_cmd() {
+    init_state
+
+    local count
+    count="$(jq '.installed | length' "$STATE_FILE")"
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "설치된 Catalog Skill이 없습니다."
+        return 0
+    fi
+
+    printf '%-30s %-16s %-30s %s\n' \
+        "SKILL" "RUNTIME" "ENV" "RESULT"
+
+    local name manifest_url manifest
+    local runtime_type runtime_command
+    local env_names env_name env_display
+    local runtime_ok env_ok result
+    local ready=0
+    local missing_env=0
+    local missing_runtime=0
+    local manifest_error=0
+
+    while IFS= read -r name; do
+        manifest_url="$(
+            jq -r --arg name "$name" \
+                '.installed[$name].manifest // empty' \
+                "$STATE_FILE"
+        )"
+
+        if [[ -z "$manifest_url" ]]; then
+            printf '%-30s %-16s %-30s %s\n' \
+                "$name" "-" "-" "MANIFEST_ERROR"
+            manifest_error=$((manifest_error + 1))
+            continue
+        fi
+
+        if ! manifest="$(curl -fsSL "$manifest_url")"; then
+            printf '%-30s %-16s %-30s %s\n' \
+                "$name" "-" "-" "MANIFEST_ERROR"
+            manifest_error=$((manifest_error + 1))
+            continue
+        fi
+
+        if ! jq -e '
+            .schema_version == 1 and
+            (.name | type == "string") and
+            (.runtime | type == "object")
+        ' <<<"$manifest" >/dev/null; then
+            printf '%-30s %-16s %-30s %s\n' \
+                "$name" "-" "-" "MANIFEST_ERROR"
+            manifest_error=$((manifest_error + 1))
+            continue
+        fi
+
+        runtime_type="$(
+            jq -r '.runtime.type // "unknown"' <<<"$manifest"
+        )"
+
+        runtime_command="$(
+            jq -r '.runtime.command // empty' <<<"$manifest"
+        )"
+
+        runtime_ok=1
+
+        case "$runtime_type" in
+            pure)
+                ;;
+            python-stdlib)
+                runtime_command="${runtime_command:-python3}"
+                command -v "$runtime_command" >/dev/null 2>&1 ||
+                    runtime_ok=0
+                ;;
+            cli|script|command)
+                if [[ -z "$runtime_command" ]] ||
+                   ! command -v "$runtime_command" >/dev/null 2>&1; then
+                    runtime_ok=0
+                fi
+                ;;
+            *)
+                if [[ -n "$runtime_command" ]]; then
+                    command -v "$runtime_command" >/dev/null 2>&1 ||
+                        runtime_ok=0
+                elif [[ "$(
+                    jq -r '.runtime.required // false' <<<"$manifest"
+                )" == "true" ]]; then
+                    runtime_ok=0
+                fi
+                ;;
+        esac
+
+        env_names="$(
+            jq -r '
+                [
+                    (.environment // [])[]
+                    | select(.required == true)
+                    | .name
+                ]
+                | join(",")
+            ' <<<"$manifest"
+        )"
+
+        env_display="${env_names:--}"
+        env_ok=1
+
+        while IFS= read -r env_name; do
+            [[ -n "$env_name" ]] || continue
+            # 허브 manifest 값이다 — 변수 이름만 받는다(${!x[$(cmd)]} 간접 확장은 명령을 실행한다)
+            [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+
+            if [[ -z "${!env_name-}" ]]; then
+                env_ok=0
+            fi
+        done < <(
+            jq -r '
+                (.environment // [])[]
+                | select(.required == true)
+                | .name
+            ' <<<"$manifest"
+        )
+
+        if [[ "$runtime_ok" -eq 0 ]]; then
+            result="MISSING_RUNTIME"
+            missing_runtime=$((missing_runtime + 1))
+        elif [[ "$env_ok" -eq 0 ]]; then
+            result="MISSING_ENV"
+            missing_env=$((missing_env + 1))
+        else
+            result="READY"
+            ready=$((ready + 1))
+        fi
+
+        printf '%-30s %-16s %-30s %s\n' \
+            "$name" "$runtime_type" "$env_display" "$result"
+
+    done < <(jq -r '.installed | keys[]' "$STATE_FILE")
+
+    echo
+    echo "요약:"
+    printf 'ready:           %d\n' "$ready"
+    printf 'missing_env:     %d\n' "$missing_env"
+    printf 'missing_runtime: %d\n' "$missing_runtime"
+    printf 'manifest_error:  %d\n' "$manifest_error"
+
+    if (( missing_env > 0 ||
+          missing_runtime > 0 ||
+          manifest_error > 0 )); then
+        return 1
+    fi
+
+    return 0
+}
+
+usage() {
+    cat <<'USAGE'
+@@BRAND@@ Catalog Skill 관리자
+
+사용법:
+  @@PFX@@-skill catalog
+  @@PFX@@-skill info <name>
+  @@PFX@@-skill install <name>
+  @@PFX@@-skill list
+  @@PFX@@-skill doctor
+  @@PFX@@-skill update <name>
+  @@PFX@@-skill update --check
+  @@PFX@@-skill update --all
+  @@PFX@@-skill remove <name>
+
+Skill 구분:
+  Golden/Core       @@BRAND@@ 기본 제공, @@PFX@@-skill-sync가 관리
+  Catalog/Optional  선택 설치, @@PFX@@-skill이 관리
+  Personal          개인 Skill, @@PFX@@-skill이 덮어쓰지 않음
+USAGE
+}
+
+main() {
+    require_non_root
+
+    case "${1:-}" in
+        catalog)
+            shift
+            catalog_cmd "$@"
+            ;;
+        info)
+            shift
+            info_cmd "$@"
+            ;;
+        install)
+            shift
+            install_cmd "$@"
+            ;;
+        list)
+            shift
+            list_cmd "$@"
+            ;;
+        doctor)
+            shift
+            doctor_cmd "$@"
+            ;;
+        update)
+            shift
+            update_cmd "$@"
+            ;;
+        remove)
+            shift
+            remove_cmd "$@"
+            ;;
+        -h|--help|help|"")
+            usage
+            ;;
+        *)
+            die "알 수 없는 명령입니다: $1"
+            ;;
+    esac
+}
+
+main "$@"

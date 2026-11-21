@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""@@PFX@@-golden-check — Golden 현황과 업스트림 대조
+
+읽기 전용이다. 아무것도 바꾸지 않으므로 sudo 도 필요 없고 아무 때나 돌려도 된다.
+
+만든 이유: 이 대조를 «아무도 안 봐서» 생긴 공백이 반복됐다. offsite archive 가 네
+세대 밀렸던 것, Antigravity 스킬이 여섯 회차 0개였던 것이 모두 그런 종류다.
+
+  @@PFX@@-golden-check            사람이 읽는 표
+  @@PFX@@-golden-check --json     기계용 (타이머·알림에 물릴 때)
+
+종료 코드
+  0   전부 최신이고 현황도 정상
+  10  업데이트가 있다 (오류가 아니다)
+  1   조회 실패나 현황 이상
+"""
+import concurrent.futures as cf
+import json
+import re
+import subprocess
+import sys
+import urllib.request
+
+_OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler())   # 조회는 https 주소만(스킴을 확인한 뒤 연다)
+
+DOCKERFILE = "/opt/@@PFX@@/images/dev/Dockerfile"
+POINTER = "/opt/@@PFX@@/config/dev-container.env"
+RELEASES = "/opt/@@PFX@@/images/dev/releases"
+JSON = "--json" in sys.argv
+
+
+def arg(name):
+    try:
+        with open(DOCKERFILE, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r"ARG %s=(\S+)" % re.escape(name), line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:
+        return ""
+
+
+def get(url, method="GET"):
+    if not url.startswith("https://"):
+        raise ValueError("https 주소만 조회한다: " + url)
+    req = urllib.request.Request(url, method=method,
+                                 headers={"User-Agent": "@@PFX@@-golden-check"})
+    with _OPENER.open(req, timeout=25) as r:
+        return r if method == "HEAD" else json.load(r)
+
+
+def npm(pkg):
+    return get("https://registry.npmjs.org/%s/latest" % pkg.replace("/", "%2f"))["version"]
+
+
+def gh_release(repo):
+    tag = get("https://api.github.com/repos/%s/releases/latest" % repo)["tag_name"]
+    for pre in ("bun-", "v"):          # bun 태그는 "bun-v1.4.2" 로 두 겹이다
+        if tag.startswith(pre):
+            tag = tag[len(pre):]
+    return tag
+
+
+def gh_head(repo):
+    d = get("https://api.github.com/repos/%s" % repo)
+    return get("https://api.github.com/repos/%s/commits/%s" % (repo, d["default_branch"]))["sha"]
+
+
+def gl_release(project):
+    tag = get("https://gitlab.com/api/v4/projects/%s/releases?per_page=1" % project.replace("/", "%2F"))[0]["tag_name"]
+    return tag[1:] if tag.startswith("v") else tag
+
+
+def pypi(pkg):
+    return get("https://pypi.org/pypi/%s/json" % pkg)["info"]["version"]
+
+
+def nodesource24():
+    # NodeSource 24.x 저장소의 nodejs 최신 deb 버전. nodejs.org 의 최신 보안 릴리스는 여기 올라오기까지 늦을 수 있다(우리는 deb 로 설치한다).
+    req = urllib.request.Request("https://deb.nodesource.com/node_24.x/dists/nodistro/main/binary-amd64/Packages",
+                                 headers={"User-Agent": "@@PFX@@-golden-check"})
+    with _OPENER.open(req, timeout=25) as r:
+        text = r.read().decode("utf-8", "replace")
+    best = None
+    for blk in text.split("\n\n"):
+        if re.search(r"^Package: nodejs$", blk, re.M):
+            m = re.search(r"^Version: (\d+)\.(\d+)\.(\d+)-", blk, re.M)
+            if m:
+                v = tuple(int(x) for x in m.groups())
+                best = v if best is None or v > best else best
+    if best is None:
+        raise RuntimeError("NodeSource Packages 에서 nodejs 버전을 못 찾음")
+    return ".".join(str(x) for x in best)
+
+
+# (표시이름, Dockerfile ARG, 조회, 종류)
+CHECKS = [
+    ("Claude Code",   "CLAUDE_CODE_VERSION",   lambda: npm("@anthropic-ai/claude-code"), "ver"),
+    ("Codex",         "CODEX_VERSION",         lambda: npm("@openai/codex"),             "ver"),
+    ("Paseo",         "PASEO_VERSION",         lambda: npm("@getpaseo/cli"),             "ver"),
+    ("Vercel",        "VERCEL_VERSION",        lambda: npm("vercel"),                    "ver"),
+    ("pnpm",          "PNPM_VERSION",          lambda: npm("pnpm"),                      "ver"),
+    ("Playwright",    "PLAYWRIGHT_VERSION",    lambda: npm("playwright"),                "ver"),
+    ("Bun",           "BUN_VERSION",           lambda: gh_release("oven-sh/bun"),        "ver"),
+    ("uv",            "UV_VERSION",            lambda: gh_release("astral-sh/uv"),       "ver"),
+    ("Antigravity",   "ANTIGRAVITY_VERSION",   lambda: gh_release("google-antigravity/antigravity-cli"), "ver"),
+    ("superpowers",   "SUPERPOWERS_VERSION",   lambda: gh_release("obra/superpowers"),   "ver"),
+    ("archify",       "ARCHIFY_VERSION",       lambda: gh_release("tt-a1i/archify"),     "ver"),
+    ("agent-browser", "AGENT_BROWSER_VERSION", lambda: gh_release("vercel-labs/agent-browser"), "ver"),
+    ("ponytail",      "PONYTAIL_VERSION",      lambda: gh_release("DietrichGebert/ponytail"),   "ver"),
+    ("glab",          "GLAB_VERSION",          lambda: gl_release("gitlab-org/cli"),     "ver"),
+    ("python-pptx",   "PYTHON_PPTX_VERSION",   lambda: pypi("python-pptx"),              "ver"),
+    ("lxml",          "LXML_VERSION",          lambda: pypi("lxml"),                     "ver"),
+    ("Pillow",        "PILLOW_VERSION",        lambda: pypi("Pillow"),                   "ver"),
+    ("XlsxWriter",    "XLSXWRITER_VERSION",    lambda: pypi("XlsxWriter"),               "ver"),
+    ("gh",            "GH_VERSION",            lambda: gh_release("cli/cli"),            "ver"),
+    ("Node (NodeSource)", "NODE_VERSION",      nodesource24,                             "ver"),
+    # commit 핀 — HEAD 가 움직여도 «릴리스» 가 아니면 따라가지 않는다
+    ("effective-html", "EFFECTIVE_HTML_COMMIT", lambda: gh_head("plannotator/effective-html"), "commit"),
+    ("ui-ux-pro-max",  "UI_UX_PRO_MAX_COMMIT",  lambda: gh_head("nextlevelbuilder/ui-ux-pro-max-skill"), "commit"),
+]
+
+
+def probe(item):
+    name, argname, fn, kind = item
+    pinned = arg(argname)
+    if pinned is None:
+        return dict(name=name, pinned=None, latest=None, kind=kind,
+                    state="error", note="Dockerfile 에 %s 가 없다" % argname)
+    try:
+        latest = fn()
+    except Exception as e:
+        return dict(name=name, pinned=pinned, latest=None, kind=kind,
+                    state="error", note="%s: %s" % (type(e).__name__, e))
+
+    if kind == "commit":
+        same = latest.startswith(pinned[:12]) or pinned.startswith(latest[:12])
+        return dict(name=name, pinned=pinned[:12], latest=latest[:12], kind=kind,
+                    state="same" if same else "moved")
+    if pinned == latest:
+        return dict(name=name, pinned=pinned, latest=latest, kind=kind, state="same")
+    major = kind == "ver" and pinned.split(".")[0] != latest.split(".")[0]
+    return dict(name=name, pinned=pinned, latest=latest, kind=kind,
+                state="major" if major else "new")
+
+
+def current_state():
+    pointer = ""
+    try:
+        with open(POINTER, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("GOLDEN_IMAGE="):
+                    pointer = line.strip().split("=", 1)[1]
+    except OSError:
+        pass
+    images = [l for l in sh("docker", "images", "@@PFX@@-dev",
+                            "--format", "{{.Tag}}").splitlines() if l]
+    running = {}
+    out = sh("docker", "ps", "--format", "{{.Names}}\t{{.Image}}")
+    for line in out.splitlines():
+        if "\t" in line:
+            n, i = line.split("\t", 1)
+            if n.startswith("dev-"):
+                running[n] = i
+    stale = sorted(n for n, i in running.items() if pointer and i != pointer)
+    # 포인터가 가리키는 버전의 manifest 가 실제로 설치돼 있는지 본다.
+    # ls | tail -1 은 사전순이라 0.4.9 가 0.4.18 뒤로 온다 — 버전으로 찾는다.
+    ver = pointer.split(":", 1)[1] if ":" in pointer else ""
+    mani = "%s/%s.manifest" % (RELEASES, ver) if ver else ""
+    mani_ok = bool(mani) and sh("bash", "-lc", "test -r %s && echo y" % mani) == "y"
+    if not mani_ok:   # 단발 빌드 이미지: manifest 가 하나도 없거나, 있는 manifest 가 모두 더 높은 버전이면(승격 뒤 롤백) 정상
+        try:
+            vs = sh("bash", "-lc", "ls %s/ 2>/dev/null | sed -n s/[.]manifest$//p" % RELEASES).split()
+            mani_ok = all(tuple(map(int, v.split("."))) > tuple(map(int, ver.split("."))) for v in vs)
+        except ValueError:
+            pass
+    disk = sh("bash", "-lc", "df -h / | awk 'NR==2{print $3\" 사용 · \"$4\" 여유 · \"$5}'")
+    return dict(pointer=pointer, images=images, running=running,
+                stale=stale, manifest=mani, manifest_ok=mani_ok, disk=disk)
+
+
+def main():
+    state = current_state()
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        rows = list(ex.map(probe, CHECKS))
+
+    if JSON:
+        print(json.dumps(dict(current=state, upstream=rows), ensure_ascii=False, indent=1))
+    else:
+        print("Golden 현황")
+        print("  포인터        %s" % (state["pointer"] or "(못 읽음)"))
+        print("  로컬 이미지   %s" % (" · ".join(state["images"]) or "(없음)"))
+        print("  manifest      %s%s" % (state["manifest"] or "(못 읽음)",
+                                          "" if state["manifest_ok"] else "   ⚠ 설치돼 있지 않다"))
+        print("  디스크        %s" % state["disk"])
+        if state["stale"]:
+            print("  ⚠ 포인터와 다른 컨테이너: %s" % ", ".join(state["stale"]))
+            for n in state["stale"]:
+                print("      %-24s %s" % (n, state["running"][n]))
+        else:
+            print("  컨테이너      전부 포인터와 일치 (%d개)" % len(state["running"]))
+
+        print("\n업스트림 대조")
+        order = {"major": 0, "new": 1, "moved": 2, "error": 3, "same": 4}
+        for r in sorted(rows, key=lambda x: (order[x["state"]], x["name"])):
+            if r["state"] == "same":
+                print("  같음   %-16s %s" % (r["name"], r["pinned"]))
+            elif r["state"] == "new":
+                print("  새것   %-16s %-12s -> %s" % (r["name"], r["pinned"], r["latest"]))
+            elif r["state"] == "major":
+                print("  ★major %-16s %-12s -> %-12s  자동 채택 금지 — 노트를 읽고 판단한다"
+                      % (r["name"], r["pinned"], r["latest"]))
+            elif r["state"] == "moved":
+                print("  움직임 %-16s %s -> HEAD %s  (릴리스가 아니면 따라가지 않는다)"
+                      % (r["name"], r["pinned"], r["latest"]))
+            else:
+                print("  ?      %-16s %-12s 조회 실패 — %s" % (r["name"], r["pinned"], r["note"][:60]))
+
+    n_new = sum(1 for r in rows if r["state"] in ("new", "major"))
+    n_err = sum(1 for r in rows if r["state"] == "error")
+    if not JSON:
+        print("\n  새것 %d · 움직임 %d · 같음 %d · 실패 %d"
+              % (n_new,
+                 sum(1 for r in rows if r["state"] == "moved"),
+                 sum(1 for r in rows if r["state"] == "same"), n_err))
+        if any(r["state"] == "major" for r in rows):
+            print("  ★ major 는 릴리스 노트를 «직접» 읽고 판단한다. GitHub 릴리스가 비어 있어도")
+            print("    벤더 docs 에 노트가 있을 수 있다 (2026-09-25 Vercel 60 사례).")
+    if n_err:
+        return 1
+    if state["stale"] or not state["manifest_ok"]:
+        return 1
+    return 10 if n_new else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

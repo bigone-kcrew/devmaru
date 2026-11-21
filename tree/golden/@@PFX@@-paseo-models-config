@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Paseo 로컬 음성 모델 경로를 이미지의 읽기 전용 디렉터리로 지정한다 (config.json providers.local.modelsDir).
+#
+# 환경변수 PASEO_LOCAL_MODELS_DIR 로는 지정할 수 없다. managed 모드의 데몬은 설정용 환경변수를
+# 지우고 뜨기 때문이다(daemonLaunchEnvironment, 0.4.24 canary 에서 실측). 설정은 config.json 으로만 준다.
+#
+# 한 번만 병합하고 마커로 재실행을 막는다. 멤버가 이미 modelsDir 를 지정했다면 덮어쓰지 않는다.
+# @@PFX@@-container-keeper 가 컨테이너 시작 때 멤버 계정으로 호출하며, 실패해도 컨테이너는 계속 뜬다.
+set -euo pipefail
+
+IMAGE_MODELS=/opt/@@PFX@@/paseo-models
+CONFIG="${HOME}/.paseo/config.json"
+MARKER="${HOME}/.paseo/.@@PFX@@-models-v1"
+
+OLD_MODELS="${HOME}/.paseo/models/local-speech"
+# 이미지에 들어 있는 모델 폴더 이름. 이전 기본 위치의 같은 폴더는 내용이 이미지와 같을 때만 지운다.
+MODEL_DIRS=(sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8 kokoro-en-v0_19)
+
+# 이전 기본 위치(~/.paseo/models/local-speech)에 남은 모델 사본을 정리한다.
+#  - 받다 만 임시 파일(.downloads)은 지운다.
+#  - 모델 폴더는 이미지의 것과 (크기, 상대경로) 목록이 같을 때만 지운다 — 다르면 손대지 않는다.
+#  - config.json 이 이미지 경로를 가리킬 때만 한다(멤버가 직접 경로를 지정했다면 하지 않는다).
+cleanup_old_models() {
+    [[ -d "${OLD_MODELS}" ]] || return 0
+    [[ "$(jq -r '.providers.local.modelsDir // ""' "${CONFIG}" 2>/dev/null)" == "${IMAGE_MODELS}" ]] || return 0
+    rm -rf -- "${OLD_MODELS}/.downloads"
+    local d a b
+    for d in "${MODEL_DIRS[@]}"; do
+        [[ -d "${OLD_MODELS}/${d}" && -d "${IMAGE_MODELS}/${d}" ]] || continue
+        a="$(cd "${OLD_MODELS}/${d}" && find . -type f -printf '%s %P\n' | sort | md5sum)"
+        b="$(cd "${IMAGE_MODELS}/${d}" && find . -type f -printf '%s %P\n' | sort | md5sum)"
+        if [[ "${a}" == "${b}" ]]; then
+            rm -rf -- "${OLD_MODELS:?}/${d}"
+        else
+            echo "@@PFX@@-paseo-models-config: ${OLD_MODELS}/${d} 가 이미지와 달라 남겨 둠" >&2
+        fi
+    done
+}
+
+[[ -d "${IMAGE_MODELS}" ]] || exit 0
+if [[ -e "${MARKER}" ]]; then
+    cleanup_old_models
+    exit 0
+fi
+
+# 데몬이 첫 기동에서 config.json 을 만들 때까지 기다린다
+for _ in {1..30}; do
+    [[ -f "${CONFIG}" ]] && break
+    sleep 1
+done
+if [[ ! -f "${CONFIG}" ]]; then
+    echo "@@PFX@@-paseo-models-config: config.json 이 아직 없어 건너뜀 (다음 시작 때 다시 시도)" >&2
+    exit 0
+fi
+
+tmp="$(mktemp "${HOME}/.paseo/.config.XXXXXX")"
+trap 'rm -f "${tmp}"' EXIT
+
+jq --arg dir "${IMAGE_MODELS}" '
+    .providers = (.providers // {}) |
+    .providers.local = (.providers.local // {}) |
+    .providers.local.modelsDir = (.providers.local.modelsDir // $dir)
+' "${CONFIG}" > "${tmp}"
+
+chmod 0600 "${tmp}"
+mv "${tmp}" "${CONFIG}"
+trap - EXIT
+
+touch "${MARKER}"
+chmod 0600 "${MARKER}"
+
+# 데몬이 새 설정을 읽도록 다시 시작한다
+paseo daemon restart >/dev/null 2>&1 || echo "@@PFX@@-paseo-models-config: WARNING: paseo daemon restart 실패" >&2
+
+# 재시작으로 이전 다운로드 작업이 끝났으니, 이전 위치에 남은 사본을 정리한다
+cleanup_old_models

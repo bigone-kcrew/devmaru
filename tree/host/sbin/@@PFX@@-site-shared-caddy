@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# @@PFX@@-site-shared-caddy (root) — 공용 정적 프로젝트 이름 목록(표준입력, 한 줄에 하나)으로 /etc/caddy/@@PFX@@-shared.caddy 를 만들고
+# Caddyfile 전체를 검증한 뒤 reload 한다. 실패하면 원래 파일로 되돌린다. @@PORTAL_HOST@@ 블록의 포털 handle 앞에서 import 된다(install-v3.sh).
+#   @@PORTAL_HOST@@/<프로젝트>/…  →  공용 샌드박스(127.0.0.1:18199, @@PFX@@-publish-shared.service)
+# 환경: CADDY_DIR(기본 /etc/caddy) · DRY=1(검증만, reload·락 없음) · AI_SITE_SHARED_PORT(기본 18199)
+set -euo pipefail
+CADDY_DIR=${CADDY_DIR:-/etc/caddy}; PORT=${AI_SITE_SHARED_PORT:-18199}; DRY=${DRY:-0}
+F=$CADDY_DIR/Caddyfile; SF=$CADDY_DIR/@@PFX@@-shared.caddy
+names=()
+while IFS= read -r n; do
+  [[ -z $n ]] && continue
+  [[ $n =~ ^[a-z][a-z0-9-]{1,30}$ ]] || { echo "이름 규칙 위반: $n" >&2; exit 2; }
+  names+=("$n")
+done
+((${#names[@]} <= 10)) || { echo "공용 프로젝트는 최대 10개: ${#names[@]}" >&2; exit 2; }
+# 주석 처리된 행이나 부분 일치는 인정하지 않는다(행 전체가 «import <파일>» 이어야 한다)
+awk -v s="import $SF" '{ sub(/\r$/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 == s) f = 1 } END { exit !f }' "$F" || { echo "Caddyfile 의 ai 블록에 'import $SF' 가 없다(install-v3.sh 가 넣는다)" >&2; exit 3; }
+((DRY)) || { exec 9>"${AI_PASEO_LOCK:-/run/@@PFX@@-paseo-caddy.lock}"; flock 9; }   # @@PFX@@-site-caddy · @@PFX@@-paseo-caddy 와 같은 락
+had=0; [[ -f $SF ]] && { had=1; cp -p "$SF" "$SF.prev"; }
+undo(){ if ((had)); then mv -f "$SF.prev" "$SF"; else rm -f "$SF"; fi; echo "실패 — 원복함" >&2; exit 1; }
+trap 'undo' ERR
+{
+  echo "# @@PFX@@-site-shared-caddy (자동 생성 — 직접 수정하지 말 것)"
+  for n in "${names[@]}"; do
+    printf '@shared_%s path /%s /%s/*\nhandle @shared_%s {\n\treverse_proxy 127.0.0.1:%s\n}\n' "${n//-/_}" "$n" "$n" "${n//-/_}" "$PORT"
+  done
+} > "$SF.new"
+mv -f "$SF.new" "$SF"; chmod 644 "$SF"
+V=$F
+if ((DRY)); then V=$F.dryvalid; sed "s#/var/log/caddy/#$CADDY_DIR/#g" "$F" > "$V"; fi   # @@ADMIN_USER@@ 은 운영 로그 파일을 못 열어 검증용 복사본만 로그 경로를 바꾼다
+out=$(XDG_DATA_HOME=${TMPDIR:-/tmp}/@@PFX@@-site-shared-caddy-xdg caddy validate --config "$V" --adapter caddyfile 2>&1) || { echo "$out" | grep -iE "error|invalid" | head -5 >&2; false; }
+((DRY)) && rm -f "$V"
+if ((DRY)); then trap - ERR; rm -f "$SF.prev"; echo "DRY: 검증 통과(${#names[@]}개), reload 안 함"; exit 0; fi
+systemctl reload caddy
+trap - ERR; rm -f "$SF.prev"
+echo "공용 정적 ${#names[@]}개 반영: ${names[*]:-없음}"

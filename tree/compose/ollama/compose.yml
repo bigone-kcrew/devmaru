@@ -1,0 +1,20 @@
+# @@PFX@@-ollama — 2026-10-21 compose 화(종전: docker run 으로 직접 생성, 정의 파일 없음). 설정은 생성 당시 docker inspect(ops/logs/ollama_inspect_before_20261021.json)와 동일.
+# 네트워크: @@PFX@@-memory-net(mem0 게이트웨이용 기존) + @@PFX@@-internal-net(2026-10-21 신설, 알리오 임베딩용 전용)
+services:
+  @@PFX@@-ollama:
+    container_name: @@PFX@@-ollama
+    image: ollama/ollama:0.40.16
+    restart: unless-stopped
+    mem_limit: 3758096384          # 3.5GiB (기존과 동일)
+    memswap_limit: 3758096384      # 2026-10-21: 스왑 비활성(= mem_limit). 모델 메모리가 스왑으로 내려가 임베딩이 9초 걸린 적이 있어(18:50) 막는다
+    ports: ["127.0.0.1:11435:11434"]
+    volumes: ["/srv/@@PFX@@/nvme/ollama:/root/.ollama"]
+    environment:
+      - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_HOST=0.0.0.0:11434
+    networks: [@@PFX@@-memory-net, @@PFX@@-internal-net]
+networks:
+  @@PFX@@-memory-net:
+    external: true
+  @@PFX@@-internal-net:
+    external: true

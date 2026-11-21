@@ -1,0 +1,25 @@
+services:
+  n8n:
+    image: n8nio/n8n:2.47.5
+    container_name: n8n
+    restart: unless-stopped
+
+    group_add:
+      - "@@GID@@"
+
+    env_file:
+      - /opt/@@PFX@@/config/env/n8n.env
+
+    ports:
+      - "127.0.0.1:5678:5678"
+
+    volumes:
+      - /srv/@@PFX@@/services/n8n/data:/home/node/.n8n
+      - /srv/@@PFX@@/onboarding:/srv/@@PFX@@/onboarding:ro
+
+    networks:
+      - @@PFX@@-service-net
+
+networks:
+  @@PFX@@-service-net:
+    external: true

@@ -1,0 +1,18 @@
+[Unit]
+Description=@@BRAND@@ Samba SMB over QUIC
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/srv/@@PFX@@/samba/smb.conf
+ConditionPathExists=/srv/@@PFX@@/samba/tls/cert.pem
+ConditionPathExists=/srv/@@PFX@@/samba/tls/key.pem
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/modprobe quic
+ExecStart=/usr/sbin/smbd --foreground --no-process-group --configfile=/srv/@@PFX@@/samba/smb.conf
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# 이 Golden 회차 전용 검증 — `@@PFX@@-golden rc` 가 RC 이미지 태그를 인자로 호출한다(실패하면 비-0).
+# 파일 이름은 <Golden 버전>.checks 이고 실행 권한이 있어야 한다. 다음 회차에는 복사해 «이번에 새로 물어야 할 것» 만 고친다.
+IMG="${1:?이미지 태그를 달라}"
+fail=0
+chk(){ docker run --rm --entrypoint bash "$IMG" -lc "$2" >/dev/null 2>&1 && echo "  OK    $1" || { echo "  FAIL  $1"; fail=1; }; }
+chk "Core Skill 21개" '[ "$(ls -1 /opt/@@PFX@@/skills | wc -l)" = 21 ]'
+chk "memory 스킬 없음" '[ ! -e /opt/@@PFX@@/skills/memory-save ]'
+chk "entrypoint 설치" 'test -x /usr/local/bin/@@PFX@@-entrypoint'
+exit $fail

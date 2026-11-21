@@ -1,0 +1,22 @@
+[Unit]
+Description=@@PFX@@-site (v3): discover member/shared publish folders and refresh the sandbox bind mounts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/@@PFX@@-site-sync
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=300
+# 샌드박스 — 쓰는 곳: 샌드박스 drop-in(/run/systemd/system), 상태(/var/lib/@@PFX@@), 공용 매처 생성기가 쓰는 Caddy 설정·로그 경로·락(/run).
+# /var/log/caddy 가 필요한 이유: ProtectSystem=strict 에서 `caddy validate` 가 로그 파일을 못 열어 첫 적용이 실패한 적이 있다(2026-10-22).
+ProtectSystem=strict
+ReadWritePaths=/run/systemd/system /var/lib/@@PFX@@ /etc/caddy /var/log/caddy /run /home
+RuntimeDirectory=@@PFX@@-site-sync
+# 멤버에게 공개 상태 안내(~/.@@PFX@@/apps/.site)를 쓴다 — @@PFX@@-site-note 가 멤버 uid 로 헬퍼를 실행한다(/home 쓰기 필요)
+Environment=AI_SITE3_NOTE=/usr/local/sbin/@@PFX@@-site-note
+PrivateTmp=yes
+NoNewPrivileges=yes
+# 샌드박스 포트 응답 확인(127.0.0.1)과 systemctl(AF_UNIX)만
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost

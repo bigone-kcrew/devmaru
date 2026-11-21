@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# 페어링 URL 은 접속 비밀이다 — 만들어지는 순간부터 root 만 읽게 한다(마지막에 n8n·onboarding 용으로 640 root:@@PFX@@)
+umask 077
+
+if [[ $EUID -ne 0 ]]; then
+  echo "ERROR: run as root: sudo @@PFX@@-paseo-pair-qr-create <username>"
+  exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: @@PFX@@-paseo-pair-qr-create <username>"
+  exit 1
+fi
+
+USERNAME="$1"
+
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
+ONBOARDING_DIR="/srv/@@PFX@@/onboarding/${USERNAME}"
+URL_FILE="${ONBOARDING_DIR}/pairing-url.txt"
+PNG_FILE="${ONBOARDING_DIR}/pairing.png"
+
+if [[ ! -f "$URL_FILE" ]]; then
+  echo "ERROR: pairing url not found: $URL_FILE"
+  echo "Run @@PFX@@-paseo-pair-create first"
+  exit 1
+fi
+
+TMP_PNG="${PNG_FILE}.tmp.$$"
+trap 'rm -f "$TMP_PNG"' EXIT
+qrencode \
+  -o "$TMP_PNG" \
+  -s 8 \
+  -m 4 \
+  < "$URL_FILE"
+
+mv -f "$TMP_PNG" "$PNG_FILE"
+chown root:@@PFX@@ "$PNG_FILE"
+chmod 640 "$PNG_FILE"
+
+echo "QR created:"
+echo "$PNG_FILE"

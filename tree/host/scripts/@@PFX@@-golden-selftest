@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""@@PFX@@-golden-selftest — RC 이미지 자체 검증
+
+  @@PFX@@-golden-selftest @@PFX@@-dev:0.4.19-rc1
+
+**기대값을 Dockerfile 의 ARG 에서 읽는다.** 종전에는 스크립트에 버전을 손으로 박아
+회차마다 고쳐야 했고, 2026-09-25 에 그걸 고치다 두 번 틀렸다. 핀과 검사가 갈라지지
+않도록 한 곳에서만 읽는다.
+"""
+import re, subprocess, sys
+
+DOCKERFILE = "/opt/@@PFX@@/images/dev/Dockerfile"
+
+def arg(name):
+    with open(DOCKERFILE, encoding="utf-8") as fh:
+        for line in fh:
+            m = re.match(r"ARG %s=(\S+)" % re.escape(name), line)
+            if m:
+                return m.group(1)
+    return None
+
+IMG = sys.argv[1] if len(sys.argv) > 1 else sys.exit("이미지 태그를 달라")
+npass = nfail = 0
+
+def run(cmd):
+    p = subprocess.run(["docker", "run", "--rm", "--entrypoint", "bash", IMG, "-lc", cmd],
+                       capture_output=True, text=True, timeout=180)
+    return (p.stdout + p.stderr).replace("\r", "").strip().split("\n")[0]
+
+def ck(label, want, cmd, exact=False):
+    global npass, nfail
+    got = run(cmd)
+    # 부분 문자열이면 «2.1.31» 이 «2.1.310» 에, «0» 이 «10» 에 통과한다 — 숫자·점 경계를 본다
+    hit = got == want if exact else re.search(r"(?<![0-9.])" + re.escape(want) + r"(?![0-9]|\.[0-9])", got)
+    if hit:
+        print("  OK    %-24s %s" % (label, got)); npass += 1
+    else:
+        print("  FAIL  %-24s 기대 %-12s 실측 %s" % (label, want, got)); nfail += 1
+
+def have(label, path):
+    global npass, nfail
+    p = subprocess.run(["docker", "run", "--rm", "--entrypoint", "bash", IMG, "-lc",
+                        "test -e '%s'" % path], capture_output=True)
+    if p.returncode == 0:
+        print("  OK    %-24s %s" % (label, path)); npass += 1
+    else:
+        print("  FAIL  %-24s 없음: %s" % (label, path)); nfail += 1
+
+print("=== 이미지 ===")
+print(subprocess.run(["docker", "images", IMG, "--format", "  {{.Repository}}:{{.Tag}}  {{.ID}}"],
+                     capture_output=True, text=True).stdout.rstrip())
+
+print("=== 런타임 — 기대값은 Dockerfile ARG 에서 읽는다 ===")
+for label, argname, cmd in [
+    ("Claude Code",   "CLAUDE_CODE_VERSION",   "claude --version"),
+    ("Codex",         "CODEX_VERSION",         "codex --version"),
+    ("Paseo",         "PASEO_VERSION",         "paseo --version"),
+    ("Antigravity",   "ANTIGRAVITY_VERSION",   "agy --version"),
+    ("Vercel",        "VERCEL_VERSION",        "vercel --version"),
+    ("pnpm",          "PNPM_VERSION",          "pnpm --version"),
+    ("Node",          "NODE_VERSION",          "node --version"),
+    ("Bun",           "BUN_VERSION",           "bun --version"),
+    ("glab",          "GLAB_VERSION",          "glab --version"),
+    ("uv",            "UV_VERSION",            "uv --version"),
+    ("agent-browser", "AGENT_BROWSER_VERSION", "agent-browser --version"),
+]:
+    want = arg(argname)
+    if want is None:
+        print("  ?     %-24s Dockerfile 에 ARG %s 가 없다" % (label, argname)); nfail += 1
+    else:
+        ck(label, want, cmd)
+
+print("=== Skills ===")
+have("skills 디렉터리", "/opt/@@PFX@@/skills")
+n = run("ls -1 /opt/@@PFX@@/skills | wc -l")
+if n.isdigit() and int(n) >= 21:   # canary 와 같은 기준(-ge 21)
+    print("  OK    %-24s %s개" % ("Core Skills", n)); npass += 1
+else:
+    print("  FAIL  %-24s 21개 이상이어야 하는데 %s개" % ("Core Skills", n)); nfail += 1
+miss = run("for d in /opt/@@PFX@@/skills/*/; do [ -f \"$d/SKILL.md\" ] || basename $d; done")
+if not miss:
+    print("  OK    %-24s 전부 SKILL.md 보유" % "SKILL.md 검증"); npass += 1
+else:
+    print("  FAIL  %-24s 없음: %s" % ("SKILL.md 검증", miss)); nfail += 1
+
+print("=== Antigravity 스킬 경로 (2026-09-25 교정) ===")
+ck("@@PFX@@-skill-sync GEMINI 루트", "config/skills", "grep GEMINI_ROOT= /usr/local/bin/@@PFX@@-skill-sync | head -1")
+ck("옛 경로 정리 코드", "GEMINI_LEGACY_ROOT", "grep -o GEMINI_LEGACY_ROOT /usr/local/bin/@@PFX@@-skill-sync | head -1")
+
+print("=== Antigravity ===")
+have("agy CLI", "/usr/local/bin/agy")
+
+print("=== Superpowers 동기화 (0.4.29: 번들 경로·버전을 번들에서 읽는다 — 0.4.28 은 경로가 낡아 멤버 Claude 에서 로드 실패) ===")
+ck("sync 에 옛 경로 없음", "0", "grep -c 'superpowers/v6[.]' /usr/local/bin/@@PFX@@-plugin-sync", exact=True)
+ck("Superpowers 동기화", "exit=0", "H=$(mktemp -d); HOME=$H @@PFX@@-plugin-sync >/dev/null 2>&1; echo exit=$?; rm -rf $H")
+ck("muse 기본 끄기 마커", "@@PFX@@-providers-v3", "grep -o @@PFX@@-providers-v3 /usr/local/bin/@@PFX@@-entrypoint | head -1")
+
+print("=== 텔레메트리 차단 (회차를 넘기며 지워지기 쉽다) ===")
+ck("hyperframes 차단", "1", "printenv HYPERFRAMES_NO_TELEMETRY")
+ck("DO_NOT_TRACK", "1", "printenv DO_NOT_TRACK")
+ck("superpowers 차단", "true", "printenv SUPERPOWERS_DISABLE_TELEMETRY")
+ck("AGY 자동갱신 차단", "true", "printenv AGY_CLI_DISABLE_AUTO_UPDATE")
+
+print("=== helper ===")
+for label, path in [("@@PFX@@-skill-sync", "/usr/local/bin/@@PFX@@-skill-sync"),
+                    ("@@PFX@@-user-bootstrap", "/usr/local/bin/@@PFX@@-user-bootstrap"),
+                    ("kordoc-api", "/usr/local/bin/kordoc-api"),
+                    ("tmux", "/usr/bin/tmux"),
+                    ("archify", "/opt/@@PFX@@/skills/archify")]:
+    have(label, path)
+print("  (@@PFX@@-mcp-sync 는 런타임 바인드 마운트라 이미지에 없는 것이 정상이다)")
+
+print("\n  === PASS %d · FAIL %d ===" % (npass, nfail))
+sys.exit(1 if nfail else 0)

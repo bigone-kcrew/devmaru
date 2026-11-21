@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec sudo -n /opt/@@PFX@@/scripts/@@PFX@@-member-tmux "$@"

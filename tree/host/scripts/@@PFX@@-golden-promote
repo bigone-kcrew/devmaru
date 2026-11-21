@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=""
+RC_IMAGE=""
+CHANGES_FILE=""
+PLAN=0
+RUN_TESTS=1
+CONFIG="/opt/@@PFX@@/config/dev-container.env"
+RELEASES="/opt/@@PFX@@/images/dev/releases"
+SELFTEST="/opt/@@PFX@@/scripts/@@PFX@@-golden-selftest"
+CANARY="/opt/@@PFX@@/scripts/@@PFX@@-golden-canary"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sudo @@PFX@@-golden-promote <version> [options]
+
+Promote a verified Golden RC to stable. This command never rolls out
+member containers.
+
+Options:
+  --from <image>          RC image (default: @@PFX@@-dev:<version>-rc1)
+  --changes-file <file>   Release changes text (default: releases/<version>.changes)
+  --plan                  Show checks and writes without changing anything
+  --no-tests              Do not rerun self-test/canary (explicit only)
+  -h, --help              Show this help
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) [[ $# -ge 2 ]] || die "--from requires an image"; RC_IMAGE="$2"; shift 2 ;;
+    --changes-file) [[ $# -ge 2 ]] || die "--changes-file requires a file"; CHANGES_FILE="$2"; shift 2 ;;
+    --plan) PLAN=1; shift ;;
+    --no-tests) RUN_TESTS=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) die "unknown option: $1" ;;
+    *) [[ -z "$VERSION" ]] || die "only one version is allowed"; VERSION="$1"; shift ;;
+  esac
+done
+
+[[ -n "$VERSION" ]] || { usage >&2; exit 2; }
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z"
+[[ $EUID -eq 0 ]] || die "run as root: sudo @@PFX@@-golden-promote $VERSION"
+
+RC_IMAGE="${RC_IMAGE:-@@PFX@@-dev:${VERSION}-rc1}"
+STABLE_IMAGE="@@PFX@@-dev:${VERSION}"
+CHANGES_FILE="${CHANGES_FILE:-${RELEASES}/${VERSION}.changes}"
+MANIFEST="${RELEASES}/${VERSION}.manifest"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+PREVIOUS="$(awk -F= '/^GOLDEN_IMAGE=/{print $2; exit}' "$CONFIG" 2>/dev/null || true)"
+[[ -n "$PREVIOUS" ]] || die "cannot read GOLDEN_IMAGE from $CONFIG"
+
+command -v docker >/dev/null 2>&1 || die "docker not found"
+[[ -r "$CONFIG" ]] || die "config not readable: $CONFIG"
+[[ -d "$RELEASES" ]] || die "release directory missing: $RELEASES"
+if [[ "$PLAN" -eq 0 ]]; then
+  [[ -f "$CHANGES_FILE" ]] || die "changes file missing: $CHANGES_FILE (이번 회차 변경 내용을 먼저 적어 둔다 — docs/GOLDEN.md)"
+fi
+
+RC_ID="$(docker image inspect "$RC_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+[[ -n "$RC_ID" ]] || die "RC image not found: $RC_IMAGE"
+STABLE_ID="$(docker image inspect "$STABLE_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+
+echo "Golden promotion — $RC_IMAGE -> $STABLE_IMAGE"
+echo "RC image ID: $RC_ID"
+[[ -n "$STABLE_ID" ]] && echo "Existing stable ID: $STABLE_ID"
+echo "Previous pointer: $PREVIOUS"
+echo "Changes: $CHANGES_FILE"
+
+if [[ "$PLAN" -eq 1 ]]; then
+  echo
+  echo "PLAN only — no image tag, manifest, or pointer changes."
+  echo "Would run:"
+  echo "  $SELFTEST $RC_IMAGE"
+  echo "  $CANARY $RC_IMAGE $VERSION"
+  echo "  docker tag $RC_IMAGE $STABLE_IMAGE"
+  echo "  write $MANIFEST"
+  echo "  set GOLDEN_IMAGE=$STABLE_IMAGE"
+  [[ -f "$CHANGES_FILE" ]] || echo "WARNING: changes file is not present yet"
+  exit 0
+fi
+
+if [[ "$RUN_TESTS" -eq 1 ]]; then
+  [[ -x "$SELFTEST" ]] || die "self-test missing or not executable: $SELFTEST"
+  [[ -x "$CANARY" ]] || die "canary missing or not executable: $CANARY"
+  echo; echo "=== SELF-TEST ==="; "$SELFTEST" "$RC_IMAGE"
+  echo; echo "=== CANARY ==="; "$CANARY" "$RC_IMAGE" "$VERSION"
+else
+  echo; echo "WARNING: --no-tests used; RC verification is not rerun."
+fi
+
+if [[ -n "$STABLE_ID" && "$STABLE_ID" != "$RC_ID" ]]; then
+  die "stable tag already points to a different image: $STABLE_ID"
+fi
+
+docker tag "$RC_IMAGE" "$STABLE_IMAGE"
+FINAL_ID="$(docker image inspect "$STABLE_IMAGE" --format '{{.Id}}')"
+[[ "$FINAL_ID" == "$RC_ID" ]] || die "stable tag ID mismatch"
+
+TMP_MANIFEST="$(mktemp "${RELEASES}/.${VERSION}.manifest.XXXXXX")"
+TMP_CONFIG="$(mktemp "${CONFIG}.XXXXXX")"
+cleanup() { rm -f "$TMP_MANIFEST" "$TMP_CONFIG"; }
+trap cleanup EXIT
+
+{
+  echo "@@BRAND@@ Golden Image Release"
+  echo
+  echo "Version: $VERSION"
+  echo "Image: $STABLE_IMAGE"
+  echo "Promoted-From: $RC_IMAGE"
+  echo "Previous-Stable: $PREVIOUS"
+  echo "Status: stable"
+  echo "Release-Date: $(date +%F)"
+  echo "Image-ID: $FINAL_ID"
+  echo
+  echo "Changes:"
+  echo
+  cat "$CHANGES_FILE"
+  echo
+  echo "Verification:"
+  echo
+  if [[ "$RUN_TESTS" -eq 1 ]]; then
+    echo "    @@PFX@@-golden-selftest  PASS"
+    echo "    @@PFX@@-golden-canary    PASS"
+  else
+    echo "    @@PFX@@-golden-selftest  NOT RUN (--no-tests)"
+    echo "    @@PFX@@-golden-canary    NOT RUN (--no-tests)"
+  fi
+} > "$TMP_MANIFEST"
+
+install -o root -g root -m 0644 "$TMP_MANIFEST" "$MANIFEST"
+cp -a "$CONFIG" "${CONFIG}.bak.${TIMESTAMP}"
+sed "s|^GOLDEN_IMAGE=.*|GOLDEN_IMAGE=$STABLE_IMAGE|" "$CONFIG" > "$TMP_CONFIG"
+install -o root -g root -m "$(stat -c '%a' "$CONFIG")" "$TMP_CONFIG" "$CONFIG"
+
+echo
+echo "PROMOTE PASS"
+echo "stable:   $STABLE_IMAGE"
+echo "image ID: $FINAL_ID"
+echo "manifest: $MANIFEST"
+echo "pointer:  $CONFIG"
+echo
+echo "Member rollout is separate:"
+echo "  sudo @@PFX@@-member-update-all --check"
+echo "  sudo @@PFX@@-member-update-all"

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# @@PFX@@-agent-audit — 에이전트 계정의 sudo 실행 기록(실행된 명령). 사용: sudo @@PFX@@-agent-audit [--tail N]  (기본 50줄)
+set -uo pipefail
+LOG=/var/log/@@PFX@@/agent-audit.log; N=50
+case "${1:-}" in --tail) N=${2:-}; [[ $N =~ ^[0-9]+$ ]] || { echo "실패: --tail 은 숫자" >&2; exit 1; };; "") ;; *) echo "사용: @@PFX@@-agent-audit [--tail N]" >&2; exit 1;; esac
+[ -r "$LOG" ] || { echo "안내: 기록이 없거나 읽을 수 없습니다($LOG) — sudo 로 실행하세요. 에이전트 계정은 설치 뒤 sudo @@PFX@@-agent-setup install"; exit 0; }
+[ -s "$LOG" ] || { echo "안내: 아직 기록이 없습니다"; exit 0; }
+tail -n "$N" "$LOG"

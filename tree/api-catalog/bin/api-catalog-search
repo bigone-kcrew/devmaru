@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path("/opt/@@PFX@@/api-catalog")
+CATALOG = ROOT / "data/catalog.json"
+HEALTH_STATE = ROOT / "data/health-state.json"
+
+
+def normalize(s):
+    return re.sub(r"\s+", " ", (s or "").casefold()).strip()
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+
+
+def is_ascii_token(term):
+    return bool(re.fullmatch(r"[a-z0-9.+#_-]+", term))
+
+
+def contains_term(text, term):
+    text = normalize(text)
+    term = normalize(term)
+
+    if not term:
+        return False
+
+    # Short ASCII tokens such as AI, API, SMS, STT:
+    # require token boundaries to avoid Airbnb/FairData/KAIA false positives.
+    if is_ascii_token(term) and len(term) <= 4:
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        return re.search(pattern, text) is not None
+
+    return term in text
+
+
+def field_score(value, term, field):
+    value_n = normalize(value)
+    term_n = normalize(term)
+
+    if not value_n or not term_n:
+        return 0
+
+    exact = value_n == term_n
+    hit = contains_term(value_n, term_n)
+
+    if not hit:
+        return 0
+
+    if field == "name":
+        return 120 if exact else 60
+
+    if field == "category":
+        return 80 if exact else 35
+
+    if field == "description":
+        # Short Korean substrings can produce false positives:
+        # e.g. "문자" inside "방문자".
+        if not is_ascii_token(term_n) and len(term_n) <= 2:
+            return 2
+        return 15
+
+    if field == "auth":
+        return 8 if exact else 3
+
+    return 0
+
+
+def score(entry, terms):
+    fields = {
+        "name": entry.get("name"),
+        "category": entry.get("category"),
+        "description": entry.get("description"),
+        "auth": entry.get("auth"),
+    }
+
+    total = 0
+    matched_terms = 0
+    per_term = []
+
+    for term in terms:
+        term_score = 0
+
+        for field, value in fields.items():
+            term_score += field_score(value, term, field)
+
+        if term_score > 0:
+            matched_terms += 1
+
+        per_term.append(term_score)
+        total += term_score
+
+    # Reward results covering more of the user's query.
+    if matched_terms >= 2:
+        total += matched_terms * 25
+
+    if matched_terms == len(terms) and len(terms) > 1:
+        total += 50
+
+    return total, matched_terms, per_term
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="@@BRAND@@ 한국 API Catalog 검색"
+    )
+
+    ap.add_argument("query", nargs="+", help="검색어")
+    ap.add_argument(
+        "--mode",
+        choices=["any", "all"],
+        default="any",
+        help="any: 하나 이상 일치, all: 모든 검색어 일치",
+    )
+    ap.add_argument("--category")
+    ap.add_argument("--auth")
+    ap.add_argument("--limit", type=int, default=20)
+    ap.add_argument(
+        "--min-score",
+        type=int,
+        default=10,
+        help="최소 검색 점수 (기본값: 10)",
+    )
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--debug", action="store_true")
+
+    args = ap.parse_args()
+
+    catalog = load_json(CATALOG, None)
+
+    if not catalog:
+        print("ERROR: catalog not found", file=sys.stderr)
+        return 1
+
+    state_obj = load_json(
+        HEALTH_STATE,
+        {"results": []},
+    )
+
+    health = {
+        x["id"]: x
+        for x in state_obj.get("results", [])
+    }
+
+    terms = [
+        normalize(x)
+        for x in args.query
+        if normalize(x)
+    ]
+
+    if not terms:
+        print("ERROR: empty query", file=sys.stderr)
+        return 1
+
+    rows = []
+
+    for entry in catalog["entries"]:
+        if args.category:
+            if normalize(args.category) not in normalize(
+                entry.get("category")
+            ):
+                continue
+
+        if args.auth:
+            if normalize(args.auth) != normalize(
+                entry.get("auth")
+            ):
+                continue
+
+        s, matched_terms, per_term = score(entry, terms)
+
+        if args.mode == "all":
+            if matched_terms != len(terms):
+                continue
+        else:
+            if matched_terms == 0:
+                continue
+
+        if s < args.min_score:
+            continue
+
+        row = dict(entry)
+        row["score"] = s
+        row["matched_terms"] = matched_terms
+
+        hs = health.get(entry["id"])
+        row["health_state"] = (
+            hs["state"] if hs else "UNKNOWN"
+        )
+
+        if args.debug:
+            row["debug_term_scores"] = {
+                term: value
+                for term, value in zip(terms, per_term)
+            }
+
+        rows.append(row)
+
+    rows.sort(
+        key=lambda x: (
+            -x["score"],
+            -x["matched_terms"],
+            normalize(x["name"]),
+        )
+    )
+
+    rows = rows[:max(1, args.limit)]
+
+    if args.json:
+        print(json.dumps({
+            "query": " ".join(args.query),
+            "mode": args.mode,
+            "count": len(rows),
+            "source_commit": catalog["source"]["commit"],
+            "results": rows,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"검색어: {' '.join(args.query)}")
+    print(f"모드: {args.mode}")
+    print(f"결과: {len(rows)}개")
+    print(f"Catalog: {catalog['source']['commit'][:12]}")
+    print()
+
+    for i, x in enumerate(rows, 1):
+        print(f"{i}. {x['name']}")
+        print(f"   점수: {x['score']}")
+        print(f"   분류: {x.get('category') or '-'}")
+        print(f"   인증: {x.get('auth') or '-'}")
+        print(f"   상태: {x['health_state']}")
+        print(f"   설명: {x.get('description') or '-'}")
+        print(f"   URL: {x['url']}")
+
+        if args.debug:
+            print(f"   DEBUG: {x['debug_term_scores']}")
+
+        print()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

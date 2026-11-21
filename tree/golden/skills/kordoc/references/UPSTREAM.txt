@@ -1,0 +1,6 @@
+Repository: https://github.com/chrisryugj/kordoc
+Branch: main (tag v4.24.0 has the same file)
+Source: plugins/kordoc/skills/kordoc/SKILL.md
+GitHub blob SHA: 1b49724bea2a26ed41a23993dd59b1776ddf5755
+Retrieved: 2026-10-21 (kordoc 4.24.0)
+Purpose: @@BRAND@@ upstream reference; not distributed directly yet.

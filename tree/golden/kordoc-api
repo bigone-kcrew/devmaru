@@ -1,0 +1,2822 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+KORDOC_API_BASE="${KORDOC_API_BASE:-http://kordoc:3400}"
+KORDOC_API_TOKEN="${KORDOC_API_TOKEN:-}"
+KORDOC_API_TIMEOUT="${KORDOC_API_TIMEOUT:-600}"
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  kordoc-api health
+  kordoc-api version
+
+  kordoc-api generate-hwpx <markdown-file> -o <output.hwpx> [--options <options.json>]
+  kordoc-api generate-hwpx-advanced <markdown-file> -o <output.hwpx> [--options <options.json>] [--profile <profile.json>] [--template <template.hwpx>] [--image <image>]...
+
+  kordoc-api render-native <file> -o <output> [--format <png|jpeg|svg|html|pdf>] [--pages <range>] [--max-width-px <200-4000>] [--highlight <text>]... [--reflow-mode <keep|charAll>]
+
+  kordoc-api extract-tables <file> [--visual <none|non-tabular|non-tabular-and-uncertain|all>] [--format <png|jpeg>] [--padding-pt <0-100>] [--cells] [--output-dir <dir>]
+
+  kordoc-api crop-regions <file> [--target <table|image|paragraph|shape>]... [--format <png|jpeg>] [--pages <range>] [--padding-pt <0-100>] [--output-dir <dir>]
+
+  kordoc-api parse-pages <file> [--ocr <false|true|force>] [--table-format gfm]
+  kordoc-api parse-table <file> [--ocr <false|true|force>] [--images <true|false>]
+  kordoc-api parse-chunks <file> [--ocr <false|true|force>] [--granularity <section|block>] [--include-table-cells]
+
+  kordoc-api patch <file> --markdown <markdown-file> -o <output.hwp|output.hwpx> [--options <options.json>]
+  kordoc-api seal <file> --image <seal-image> --ops <ops.json> -o <output.hwpx>
+
+  kordoc-api seal-native <file> --image <seal-image> -o <output.hwpx> [--anchor <text>] [--occurrence <n>] [--size-mm <n>] [--mode <auto|overlap|right>] [--dx-mm <n>] [--dy-mm <n>]
+
+  kordoc-api patch-native <file> --markdown <markdown-file> -o <output.hwp|output.hwpx> [--no-structure]
+
+  kordoc-api detect <file>
+  kordoc-api metadata <file> [common parse options] [--table-format gfm]
+  kordoc-api validate <file>
+  kordoc-api compare <fileA> <fileB> [--ocr <false|true|force>]
+  kordoc-api lint <file|-> [--munche <true|false>] [--strict]
+  kordoc-api lint-full (--file <document> | --text-file <text> | --blocks <blocks.json>) [--munche|--slop|--logic|--numbers|--budget|--gate <true|false>] [--preset <name>]
+  kordoc-api form-parse <file>
+  kordoc-api profile-extract <reference.hwpx> -o <profile.json>
+
+  kordoc-api fill <file> --values <values.json> [options]
+  kordoc-api fill --template <gian|gian-simple|일반기안문|간이기안문> --values <values.json> [options]
+  kordoc-api redact <file> [options]
+
+  kordoc-api parse <file> [options]
+
+Formats (auto-detected): HWP, HWPX, PDF, XLSX, XLS, DOCX, PPTX, images. PPTX: one slide = one page.
+
+Fill options:
+  --values <values.json>
+      Required JSON object containing fill values.
+      Values are read from the file and are not expanded into the shell command line.
+
+  --formats <formats.json>
+      Optional JSON object containing per-field format rules.
+
+  --require-unique
+      Reject scalar fields that match multiple locations.
+
+  --mask-values
+      Hide filled values from API response metadata.
+      The actual document still receives the original values.
+
+  --format <markdown|hwpx|hwpx-preserve>
+      Output format. Default: markdown.
+      Binary formats require -o.
+
+  -o, --output <path>
+      Required for hwpx and hwpx-preserve.
+
+Redact options:
+  --rules <rules.json>
+      Optional JSON array of redaction rule names.
+
+  --mask-char <character>
+      Optional mask character.
+
+  --dry-run
+      Return the redaction report without modifying the document.
+
+  -o, --output <path>
+      Required unless --dry-run is used.
+      HWP/HWPX produces a redacted document.
+      Other supported formats produce redacted Markdown.
+
+Parse options:
+  --ocr <false|true|force>
+      OCR mode. Default: false
+
+  --ocr-rec <handwriting|auto|printed>
+      OCR recognition model. Omit for the default: since kordoc 4.24.42 the service re-reads pages with
+      clearly handwritten text (page confidence < .85) with the handwriting model by itself.
+      handwriting = Korean handwriting/official-form model (kordoc 4.22.6+, ~15 MB, downloaded on first use).
+      printed = default model only, never uses or downloads the handwriting model (REST API 1.11.0+).
+      auto = more generous thresholds for switching pages to the handwriting model; downloads it up front (API 1.11.0+).
+      Only has an effect together with --ocr true|force.
+
+  --ocr-det <mobile|server|medium>
+      OCR detection model (kordoc 4.22.0+). Default: mobile. server = PP-OCRv5 server det (88 MB,
+      downloaded on first use). medium = PP-OCRv6 medium det (~62 MB, downloaded on first use; REST API 1.11.0+):
+      for tilted, blurred, scanned or noisy pages. Only has an effect together with --ocr true|force.
+
+  --ocr-det-long-side <32-4096>
+      Long side of the OCR detection input in pixels (kordoc 4.22.0+). Default: 960.
+      Only has an effect together with --ocr true|force.
+
+  --ocr-lines <true|false|all>
+      Full parse only (parse; ignored by other subcommands). Return the lines read by the built-in OCR as ocrLines[]
+      in the JSON output (kordoc 4.24.4, REST API 1.10.0+; PDF and image input). One item per page:
+      {pageNumber,width,height,scale,deskewAngle,lines:[{text,box:{x,y,w,h},confidence}]}. box is in OCR raster
+      pixels, origin top-left, not PDF points (divide by scale). true = lines used to build blocks;
+      all = also dropped low-confidence lines (dropped: true). Default off.
+      Only has an effect together with --ocr true|force.
+
+  --include-blocks <true|false>
+      Include parsed block data. Default: true
+
+  --include-field-placeholders <true|false>
+      Keep the guidance text of unfilled form fields (kordoc 4.15.7+).
+      Blank public-sector forms carry their meaning in that text. Default: false
+
+  --plain <true|false>
+      Drop image placeholders, link URLs, underline and bold markup and keep the
+      text. Heading, list and table structure are unchanged. Default: false
+
+  --html-tables <true|false>
+      Emit every table as indented HTML instead of GFM pipe tables. Default: false
+
+  --table-format <gfm>
+      parse, metadata and parse-pages only (kordoc 4.19.0+). gfm = merged and nested tables
+      also come out as GFM pipe tables, never HTML (a vertical merge repeats the value on
+      every row; a nested table follows its parent with a parent_id comment). Sent only
+      when given; without it the output is unchanged. Cannot be combined with
+      --html-tables true. Only gfm is accepted.
+
+Common parse options (parse, metadata, parse-pages, parse-chunks, parse-table):
+  Sent only when given; otherwise the engine default applies.
+
+  --pages <range>
+      Page/section range, 1-based: 3, 1-3, 1,3,5-7. PDF: exact pages. HWP/HWPX: section
+      approximation. PPTX: slides. A range outside the document returns an empty result
+      with a PARTIAL_PARSE warning.
+
+  --images <true|false>
+      Extract image bytes. false = text-only callers (placeholders stay).
+
+  --remove-header-footer <true|false>
+      PDF: drop repeated header/footer blocks. Default true; false keeps repeated headings.
+
+  --script-tags <true|false>
+      Write superscript/subscript as <sup>/<sub>. Default depends on the format: on for
+      HWPX/HWP/DOCX/PPTX, off for PDF (recommended for papers). false = plain text everywhere.
+
+  --keep-trailing-empty-cols <true|false>
+      Keep empty columns at the right edge of a table (input cells of forms).
+
+  --layout-tables <visual|keep>
+      Borderless frame tables (HWPX, HWP5, PDF). visual (default) = as seen; keep = original
+      table structure (for round-trip patching and form filling).
+      For the original structure of a form use: --layout-tables keep --keep-trailing-empty-cols true
+
+  --classify-tables <true|false>
+      Classify tables as data/layout/uncertain (blocks[].table.classification).
+
+  --keep-empty-paragraphs <true|false>
+      Keep empty paragraphs (HWPX).
+
+  --formula-ocr <true|false>
+      PDF formula OCR ($...$ / $$...$$). SLOW: 30-120 s per request. The models (~155 MB)
+      are downloaded on first use if the server does not have them yet.
+
+  --memos <true|false>
+      HWPX/HWP5 (REST API 1.11.0+): also append the document's memos (Hancom "insert memo") to the end of the
+      Markdown as a "메모" section. Default false. The memos[] field of the JSON result is returned either way.
+
+  --qr-codes <true|false>
+      Read QR codes inside images (all formats; REST API 1.11.0+). The values go to the image block's qr[] and to
+      the line after the image placeholder in the Markdown. Default false. Works even with --images false.
+
+  --drop-blank-images <true|false>
+      Drop blank images (nearly one colour: empty plates, solid bands, faint gradients) from the image blocks,
+      images and Markdown (REST API 1.11.0+). Default false. Only evaluated when image bytes are produced.
+
+  --image-format <png|webp>
+      Force every extracted image to one format: png or lossless webp (REST API 1.11.0+). Omit to keep the default
+      (PNG for PDF images, the original bytes for other formats). Ignored with --images false.
+
+  --image-placement <page-end|flow>
+      PDF only (REST API 1.11.0+). page-end (default) = images are collected after the last block of their page.
+      flow = images are placed in reading position between text blocks and image blocks get a bbox.
+
+  --html-cell-links <true|false>
+      Emit [text](URL), bare URLs and QR URLs inside HTML table cells as <a href> so merged/nested table cells are
+      clickable (REST API 1.11.0+, kordoc 4.24.63+). Only http, https, mailto, tel and # links. Default false.
+      Mostly useful together with --html-tables true or merged/nested tables.
+
+  --dedupe-running-headers <true|false>
+      Drop numbered running headers that an old HWP5 re-inserts on every page. Can also
+      delete legitimately repeated numbering; default false.
+
+  --inline-images <true|false>
+      Inline images into the Markdown as base64 data URIs (HWP5 only). The response grows.
+
+  --tables <true|false>
+      PDF table detection. false = reading-order text only, for text-centred documents.
+
+  --password-env <ENV_NAME> | --password-file <path>
+      The open password of a protected HWPX or HWP3 document, taken from an environment
+      variable (by NAME) or from a file (first line; keep it mode 600 and delete it after).
+      The password is never put on the command line or in the process list. Use one of them.
+      Example: KORDOC_PW='...' kordoc-api parse doc.hwpx --password-env KORDOC_PW
+
+Lint:
+  kordoc-api lint <file|-> checks Korean public-document notation (dates, times, amounts,
+  attachments, symbols). --munche true also checks the gaejosik report style. The JSON
+  result has ok/errors/warnings and the findings; ok:false is a normal result (exit 0).
+  --strict exits with 1 when there is an error, like `kordoc lint`.
+
+Environment:
+  KORDOC_API_BASE
+      Kordoc API base URL.
+      Default: http://kordoc:3400
+
+  KORDOC_API_TOKEN
+      Optional Bearer token.
+
+  KORDOC_API_TIMEOUT
+      Request timeout in seconds.
+      Default: 600
+USAGE
+}
+
+curl_common=(
+  --silent
+  --show-error
+  --connect-timeout 10
+  --max-time "$KORDOC_API_TIMEOUT"
+)
+
+if [[ -n "$KORDOC_API_TOKEN" ]]; then
+  curl_common+=(
+    -H "Authorization: Bearer $KORDOC_API_TOKEN"
+  )
+fi
+
+require_file() {
+  local file="$1"
+
+  [[ -f "$file" ]] \
+    || die "file not found: $file"
+
+  [[ -r "$file" ]] \
+    || die "file is not readable: $file"
+}
+
+save_returned_files() {
+  # $1 = 응답 JSON 파일, $2 = 출력 폴더. files[] 의 base64 를 폴더에 쓰고 저장 목록(JSON 배열)을 stdout 으로 낸다.
+  local response="$1" dir="$2" count i name target saved="[]"
+
+  mkdir -p "$dir" || die "cannot create output directory: $dir"
+  count="$(jq '[.files[]?] | length' "$response")"
+
+  for (( i = 0; i < count; i++ )); do
+    name="$(jq -r ".files[$i].name" "$response")"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ && "$name" != .* ]] || die "unsafe file name from server: $name"
+    target="${dir%/}/$name"
+    [[ ! -e "$target" ]] || die "refusing to overwrite existing output: $target"
+    jq -r ".files[$i].data" "$response" | base64 -d >"$target"
+    [[ -s "$target" ]] || { rm -f "$target"; die "empty file from server: $name"; }
+    saved="$(jq -c --arg o "$(realpath "$target")" --argjson b "$(stat -c '%s' "$target")" '. + [{output: $o, bytes: $b}]' <<<"$saved")"
+  done
+
+  printf '%s' "$saved"
+}
+
+semantic_ok() {
+  jq -e '
+    if type != "object" then
+      true
+    elif (has("success") and .success == false) then
+      false
+    elif (has("ok") and .ok == false) then
+      false
+    else
+      true
+    end
+  ' >/dev/null
+}
+
+request_json() {
+  local method="$1"
+  local path="$2"
+  shift 2
+
+  local tmp
+  local http_code
+
+  tmp="$(mktemp)"
+
+  if ! http_code="$(
+    curl "${curl_common[@]}" \
+      -X "$method" \
+      "$@" \
+      -o "$tmp" \
+      -w '%{http_code}' \
+      "${KORDOC_API_BASE}${path}"
+  )"; then
+    if [[ -s "$tmp" ]]; then
+      cat "$tmp" >&2
+      echo >&2
+    fi
+
+    rm -f "$tmp"
+    die "request failed: ${method} ${path}"
+  fi
+
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    if [[ -s "$tmp" ]]; then
+      cat "$tmp" >&2
+      echo >&2
+    fi
+
+    rm -f "$tmp"
+    die "HTTP ${http_code}: ${method} ${path}"
+  fi
+
+  if ! jq -e . "$tmp" >/dev/null 2>&1; then
+    cat "$tmp" >&2 || true
+    echo >&2
+
+    rm -f "$tmp"
+    die "Kordoc returned invalid JSON"
+  fi
+
+  if ! semantic_ok < "$tmp"; then
+    jq . "$tmp" >&2
+
+    rm -f "$tmp"
+    die "Kordoc reported operation failure"
+  fi
+
+  jq . "$tmp"
+  rm -f "$tmp"
+}
+
+require_json_object() {
+  local file="$1"
+  local label="$2"
+
+  require_file "$file"
+
+  jq -e 'type == "object"' "$file" >/dev/null \
+    || die "${label} must be a JSON object: $file"
+}
+
+require_json_array() {
+  local file="$1"
+  local label="$2"
+
+  require_file "$file"
+
+  jq -e 'type == "array"' "$file" >/dev/null \
+    || die "${label} must be a JSON array: $file"
+}
+
+require_output_path() {
+  local output="$1"
+  local operation="$2"
+  local output_dir
+
+  [[ -n "$output" ]] \
+    || die "${operation} requires -o <output>"
+
+  [[ ! -e "$output" ]] \
+    || die "refusing to overwrite existing output: $output"
+
+  output_dir="$(dirname "$output")"
+
+  [[ -d "$output_dir" ]] \
+    || die "output directory does not exist: $output_dir"
+}
+
+header_value() {
+  local header="$1"
+  local file="$2"
+
+  grep -i "^${header}:" "$file" 2>/dev/null \
+    | tail -n 1 \
+    | cut -d: -f2- \
+    | sed 's/^[[:space:]]*//;s/\r$//' \
+    || true
+}
+
+# ---- 파싱 계열 공통 옵션 (API 1.5.0~, kordoc ParseOptions 나머지 전부) -------------------
+# 값이 «주어진 것만» common_form 에 쌓는다. 안 주면 서버(엔진) 기본값이 쓰인다.
+common_form=()
+pwfile=""
+password_set=0
+trap 'rm -f "$pwfile"' EXIT
+consumed=0
+allow_table_format=0   # parse·metadata·parse-pages 만 1 로 올린다
+table_format_set=0
+
+consume_common_option() {
+  # $@ = 남은 인자. 공통 옵션이면 common_form 에 쌓고 consumed=2 로 두고 0, 아니면 1 을 돌려준다.
+  local opt="${1:-}" field kind val
+
+  case "$opt" in
+    --ocr-rec)                 field=ocrRec;               kind=ocrrec ;;
+    --ocr-det)                 field=ocrDet;               kind=ocrdet ;;
+    --ocr-det-long-side)       field=ocrDetLongSide;       kind=ocrlong ;;
+    --ocr-lines)               field=ocrLines;             kind=ocrlines ;;
+    --memos)                   field=memos;                kind=bool ;;
+    --qr-codes)                field=qrCodes;              kind=bool ;;
+    --drop-blank-images)       field=dropBlankImages;      kind=bool ;;
+    --html-cell-links)         field=htmlCellLinks;        kind=bool ;;
+    --image-format)            field=imageFormat;          kind=imgfmt ;;
+    --image-placement)         field=imagePlacement;       kind=imgplace ;;
+    --pages)                   field=pages;                kind=pages ;;
+    --images)                  field=images;               kind=bool ;;
+    --remove-header-footer)    field=removeHeaderFooter;   kind=bool ;;
+    --script-tags)             field=scriptTags;           kind=bool ;;
+    --keep-trailing-empty-cols) field=keepTrailingEmptyCols; kind=bool ;;
+    --layout-tables)           field=layoutTables;         kind=layout ;;
+    --classify-tables)         field=classifyTables;       kind=bool ;;
+    --keep-empty-paragraphs)   field=keepEmptyParagraphs;  kind=bool ;;
+    --formula-ocr)             field=formulaOcr;           kind=bool ;;
+    --dedupe-running-headers)  field=dedupeRunningHeaders; kind=bool ;;
+    --inline-images)           field=inlineImages;         kind=bool ;;
+    --tables)                  field=tables;               kind=bool ;;
+    --table-format)            [[ "$allow_table_format" == 1 ]] || return 1
+                               field=tableFormat;          kind=tableformat ;;
+    --password-env)            field=password;             kind=passenv ;;
+    --password-file)           field=password;             kind=passfile ;;
+    *) return 1 ;;
+  esac
+
+  [[ $# -ge 2 ]] || die "$opt requires a value"
+  val="$2"
+
+  case "$kind" in
+    bool)
+      [[ "$val" == true || "$val" == false ]] || die "invalid $opt value: $val (true|false)"
+      ;;
+    tableformat)
+      [[ "$val" == gfm ]] || die "invalid $opt value: $val (gfm)"
+      table_format_set=1
+      ;;
+    ocrrec)
+      [[ "$val" == handwriting || "$val" == auto || "$val" == printed ]] || die "invalid $opt value: $val (handwriting|auto|printed)"
+      ;;
+    ocrdet)
+      [[ "$val" == mobile || "$val" == server || "$val" == medium ]] || die "invalid $opt value: $val (mobile|server|medium)"
+      ;;
+    ocrlines)
+      [[ "$val" == true || "$val" == false || "$val" == all ]] || die "invalid $opt value: $val (true|false|all)"
+      ;;
+    imgfmt)
+      [[ "$val" == png || "$val" == webp ]] || die "invalid $opt value: $val (png|webp)"
+      ;;
+    imgplace)
+      [[ "$val" == page-end || "$val" == flow ]] || die "invalid $opt value: $val (page-end|flow)"
+      ;;
+    ocrlong)
+      if ! [[ "$val" =~ ^[0-9]{2,4}$ ]] || (( 10#$val < 32 || 10#$val > 4096 )); then
+        die "invalid $opt value: $val (32-4096)"
+      fi
+      ;;
+    layout)
+      [[ "$val" == visual || "$val" == keep ]] || die "invalid $opt value: $val (visual|keep)"
+      ;;
+    pages)
+      [[ "$val" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] \
+        || die "invalid $opt value: $val (예: 3, 1-3, 1,3,5-7)"
+      ;;
+    passenv|passfile)
+      [[ "$password_set" == 0 ]] || die "--password-env 와 --password-file 은 하나만 쓴다"
+      pwfile="$(mktemp)"
+      chmod 600 "$pwfile"
+      if [[ "$kind" == passenv ]]; then
+        [[ "$val" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+          || die "--password-env 는 환경변수 «이름» 을 받는다 (암호 값을 명령줄에 쓰지 않는다)"
+        [[ -n "${!val:-}" ]] || die "환경변수 $val 이 비어 있거나 없다"
+        printf '%s' "${!val}" > "$pwfile"
+      else
+        require_file "$val"
+        # 파일 끝의 줄바꿈은 암호가 아니다 — 명령 치환이 떼어 낸다
+        printf '%s' "$(cat "$val")" > "$pwfile"
+        [[ -s "$pwfile" ]] || die "암호 파일이 비어 있다: $val"
+      fi
+      password_set=1
+      common_form+=( -F "password=<${pwfile}" )
+      consumed=2
+      return 0
+      ;;
+  esac
+
+  common_form+=( -F "${field}=${val}" )
+  consumed=2
+  return 0
+}
+
+command="${1:-}"
+
+case "$command" in
+  health)
+    [[ $# -eq 1 ]] || die "usage: kordoc-api health"
+    request_json GET /health
+    ;;
+
+  version)
+    [[ $# -eq 1 ]] || die "usage: kordoc-api version"
+    request_json GET /version
+    ;;
+
+  generate-hwpx)
+    [[ $# -ge 4 ]] \
+      || die "usage: kordoc-api generate-hwpx <markdown-file> -o <output.hwpx> [--options <options.json>]"
+
+    markdown_file="$2"
+    require_file "$markdown_file"
+
+    output=""
+    options_file=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        --options)
+          [[ $# -ge 2 ]] || die "--options requires a JSON file"
+          options_file="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown generate-hwpx option: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$output" ]] \
+      || die "generate-hwpx requires -o <output.hwpx>"
+
+    [[ ! -e "$output" ]] \
+      || die "refusing to overwrite existing output: $output"
+
+    output_dir="$(dirname "$output")"
+    [[ -d "$output_dir" ]] \
+      || die "output directory does not exist: $output_dir"
+
+    payload="$(mktemp)"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-hwpx.XXXXXX")"
+
+    cleanup_generate() {
+      rm -f "$payload" "$tmp_output"
+    }
+
+    if [[ -n "$options_file" ]]; then
+      require_file "$options_file"
+
+      if ! jq -e 'type == "object"' "$options_file" >/dev/null; then
+        cleanup_generate
+        die "options must be a JSON object: $options_file"
+      fi
+
+      jq -n \
+        --rawfile markdown "$markdown_file" \
+        --slurpfile opts "$options_file" \
+        '{
+          markdown: $markdown,
+          options: $opts[0]
+        }' > "$payload"
+    else
+      jq -n \
+        --rawfile markdown "$markdown_file" \
+        '{
+          markdown: $markdown,
+          options: {}
+        }' > "$payload"
+    fi
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        --data-binary "@${payload}" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/generate/hwpx"
+    )"; then
+      if [[ -s "$tmp_output" ]]; then
+        cat "$tmp_output" >&2 || true
+        echo >&2
+      fi
+
+      cleanup_generate
+      die "request failed: POST /v1/document/generate/hwpx"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+
+      cleanup_generate
+      die "HTTP ${http_code}: POST /v1/document/generate/hwpx"
+    fi
+
+    if [[ ! -s "$tmp_output" ]]; then
+      cleanup_generate
+      die "Kordoc returned an empty HWPX"
+    fi
+
+    case "${content_type%%;*}" in
+      application/hwp+zip|application/zip|application/octet-stream)
+        ;;
+      *)
+        file "$tmp_output" >&2 || true
+        cleanup_generate
+        die "unexpected Content-Type: ${content_type:-unknown}"
+        ;;
+    esac
+
+    if ! file "$tmp_output" | grep -Eqi 'HWPX|Zip archive'; then
+      file "$tmp_output" >&2 || true
+      cleanup_generate
+      die "response is not recognized as HWPX/ZIP"
+    fi
+
+    mv "$tmp_output" "$output"
+    rm -f "$payload"
+
+    bytes="$(stat -c '%s' "$output")"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --argjson bytes "$bytes" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes
+      }'
+    ;;
+
+  generate-hwpx-advanced)
+    [[ $# -ge 4 ]] \
+      || die "usage: kordoc-api generate-hwpx-advanced <markdown-file> -o <output.hwpx> [--options <options.json>] [--profile <profile.json>] [--template <template.hwpx>] [--image <image>]..."
+
+    markdown_file="$2"
+    require_file "$markdown_file"
+
+    output=""
+    options_file=""
+    profile_file=""
+    template_file=""
+    images=()
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+        --options)
+          [[ $# -ge 2 ]] || die "--options requires a JSON file"
+          options_file="$2"
+          shift 2
+          ;;
+        --profile)
+          [[ $# -ge 2 ]] || die "--profile requires a JSON file"
+          profile_file="$2"
+          shift 2
+          ;;
+        --template)
+          [[ $# -ge 2 ]] || die "--template requires an HWPX file"
+          template_file="$2"
+          shift 2
+          ;;
+        --image)
+          [[ $# -ge 2 ]] || die "--image requires a file"
+          images+=("$2")
+          shift 2
+          ;;
+        *)
+          die "unknown generate-hwpx-advanced option: $1"
+          ;;
+      esac
+    done
+
+    require_output_path "$output" "generate-hwpx-advanced"
+
+    if [[ -n "$options_file" ]]; then
+      require_json_object "$options_file" "options"
+    fi
+
+    if [[ -n "$profile_file" ]]; then
+      require_file "$profile_file"
+
+      jq -e '
+        type == "object" and
+        (
+          has("profile") == false or
+          (.profile | type == "object")
+        )
+      ' "$profile_file" >/dev/null \
+        || die "profile must be a raw profile object or profile-extract wrapper: $profile_file"
+    fi
+
+    for image in "${images[@]}"; do
+      require_file "$image"
+    done
+
+    file_count="${#images[@]}"
+
+    if [[ -n "$profile_file" ]]; then
+      file_count=$((file_count + 1))
+    fi
+
+    if [[ -n "$template_file" ]]; then
+      require_file "$template_file"
+      file_count=$((file_count + 1))
+    fi
+
+    (( file_count <= 8 )) \
+      || die "advanced generation accepts at most 8 uploaded files total (profile + images)"
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-advanced.XXXXXX")"
+
+    form_args=(
+      -F "markdown=<${markdown_file}"
+    )
+
+    if [[ -n "$options_file" ]]; then
+      form_args+=(
+        -F "options=<${options_file}"
+      )
+    fi
+
+    if [[ -n "$profile_file" ]]; then
+      form_args+=(
+        -F "profile=@${profile_file};type=application/json"
+      )
+    fi
+
+    if [[ -n "$template_file" ]]; then
+      form_args+=(
+        -F "template=@${template_file}"
+      )
+    fi
+
+    for image in "${images[@]}"; do
+      form_args+=(
+        -F "image=@${image}"
+      )
+    done
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        "${form_args[@]}" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/generate/hwpx/advanced"
+    )"; then
+      if [[ -s "$tmp_output" ]]; then
+        cat "$tmp_output" >&2 || true
+        echo >&2
+      fi
+      rm -f "$tmp_output"
+      die "request failed: POST /v1/document/generate/hwpx/advanced"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+      rm -f "$tmp_output"
+      die "HTTP ${http_code}: POST /v1/document/generate/hwpx/advanced"
+    fi
+
+    if [[ ! -s "$tmp_output" ]]; then
+      rm -f "$tmp_output"
+      die "Kordoc returned an empty HWPX"
+    fi
+
+    case "${content_type%%;*}" in
+      application/hwp+zip|application/zip|application/octet-stream)
+        ;;
+      *)
+        file "$tmp_output" >&2 || true
+        rm -f "$tmp_output"
+        die "unexpected Content-Type: ${content_type:-unknown}"
+        ;;
+    esac
+
+    if ! file "$tmp_output" | grep -Eqi 'HWPX|Zip archive'; then
+      file "$tmp_output" >&2 || true
+      rm -f "$tmp_output"
+      die "response is not recognized as HWPX/ZIP"
+    fi
+
+    mv "$tmp_output" "$output"
+
+    bytes="$(stat -c '%s' "$output")"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --argjson bytes "$bytes" \
+      --argjson imageCount "${#images[@]}" \
+      --arg profileUsed "$([[ -n "$profile_file" ]] && echo true || echo false)" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes,
+        imageCount: $imageCount,
+        profileUsed: ($profileUsed == "true")
+      }'
+    ;;
+
+  render-native)
+    [[ $# -ge 4 ]] \
+      || die "usage: kordoc-api render-native <file> -o <output> [--format <png|jpeg|svg|html|pdf>] [--pages <range>] [--max-width-px <200-4000>] [--highlight <text>]... [--reflow-mode <keep|charAll>]"
+
+    file="$2"
+    require_file "$file"
+
+    output=""
+    format="png"
+    pages=""
+    max_width_px=""
+    reflow_mode=""
+    highlights=()
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        --format)
+          [[ $# -ge 2 ]] || die "--format requires png, jpeg, svg, html or pdf"
+          format="$2"
+          case "$format" in
+            png|jpeg|svg|html|pdf)
+              ;;
+            *)
+              die "invalid render format: $format"
+              ;;
+          esac
+          shift 2
+          ;;
+
+        --pages)
+          [[ $# -ge 2 ]] || die "--pages requires a range"
+          pages="$2"
+          shift 2
+          ;;
+
+        --max-width-px)
+          [[ $# -ge 2 ]] || die "--max-width-px requires an integer"
+          max_width_px="$2"
+
+          [[ "$max_width_px" =~ ^[0-9]+$ ]] \
+            || die "--max-width-px must be an integer"
+
+          (( max_width_px >= 200 && max_width_px <= 4000 )) \
+            || die "--max-width-px must be between 200 and 4000"
+
+          shift 2
+          ;;
+
+        --highlight)
+          [[ $# -ge 2 ]] || die "--highlight requires a text"
+          highlights+=("$2")
+          shift 2
+          ;;
+
+        --reflow-mode)
+          [[ $# -ge 2 ]] || die "--reflow-mode requires keep or charAll"
+          reflow_mode="$2"
+          case "$reflow_mode" in
+            keep|charAll)
+              ;;
+            *)
+              die "invalid reflow mode: $reflow_mode"
+              ;;
+          esac
+          shift 2
+          ;;
+
+        *)
+          die "unknown render-native option: $1"
+          ;;
+      esac
+    done
+
+    require_output_path "$output" "render-native"
+
+    form_args=(
+      -F "file=@${file}"
+      -F "format=${format}"
+    )
+
+    if [[ -n "$pages" ]]; then
+      form_args+=(
+        --form-string "pages=${pages}"
+      )
+    fi
+
+    if [[ -n "$max_width_px" ]]; then
+      form_args+=(
+        -F "maxWidthPx=${max_width_px}"
+      )
+    fi
+
+    if [[ -n "$reflow_mode" ]]; then
+      form_args+=(
+        -F "reflowMode=${reflow_mode}"
+      )
+    fi
+
+    if (( ${#highlights[@]} > 0 )); then
+      form_args+=(
+        --form-string "highlights=$(jq -cn '$ARGS.positional' --args "${highlights[@]}")"
+      )
+    fi
+
+    response="$(mktemp)"
+
+    if ! request_json \
+      POST \
+      /v1/document/render/native \
+      "${form_args[@]}" \
+      >"$response"
+    then
+      rm -f "$response"
+      exit 1
+    fi
+
+    if jq -e '.isError == true' "$response" >/dev/null; then
+      jq -r '[.content[]? | select(.type == "text") | .text] | join("\n")' "$response" >&2 || true
+      rm -f "$response"
+      die "render-native failed"
+    fi
+
+    case "$format" in
+      png)  mime="image/png";  selector='.content[]? | select(.type == "image") | .data' ;;
+      jpeg) mime="image/jpeg"; selector='.content[]? | select(.type == "image") | .data' ;;
+      svg)  mime="image/svg+xml";  selector='.files[]? | .data' ;;
+      html) mime="text/html";      selector='.files[]? | .data' ;;
+      pdf)  mime="application/pdf"; selector='.files[]? | .data' ;;
+    esac
+
+    if [[ "$format" == "png" || "$format" == "jpeg" ]]; then
+      got_mime="$(
+        jq -r '[.content[]? | select(.type == "image") | .mimeType] | unique | join(",")' "$response"
+      )"
+
+      [[ "$got_mime" == "$mime" ]] || {
+        rm -f "$response"
+        die "unexpected rendered MIME type: ${got_mime:-none}"
+      }
+    fi
+
+    item_count="$(jq "[${selector}] | length" "$response")"
+
+    [[ "$item_count" -ge 1 ]] || {
+      jq . "$response" >&2 || true
+      rm -f "$response"
+      die "render-native returned no output (format ${format})"
+    }
+
+    if [[ "$output" == *.* ]]; then
+      out_base="${output%.*}"
+      out_ext=".${output##*.}"
+    else
+      out_base="$output"
+      out_ext=""
+    fi
+
+    outputs_json="[]"
+
+    for (( i = 0; i < item_count; i++ )); do
+      if (( item_count == 1 )); then
+        target="$output"
+      else
+        target="$(printf '%s_page_%03d%s' "$out_base" $((i + 1)) "$out_ext")"
+        [[ ! -e "$target" ]] || {
+          rm -f "$response"
+          die "refusing to overwrite existing output: $target"
+        }
+      fi
+
+      tmp_output="$(mktemp "$(dirname "$output")/.kordoc-api-render.XXXXXX")"
+
+      jq -r "[${selector}][${i}]" "$response" | base64 -d >"$tmp_output"
+
+      [[ -s "$tmp_output" ]] || {
+        rm -f "$response" "$tmp_output"
+        die "render-native produced an empty file"
+      }
+
+      mv "$tmp_output" "$target"
+
+      outputs_json="$(
+        jq -c \
+          --arg output "$(realpath "$target")" \
+          --argjson bytes "$(stat -c '%s' "$target")" \
+          '. + [{output: $output, bytes: $bytes}]' <<<"$outputs_json"
+      )"
+    done
+
+    summary="$(
+      jq -r '
+        [.content[]? | select(.type == "text") | .text]
+        | join("\n")
+      ' "$response"
+    )"
+
+    rm -f "$response"
+
+    jq -n \
+      --argjson outputs "$outputs_json" \
+      --arg contentType "$mime" \
+      --arg summary "$summary" \
+      '{
+        success: true,
+        output: $outputs[0].output,
+        contentType: $contentType,
+        bytes: $outputs[0].bytes,
+        summary: $summary
+      } + (if ($outputs | length) > 1 then {outputs: $outputs} else {} end)'
+    ;;
+
+  extract-tables)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api extract-tables <file> [--visual <mode>] [--format <png|jpeg>] [--padding-pt <0-100>] [--cells]"
+
+    file="$2"
+    require_file "$file"
+
+    visual="none"
+    format="png"
+    padding_pt="0"
+    cells="false"
+    output_dir=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --visual)
+          [[ $# -ge 2 ]] || die "--visual requires a value"
+          visual="$2"
+
+          case "$visual" in
+            none|non-tabular|non-tabular-and-uncertain|all)
+              ;;
+            *)
+              die "invalid visual mode: $visual"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --format)
+          [[ $# -ge 2 ]] || die "--format requires png or jpeg"
+          format="$2"
+
+          case "$format" in
+            png|jpeg)
+              ;;
+            *)
+              die "invalid extract-tables format: $format"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --padding-pt)
+          [[ $# -ge 2 ]] || die "--padding-pt requires a number"
+          padding_pt="$2"
+
+          awk -v n="$padding_pt" \
+            'BEGIN { exit !(n >= 0 && n <= 100) }' \
+            || die "--padding-pt must be between 0 and 100"
+
+          shift 2
+          ;;
+
+        --cells)
+          cells="true"
+          shift
+          ;;
+
+        --output-dir)
+          [[ $# -ge 2 ]] || die "--output-dir requires a directory"
+          output_dir="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown extract-tables option: $1"
+          ;;
+      esac
+    done
+
+    extract_form=(
+      -F "file=@${file}"
+      -F "visual=${visual}"
+      -F "format=${format}"
+      -F "paddingPt=${padding_pt}"
+      -F "cells=${cells}"
+    )
+
+    if [[ -z "$output_dir" ]]; then
+      request_json \
+        POST \
+        /v1/document/extract-tables \
+        "${extract_form[@]}"
+    else
+      response="$(mktemp)"
+      request_json \
+        POST \
+        /v1/document/extract-tables \
+        "${extract_form[@]}" \
+        -F "returnFiles=true" \
+        >"$response" || { rm -f "$response"; exit 1; }
+      saved="$(save_returned_files "$response" "$output_dir")" || { rm -f "$response"; exit 1; }
+      jq --argjson saved "$saved" 'del(.files) + {saved: $saved}' "$response"
+      rm -f "$response"
+    fi
+    ;;
+
+  crop-regions)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api crop-regions <file> [--target <type>]... [--format <png|jpeg>] [--pages <range>] [--padding-pt <0-100>]"
+
+    file="$2"
+    require_file "$file"
+
+    targets=()
+    format="png"
+    pages=""
+    padding_pt="0"
+    output_dir=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --target)
+          [[ $# -ge 2 ]] || die "--target requires a value"
+
+          case "$2" in
+            table|image|paragraph|shape)
+              targets+=("$2")
+              ;;
+            *)
+              die "invalid crop target: $2"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --format)
+          [[ $# -ge 2 ]] || die "--format requires png or jpeg"
+          format="$2"
+
+          case "$format" in
+            png|jpeg)
+              ;;
+            *)
+              die "invalid crop format: $format"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --pages)
+          [[ $# -ge 2 ]] || die "--pages requires a range"
+          pages="$2"
+          shift 2
+          ;;
+
+        --padding-pt)
+          [[ $# -ge 2 ]] || die "--padding-pt requires a number"
+          padding_pt="$2"
+
+          awk -v n="$padding_pt" \
+            'BEGIN { exit !(n >= 0 && n <= 100) }' \
+            || die "--padding-pt must be between 0 and 100"
+
+          shift 2
+          ;;
+
+        --output-dir)
+          [[ $# -ge 2 ]] || die "--output-dir requires a directory"
+          output_dir="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown crop-regions option: $1"
+          ;;
+      esac
+    done
+
+    if [[ "${#targets[@]}" -eq 0 ]]; then
+      targets=("table")
+    fi
+
+    target_json="$(
+      printf '%s\n' "${targets[@]}" \
+        | jq -R . \
+        | jq -s -c .
+    )"
+
+    form_args=(
+      -F "file=@${file}"
+      -F "target=${target_json}"
+      -F "format=${format}"
+      -F "paddingPt=${padding_pt}"
+    )
+
+    if [[ -n "$pages" ]]; then
+      form_args+=(
+        -F "pages=${pages}"
+      )
+    fi
+
+    if [[ -z "$output_dir" ]]; then
+      request_json \
+        POST \
+        /v1/document/crop-regions \
+        "${form_args[@]}"
+    else
+      response="$(mktemp)"
+      request_json \
+        POST \
+        /v1/document/crop-regions \
+        "${form_args[@]}" \
+        -F "returnFiles=true" \
+        >"$response" || { rm -f "$response"; exit 1; }
+      saved="$(save_returned_files "$response" "$output_dir")" || { rm -f "$response"; exit 1; }
+      jq --argjson saved "$saved" 'del(.files) + {saved: $saved}' "$response"
+      rm -f "$response"
+    fi
+    ;;
+
+  parse-pages)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api parse-pages <file> [--ocr <false|true|force>] [--table-format gfm] [common parse options]"
+
+    file="$2"
+    require_file "$file"
+    allow_table_format=1
+
+    ocr="false"
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --ocr)
+          [[ $# -ge 2 ]] || die "--ocr requires false, true, or force"
+          ocr="$2"
+
+          case "$ocr" in
+            false|true|force)
+              ;;
+            *)
+              die "invalid OCR mode: $ocr"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        *)
+          if consume_common_option "$@"; then
+            shift "$consumed"
+          else
+            die "unknown parse-pages option: $1"
+          fi
+          ;;
+      esac
+    done
+
+    request_json \
+      POST \
+      /v1/parse/pages \
+      -F "file=@${file}" \
+      -F "ocr=${ocr}" \
+      ${common_form[@]+"${common_form[@]}"}
+    ;;
+
+  parse-chunks)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api parse-chunks <file> [--ocr <false|true|force>] [--granularity <section|block>] [--include-table-cells]"
+
+    file="$2"
+    require_file "$file"
+
+    ocr="false"
+    granularity="section"
+    include_table_cells="false"
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --ocr)
+          [[ $# -ge 2 ]] || die "--ocr requires false, true, or force"
+          ocr="$2"
+
+          case "$ocr" in
+            false|true|force)
+              ;;
+            *)
+              die "invalid OCR mode: $ocr"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --granularity)
+          [[ $# -ge 2 ]] || die "--granularity requires section or block"
+          granularity="$2"
+
+          case "$granularity" in
+            section|block)
+              ;;
+            *)
+              die "invalid granularity: $granularity"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --include-table-cells)
+          include_table_cells="true"
+          shift
+          ;;
+
+        *)
+          if consume_common_option "$@"; then
+            shift "$consumed"
+          else
+            die "unknown parse-chunks option: $1"
+          fi
+          ;;
+      esac
+    done
+
+    request_json \
+      POST \
+      /v1/parse/chunks \
+      -F "file=@${file}" \
+      -F "ocr=${ocr}" \
+      -F "granularity=${granularity}" \
+      -F "includeTableCells=${include_table_cells}" \
+      ${common_form[@]+"${common_form[@]}"}
+    ;;
+
+  patch)
+    [[ $# -ge 6 ]] \
+      || die "usage: kordoc-api patch <file> --markdown <markdown-file> -o <output.hwp|output.hwpx> [--options <options.json>]"
+
+    file="$2"
+    require_file "$file"
+
+    markdown_file=""
+    options_file=""
+    output=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --markdown)
+          [[ $# -ge 2 ]] || die "--markdown requires a file"
+          markdown_file="$2"
+          shift 2
+          ;;
+
+        --options)
+          [[ $# -ge 2 ]] || die "--options requires a JSON file"
+          options_file="$2"
+          shift 2
+          ;;
+
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown patch option: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$markdown_file" ]] \
+      || die "patch requires --markdown <markdown-file>"
+
+    require_file "$markdown_file"
+    require_output_path "$output" "patch"
+
+    form_args=(
+      -F "file=@${file}"
+      -F "markdown=<${markdown_file}"
+    )
+
+    if [[ -n "$options_file" ]]; then
+      require_json_object "$options_file" "options"
+      form_args+=(
+        -F "options=<${options_file}"
+      )
+    fi
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-patch.XXXXXX")"
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        "${form_args[@]}" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/patch"
+    )"; then
+      rm -f "$tmp_output"
+      die "request failed: POST /v1/document/patch"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+      rm -f "$tmp_output"
+      die "HTTP ${http_code}: POST /v1/document/patch"
+    fi
+
+    [[ -s "$tmp_output" ]] \
+      || {
+        rm -f "$tmp_output"
+        die "patch returned an empty document"
+      }
+
+    mv "$tmp_output" "$output"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --argjson bytes "$(stat -c '%s' "$output")" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes
+      }'
+    ;;
+
+  seal)
+    [[ $# -ge 8 ]] \
+      || die "usage: kordoc-api seal <file> --image <seal-image> --ops <ops.json> -o <output.hwpx>"
+
+    file="$2"
+    require_file "$file"
+
+    image_file=""
+    ops_file=""
+    output=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --image)
+          [[ $# -ge 2 ]] || die "--image requires a file"
+          image_file="$2"
+          shift 2
+          ;;
+
+        --ops)
+          [[ $# -ge 2 ]] || die "--ops requires a JSON file"
+          ops_file="$2"
+          shift 2
+          ;;
+
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown seal option: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$image_file" ]] \
+      || die "seal requires --image <seal-image>"
+
+    [[ -n "$ops_file" ]] \
+      || die "seal requires --ops <ops.json>"
+
+    require_file "$image_file"
+    require_json_array "$ops_file" "ops"
+    require_output_path "$output" "seal"
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-seal.XXXXXX")"
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        -F "file=@${file}" \
+        -F "image=@${image_file}" \
+        -F "ops=<${ops_file}" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/seal"
+    )"; then
+      rm -f "$tmp_output"
+      die "request failed: POST /v1/document/seal"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+      rm -f "$tmp_output"
+      die "HTTP ${http_code}: POST /v1/document/seal"
+    fi
+
+    [[ -s "$tmp_output" ]] \
+      || {
+        rm -f "$tmp_output"
+        die "seal returned an empty document"
+      }
+
+    mv "$tmp_output" "$output"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --argjson bytes "$(stat -c '%s' "$output")" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes
+      }'
+    ;;
+
+  seal-native)
+    [[ $# -ge 6 ]] \
+      || die "usage: kordoc-api seal-native <file> --image <seal-image> -o <output.hwpx> [--anchor <text>] [--occurrence <n>] [--size-mm <n>] [--mode <auto|overlap|right>] [--dx-mm <n>] [--dy-mm <n>]"
+
+    file="$2"
+    require_file "$file"
+
+    image_file=""
+    output=""
+    anchor="(인)"
+    occurrence="0"
+    size_mm=""
+    mode="auto"
+    dx_mm=""
+    dy_mm=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --image)
+          [[ $# -ge 2 ]] || die "--image requires a file"
+          image_file="$2"
+          shift 2
+          ;;
+
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        --anchor)
+          [[ $# -ge 2 ]] || die "--anchor requires text"
+          anchor="$2"
+          shift 2
+          ;;
+
+        --occurrence)
+          [[ $# -ge 2 ]] || die "--occurrence requires a non-negative integer"
+          occurrence="$2"
+
+          [[ "$occurrence" =~ ^[0-9]+$ ]] \
+            || die "--occurrence must be a non-negative integer"
+
+          shift 2
+          ;;
+
+        --size-mm)
+          [[ $# -ge 2 ]] || die "--size-mm requires a number"
+          size_mm="$2"
+
+          awk -v n="$size_mm" \
+            'BEGIN { exit !(n > 0) }' \
+            || die "--size-mm must be greater than 0"
+
+          shift 2
+          ;;
+
+        --mode)
+          [[ $# -ge 2 ]] || die "--mode requires auto, overlap, or right"
+          mode="$2"
+
+          case "$mode" in
+            auto|overlap|right)
+              ;;
+            *)
+              die "invalid seal-native mode: $mode"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --dx-mm)
+          [[ $# -ge 2 ]] || die "--dx-mm requires a number"
+          dx_mm="$2"
+
+          awk -v n="$dx_mm" \
+            'BEGIN { exit !(n == n+0) }' \
+            || die "--dx-mm must be numeric"
+
+          shift 2
+          ;;
+
+        --dy-mm)
+          [[ $# -ge 2 ]] || die "--dy-mm requires a number"
+          dy_mm="$2"
+
+          awk -v n="$dy_mm" \
+            'BEGIN { exit !(n == n+0) }' \
+            || die "--dy-mm must be numeric"
+
+          shift 2
+          ;;
+
+        *)
+          die "unknown seal-native option: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$image_file" ]] \
+      || die "seal-native requires --image <seal-image>"
+
+    require_file "$image_file"
+    require_output_path "$output" "seal-native"
+
+    form_args=(
+      -F "file=@${file}"
+      -F "image=@${image_file}"
+      --form-string "anchor=${anchor}"
+      --form-string "occurrence=${occurrence}"
+      --form-string "mode=${mode}"
+    )
+
+    if [[ -n "$size_mm" ]]; then
+      form_args+=(
+        --form-string "sizeMm=${size_mm}"
+      )
+    fi
+
+    if [[ -n "$dx_mm" ]]; then
+      form_args+=(
+        --form-string "dxMm=${dx_mm}"
+      )
+    fi
+
+    if [[ -n "$dy_mm" ]]; then
+      form_args+=(
+        --form-string "dyMm=${dy_mm}"
+      )
+    fi
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-seal-native.XXXXXX")"
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        "${form_args[@]}" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/seal/native"
+    )"; then
+      rm -f "$tmp_output"
+      die "request failed: POST /v1/document/seal/native"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+      rm -f "$tmp_output"
+      die "HTTP ${http_code}: POST /v1/document/seal/native"
+    fi
+
+    [[ -s "$tmp_output" ]] || {
+      rm -f "$tmp_output"
+      die "seal-native returned an empty document"
+    }
+
+    mv "$tmp_output" "$output"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --argjson bytes "$(stat -c '%s' "$output")" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes
+      }'
+    ;;
+
+  patch-native)
+    [[ $# -ge 6 ]] \
+      || die "usage: kordoc-api patch-native <file> --markdown <markdown-file> -o <output.hwp|output.hwpx>"
+
+    file="$2"
+    require_file "$file"
+
+    markdown_file=""
+    output=""
+    structure_args=()
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --markdown)
+          [[ $# -ge 2 ]] || die "--markdown requires a file"
+          markdown_file="$2"
+          shift 2
+          ;;
+
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        --no-structure)
+          structure_args=(--form-string "structure=false")
+          shift
+          ;;
+
+        *)
+          die "unknown patch-native option: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$markdown_file" ]] \
+      || die "patch-native requires --markdown <markdown-file>"
+
+    require_file "$markdown_file"
+    require_output_path "$output" "patch-native"
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-patch-native.XXXXXX")"
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        -F "file=@${file}" \
+        -F "markdown=<${markdown_file}" \
+        "${structure_args[@]}" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/patch/native"
+    )"; then
+      rm -f "$tmp_output"
+      die "request failed: POST /v1/document/patch/native"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+      rm -f "$tmp_output"
+      die "HTTP ${http_code}: POST /v1/document/patch/native"
+    fi
+
+    [[ -s "$tmp_output" ]] || {
+      rm -f "$tmp_output"
+      die "patch-native returned an empty document"
+    }
+
+    mv "$tmp_output" "$output"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --argjson bytes "$(stat -c '%s' "$output")" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes
+      }'
+    ;;
+
+  profile-extract)
+    [[ $# -ge 4 ]] \
+      || die "usage: kordoc-api profile-extract <reference.hwpx> -o <profile.json>"
+
+    file="$2"
+    require_file "$file"
+
+    output=""
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown profile-extract option: $1"
+          ;;
+      esac
+    done
+
+    require_output_path "$output" "profile-extract"
+
+    output_dir="$(dirname "$output")"
+    response="$(mktemp)"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-profile.XXXXXX")"
+
+    if ! request_json \
+      POST \
+      /v1/document/profile/extract \
+      -F "file=@${file}" \
+      >"$response"
+    then
+      rm -f "$response" "$tmp_output"
+      exit 1
+    fi
+
+    if ! jq -e '.profile | type == "object"' "$response" >/dev/null; then
+      jq . "$response" >&2 || true
+      rm -f "$response" "$tmp_output"
+      die "Kordoc response does not contain a profile object"
+    fi
+
+    jq '.profile' "$response" >"$tmp_output"
+    mv "$tmp_output" "$output"
+
+    table_count="$(jq -r '.tableCount // 0' "$response")"
+    rm -f "$response"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg tableCount "$table_count" \
+      '{
+        success: true,
+        output: $output,
+        tableCount: ($tableCount | tonumber? // 0)
+      }'
+    ;;
+
+  fill)
+    [[ $# -ge 3 ]] \
+      || die "usage: kordoc-api fill <file> --values <values.json> [options] OR kordoc-api fill --template <template> --values <values.json> [options]"
+
+    file=""
+    template=""
+
+    if [[ "${2:-}" == "--template" ]]; then
+      [[ $# -ge 4 ]] \
+        || die "--template requires a template name"
+
+      template="$3"
+
+      case "$template" in
+        gian|gian-simple|일반기안문|간이기안문)
+          ;;
+        *)
+          die "unsupported built-in template: $template"
+          ;;
+      esac
+
+      shift 3
+    else
+      file="$2"
+      require_file "$file"
+      shift 2
+    fi
+
+    values_file=""
+    formats_file=""
+    require_unique="false"
+    mask_values="false"
+    output_format="markdown"
+    output=""
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --values)
+          [[ $# -ge 2 ]] || die "--values requires a JSON file"
+          values_file="$2"
+          shift 2
+          ;;
+
+        --formats)
+          [[ $# -ge 2 ]] || die "--formats requires a JSON file"
+          formats_file="$2"
+          shift 2
+          ;;
+
+        --require-unique)
+          require_unique="true"
+          shift
+          ;;
+
+        --mask-values)
+          mask_values="true"
+          shift
+          ;;
+
+        --format)
+          [[ $# -ge 2 ]] || die "--format requires a value"
+          output_format="$2"
+
+          case "$output_format" in
+            markdown|hwpx|hwpx-preserve)
+              ;;
+            *)
+              die "invalid fill output format: $output_format"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown fill option: $1"
+          ;;
+      esac
+    done
+
+    [[ -n "$values_file" ]] \
+      || die "fill requires --values <values.json>"
+
+    require_json_object "$values_file" "values"
+
+    if [[ -n "$formats_file" ]]; then
+      require_json_object "$formats_file" "formats"
+    fi
+
+    form_args=(
+      -F "values=<${values_file}"
+      -F "outputFormat=${output_format}"
+    )
+
+    if [[ -n "$file" ]]; then
+      form_args+=(
+        -F "file=@${file}"
+      )
+    else
+      form_args+=(
+        -F "template=${template}"
+      )
+    fi
+
+    if [[ -n "$formats_file" ]]; then
+      form_args+=(
+        -F "formats=<${formats_file}"
+      )
+    fi
+
+    if [[ "$require_unique" == "true" ]]; then
+      form_args+=(
+        -F "requireUnique=true"
+      )
+    fi
+
+    if [[ "$mask_values" == "true" ]]; then
+      form_args+=(
+        -F "maskValues=true"
+      )
+    fi
+
+    if [[ "$output_format" == "markdown" ]]; then
+      [[ -z "$output" ]] \
+        || die "-o is only used with binary fill formats"
+
+      request_json \
+        POST \
+        /v1/form/fill \
+        "${form_args[@]}"
+
+      exit 0
+    fi
+
+    require_output_path "$output" "fill"
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-fill.XXXXXX")"
+    headers="$(mktemp)"
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        "${form_args[@]}" \
+        -D "$headers" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/form/fill"
+    )"; then
+      if [[ -s "$tmp_output" ]]; then
+        cat "$tmp_output" >&2 || true
+        echo >&2
+      fi
+
+      rm -f "$tmp_output" "$headers"
+      die "request failed: POST /v1/form/fill"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+
+      rm -f "$tmp_output" "$headers"
+      die "HTTP ${http_code}: POST /v1/form/fill"
+    fi
+
+    if [[ ! -s "$tmp_output" ]]; then
+      rm -f "$tmp_output" "$headers"
+      die "Kordoc returned an empty filled document"
+    fi
+
+    case "${content_type%%;*}" in
+      application/hwp+zip|application/zip|application/octet-stream)
+        ;;
+      *)
+        file "$tmp_output" >&2 || true
+        rm -f "$tmp_output" "$headers"
+        die "unexpected Content-Type: ${content_type:-unknown}"
+        ;;
+    esac
+
+    if ! file "$tmp_output" | grep -Eqi 'HWPX|Zip archive'; then
+      file "$tmp_output" >&2 || true
+      rm -f "$tmp_output" "$headers"
+      die "filled response is not recognized as HWPX/ZIP"
+    fi
+
+    mv "$tmp_output" "$output"
+
+    filled_count="$(header_value x-kordoc-filled-count "$headers")"
+    rejected_count="$(header_value x-kordoc-rejected-count "$headers")"
+    unmatched_count="$(header_value x-kordoc-unmatched-count "$headers")"
+    response_mask="$(header_value x-kordoc-mask-values "$headers")"
+
+    rm -f "$headers"
+
+    bytes="$(stat -c '%s' "$output")"
+
+    jq -n \
+      --arg output "$(realpath "$output")" \
+      --arg contentType "$content_type" \
+      --arg filledCount "${filled_count:-0}" \
+      --arg rejectedCount "${rejected_count:-0}" \
+      --arg unmatchedCount "${unmatched_count:-0}" \
+      --arg maskValues "${response_mask:-false}" \
+      --argjson bytes "$bytes" \
+      '{
+        success: true,
+        output: $output,
+        contentType: $contentType,
+        bytes: $bytes,
+        filledCount: ($filledCount | tonumber? // 0),
+        rejectedCount: ($rejectedCount | tonumber? // 0),
+        unmatchedCount: ($unmatchedCount | tonumber? // 0),
+        maskValues: ($maskValues == "true")
+      }'
+    ;;
+
+  redact)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api redact <file> [--rules <rules.json>] [--mask-char <character>] [--dry-run] [-o <output>]"
+
+    file="$2"
+    require_file "$file"
+
+    rules_file=""
+    mask_char=""
+    dry_run="false"
+    output=""
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --rules)
+          [[ $# -ge 2 ]] || die "--rules requires a JSON file"
+          rules_file="$2"
+          shift 2
+          ;;
+
+        --mask-char)
+          [[ $# -ge 2 ]] || die "--mask-char requires a value"
+          mask_char="$2"
+          shift 2
+          ;;
+
+        --dry-run)
+          dry_run="true"
+          shift
+          ;;
+
+        -o|--output)
+          [[ $# -ge 2 ]] || die "$1 requires a path"
+          output="$2"
+          shift 2
+          ;;
+
+        *)
+          die "unknown redact option: $1"
+          ;;
+      esac
+    done
+
+    if [[ -n "$rules_file" ]]; then
+      require_json_array "$rules_file" "rules"
+
+      jq -e 'all(.[]; type == "string")' "$rules_file" >/dev/null \
+        || die "rules must contain only strings: $rules_file"
+    fi
+
+    form_args=(
+      -F "file=@${file}"
+    )
+
+    if [[ -n "$rules_file" ]]; then
+      form_args+=(
+        -F "rules=<${rules_file}"
+      )
+    fi
+
+    if [[ -n "$mask_char" ]]; then
+      form_args+=(
+        -F "maskChar=${mask_char}"
+      )
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+      [[ -z "$output" ]] \
+        || die "-o cannot be used together with --dry-run"
+
+      form_args+=(
+        -F "dryRun=true"
+      )
+
+      request_json \
+        POST \
+        /v1/document/redact \
+        "${form_args[@]}"
+
+      exit 0
+    fi
+
+    require_output_path "$output" "redact"
+
+    output_dir="$(dirname "$output")"
+    tmp_output="$(mktemp "${output_dir}/.kordoc-api-redact.XXXXXX")"
+    headers="$(mktemp)"
+
+    if ! meta="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        "${form_args[@]}" \
+        -D "$headers" \
+        -o "$tmp_output" \
+        -w $'%{http_code}\n%{content_type}' \
+        "${KORDOC_API_BASE}/v1/document/redact"
+    )"; then
+      if [[ -s "$tmp_output" ]]; then
+        cat "$tmp_output" >&2 || true
+        echo >&2
+      fi
+
+      rm -f "$tmp_output" "$headers"
+      die "request failed: POST /v1/document/redact"
+    fi
+
+    http_code="$(printf '%s\n' "$meta" | sed -n '1p')"
+    content_type="$(printf '%s\n' "$meta" | sed -n '2p')"
+
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      cat "$tmp_output" >&2 || true
+      echo >&2
+
+      rm -f "$tmp_output" "$headers"
+      die "HTTP ${http_code}: POST /v1/document/redact"
+    fi
+
+    case "${content_type%%;*}" in
+      application/json)
+        if ! jq -e . "$tmp_output" >/dev/null 2>&1; then
+          cat "$tmp_output" >&2 || true
+          rm -f "$tmp_output" "$headers"
+          die "Kordoc returned invalid JSON"
+        fi
+
+        if ! semantic_ok <"$tmp_output"; then
+          jq . "$tmp_output" >&2
+          rm -f "$tmp_output" "$headers"
+          die "Kordoc reported operation failure"
+        fi
+
+        if ! jq -e '.maskedMarkdown | type == "string"' "$tmp_output" >/dev/null; then
+          jq . "$tmp_output" >&2
+          rm -f "$tmp_output" "$headers"
+          die "redaction JSON does not contain maskedMarkdown"
+        fi
+
+        tmp_markdown="$(mktemp "${output_dir}/.kordoc-api-redact-md.XXXXXX")"
+        jq -r '.maskedMarkdown' "$tmp_output" >"$tmp_markdown"
+        mv "$tmp_markdown" "$output"
+
+        hit_count="$(jq -r '.hitCount // 0' "$tmp_output")"
+        rm -f "$tmp_output" "$headers"
+
+        bytes="$(stat -c '%s' "$output")"
+
+        jq -n \
+          --arg output "$(realpath "$output")" \
+          --arg hitCount "$hit_count" \
+          --argjson bytes "$bytes" \
+          '{
+            success: true,
+            output: $output,
+            format: "markdown",
+            bytes: $bytes,
+            hitCount: ($hitCount | tonumber? // 0)
+          }'
+        ;;
+
+      application/hwp+zip|application/zip|application/octet-stream|application/x-hwp)
+        if [[ ! -s "$tmp_output" ]]; then
+          rm -f "$tmp_output" "$headers"
+          die "Kordoc returned an empty redacted document"
+        fi
+
+        if ! file "$tmp_output" \
+          | grep -Eqi 'HWPX|HWP|Hangul|Zip archive|Composite Document|OLE'; then
+          file "$tmp_output" >&2 || true
+          rm -f "$tmp_output" "$headers"
+          die "redacted response is not recognized as HWP/HWPX"
+        fi
+
+        mv "$tmp_output" "$output"
+
+        hit_count="$(header_value x-kordoc-redaction-hits "$headers")"
+        skipped_count="$(header_value x-kordoc-redaction-skipped "$headers")"
+
+        rm -f "$headers"
+
+        bytes="$(stat -c '%s' "$output")"
+
+        jq -n \
+          --arg output "$(realpath "$output")" \
+          --arg contentType "$content_type" \
+          --arg hitCount "${hit_count:-0}" \
+          --arg skippedCount "${skipped_count:-0}" \
+          --argjson bytes "$bytes" \
+          '{
+            success: true,
+            output: $output,
+            contentType: $contentType,
+            bytes: $bytes,
+            hitCount: ($hitCount | tonumber? // 0),
+            skippedCount: ($skippedCount | tonumber? // 0)
+          }'
+        ;;
+
+      *)
+        file "$tmp_output" >&2 || true
+        rm -f "$tmp_output" "$headers"
+        die "unexpected Content-Type: ${content_type:-unknown}"
+        ;;
+    esac
+    ;;
+
+  form-parse)
+    [[ $# -eq 2 ]] || die "usage: kordoc-api form-parse <file>"
+
+    file="$2"
+    require_file "$file"
+
+    request_json \
+      POST \
+      /v1/form/parse \
+      -F "file=@${file}"
+    ;;
+
+  parse-table)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api parse-table <file> [--ocr false|true|force] [--images true|false]"
+
+    file="$2"
+    require_file "$file"
+
+    ocr="false"
+    include_images="true"
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --ocr)
+          [[ $# -ge 2 ]] || die "--ocr requires a value"
+          ocr="$2"
+          case "$ocr" in
+            false|true|force) ;;
+            *) die "invalid --ocr value: $ocr" ;;
+          esac
+          shift 2
+          ;;
+
+        --images)
+          [[ $# -ge 2 ]] || die "--images requires a value"
+          include_images="$2"
+          case "$include_images" in
+            true|false) ;;
+            *) die "invalid --images value: $include_images" ;;
+          esac
+          shift 2
+          ;;
+
+        *)
+          if consume_common_option "$@"; then
+            shift "$consumed"
+          else
+            die "unknown parse-table option: $1"
+          fi
+          ;;
+      esac
+    done
+
+    request_json \
+      POST \
+      /v1/parse/table \
+      -F "file=@${file}" \
+      -F "ocr=${ocr}" \
+      -F "images=${include_images}" \
+      ${common_form[@]+"${common_form[@]}"}
+    ;;
+
+  detect)
+    [[ $# -eq 2 ]] || die "usage: kordoc-api detect <file>"
+
+    file="$2"
+    require_file "$file"
+
+    request_json \
+      POST \
+      /v1/detect \
+      -F "file=@${file}"
+    ;;
+
+  metadata)
+    [[ $# -ge 2 ]] || die "usage: kordoc-api metadata <file> [--password-env <VAR>] [--pages <range>] [--table-format gfm] ..."
+
+    file="$2"
+    require_file "$file"
+    allow_table_format=1
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        *)
+          if consume_common_option "$@"; then
+            shift "$consumed"
+          else
+            die "unknown metadata option: $1"
+          fi
+          ;;
+      esac
+    done
+
+    request_json \
+      POST \
+      /v1/metadata \
+      -F "file=@${file}" \
+      ${common_form[@]+"${common_form[@]}"}
+    ;;
+
+  validate)
+    [[ $# -eq 2 ]] || die "usage: kordoc-api validate <file>"
+
+    file="$2"
+    require_file "$file"
+
+    request_json \
+      POST \
+      /v1/document/validate \
+      -F "file=@${file}"
+    ;;
+
+  parse)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api parse <file> [--ocr false|true|force] [--include-blocks true|false] [--include-field-placeholders true|false] [--plain true|false] [--html-tables true|false] [--table-format gfm] [common parse options]"
+
+    file="$2"
+    require_file "$file"
+    allow_table_format=1
+
+    ocr="false"
+    include_blocks="true"
+    include_field_placeholders="false"
+    plain="false"
+    html_tables="false"
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --ocr)
+          [[ $# -ge 2 ]] \
+            || die "--ocr requires a value"
+
+          ocr="$2"
+
+          case "$ocr" in
+            false|true|force)
+              ;;
+            *)
+              die "invalid --ocr value: $ocr"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --include-blocks)
+          [[ $# -ge 2 ]] \
+            || die "--include-blocks requires a value"
+
+          include_blocks="$2"
+
+          case "$include_blocks" in
+            true|false)
+              ;;
+            *)
+              die "invalid --include-blocks value: $include_blocks"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --include-field-placeholders)
+          [[ $# -ge 2 ]] \
+            || die "--include-field-placeholders requires a value"
+
+          include_field_placeholders="$2"
+
+          case "$include_field_placeholders" in
+            true|false)
+              ;;
+            *)
+              die "invalid --include-field-placeholders value: $include_field_placeholders"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --plain)
+          [[ $# -ge 2 ]] \
+            || die "--plain requires a value"
+
+          plain="$2"
+
+          case "$plain" in
+            true|false)
+              ;;
+            *)
+              die "invalid --plain value: $plain"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        --html-tables)
+          [[ $# -ge 2 ]] \
+            || die "--html-tables requires a value"
+
+          html_tables="$2"
+
+          case "$html_tables" in
+            true|false)
+              ;;
+            *)
+              die "invalid --html-tables value: $html_tables"
+              ;;
+          esac
+
+          shift 2
+          ;;
+
+        *)
+          if consume_common_option "$@"; then
+            shift "$consumed"
+          else
+            die "unknown parse option: $1"
+          fi
+          ;;
+      esac
+    done
+
+    [[ "$table_format_set" == 0 || "$html_tables" == false ]] \
+      || die "--table-format 은 --html-tables true 와 같이 쓰지 않는다"
+
+    request_json \
+      POST \
+      /v1/parse \
+      -F "file=@${file}" \
+      -F "ocr=${ocr}" \
+      -F "includeBlocks=${include_blocks}" \
+      -F "includeFieldPlaceholders=${include_field_placeholders}" \
+      -F "plain=${plain}" \
+      -F "htmlTables=${html_tables}" \
+      ${common_form[@]+"${common_form[@]}"}
+    ;;
+
+  compare)
+    [[ $# -ge 3 ]] \
+      || die "usage: kordoc-api compare <fileA> <fileB> [--ocr <false|true|force>]"
+
+    file_a="$2"
+    file_b="$3"
+    require_file "$file_a"
+    require_file "$file_b"
+
+    ocr="false"
+
+    shift 3
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --ocr)
+          [[ $# -ge 2 ]] || die "--ocr requires false, true, or force"
+          ocr="$2"
+          case "$ocr" in
+            false|true|force) ;;
+            *) die "invalid --ocr value: $ocr" ;;
+          esac
+          shift 2
+          ;;
+
+        *)
+          die "unknown compare option: $1"
+          ;;
+      esac
+    done
+
+    request_json \
+      POST \
+      /v1/compare \
+      -F "fileA=@${file_a}" \
+      -F "fileB=@${file_b}" \
+      -F "ocr=${ocr}"
+    ;;
+
+  lint)
+    [[ $# -ge 2 ]] \
+      || die "usage: kordoc-api lint <file|-> [--munche <true|false>] [--strict]"
+
+    lint_src="$2"
+    munche="false"
+    strict="false"
+
+    shift 2
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --munche)
+          [[ $# -ge 2 ]] || die "--munche requires true or false"
+          munche="$2"
+          case "$munche" in
+            true|false) ;;
+            *) die "invalid --munche value: $munche" ;;
+          esac
+          shift 2
+          ;;
+
+        --strict)
+          strict="true"
+          shift
+          ;;
+
+        *)
+          die "unknown lint option: $1"
+          ;;
+      esac
+    done
+
+    if [[ "$lint_src" != "-" ]]; then
+      require_file "$lint_src"
+      exec 3< "$lint_src"
+    else
+      exec 3<&0
+    fi
+
+    # 본문은 셸 명령줄에 펼치지 않고 stdin 으로 JSON 으로 만든다(긴 문서·특수문자 안전).
+    lint_tmp="$(mktemp)"
+
+    if ! lint_code="$(
+      jq -Rs --argjson munche "$munche" '{text: ., munche: $munche}' <&3 \
+        | curl "${curl_common[@]}" \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            --data-binary @- \
+            -o "$lint_tmp" \
+            -w '%{http_code}' \
+            "${KORDOC_API_BASE}/v1/document/lint"
+    )"; then
+      rm -f "$lint_tmp"
+      die "request failed: POST /v1/document/lint"
+    fi
+
+    exec 3<&-
+
+    if [[ ! "$lint_code" =~ ^2[0-9][0-9]$ ]]; then
+      [[ -s "$lint_tmp" ]] && { cat "$lint_tmp" >&2; echo >&2; }
+      rm -f "$lint_tmp"
+      die "HTTP ${lint_code}: POST /v1/document/lint"
+    fi
+
+    jq -e . "$lint_tmp" >/dev/null 2>&1 \
+      || { cat "$lint_tmp" >&2; rm -f "$lint_tmp"; die "Kordoc returned invalid JSON"; }
+
+    # ok:false 는 «표기 오류가 있다» 는 정상 결과다 — 항상 stdout 에 낸다.
+    jq . "$lint_tmp"
+
+    if [[ "$strict" == "true" ]] && jq -e '.ok == false' "$lint_tmp" >/dev/null; then
+      rm -f "$lint_tmp"
+      exit 1
+    fi
+
+    rm -f "$lint_tmp"
+    ;;
+
+  lint-full)
+    [[ $# -ge 3 ]] \
+      || die "usage: kordoc-api lint-full (--file <document> | --text-file <text> | --blocks <blocks.json>) [--munche|--slop|--logic|--numbers|--budget|--gate <true|false>] [--preset <name>]"
+
+    shift
+    lint_form=()
+    lint_sources=0
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --file)
+          [[ $# -ge 2 ]] || die "--file requires a document"
+          require_file "$2"
+          lint_form+=(-F "file=@${2}")
+          lint_sources=$((lint_sources + 1))
+          shift 2
+          ;;
+
+        --text-file)
+          [[ $# -ge 2 ]] || die "--text-file requires a file"
+          require_file "$2"
+          lint_form+=(-F "text=<${2}")
+          lint_sources=$((lint_sources + 1))
+          shift 2
+          ;;
+
+        --blocks)
+          [[ $# -ge 2 ]] || die "--blocks requires a JSON file"
+          require_json_array "$2" "blocks"
+          lint_form+=(-F "blocks=<${2}")
+          lint_sources=$((lint_sources + 1))
+          shift 2
+          ;;
+
+        --munche|--slop|--logic|--numbers|--budget|--gate)
+          [[ $# -ge 2 ]] || die "$1 requires true or false"
+          case "$2" in
+            true|false) ;;
+            *) die "invalid $1 value: $2" ;;
+          esac
+          lint_form+=(--form-string "${1#--}=${2}")
+          shift 2
+          ;;
+
+        --preset)
+          [[ $# -ge 2 ]] || die "--preset requires a name"
+          lint_form+=(--form-string "preset=${2}")
+          shift 2
+          ;;
+
+        *)
+          die "unknown lint-full option: $1"
+          ;;
+      esac
+    done
+
+    (( lint_sources == 1 )) \
+      || die "lint-full needs exactly one of --file, --text-file, --blocks"
+
+    lint_tmp="$(mktemp)"
+
+    if ! lint_code="$(
+      curl "${curl_common[@]}" \
+        -X POST \
+        "${lint_form[@]}" \
+        -o "$lint_tmp" \
+        -w '%{http_code}' \
+        "${KORDOC_API_BASE}/v1/document/lint/full"
+    )"; then
+      rm -f "$lint_tmp"
+      die "request failed: POST /v1/document/lint/full"
+    fi
+
+    if [[ ! "$lint_code" =~ ^2[0-9][0-9]$ ]]; then
+      [[ -s "$lint_tmp" ]] && { cat "$lint_tmp" >&2; echo >&2; }
+      rm -f "$lint_tmp"
+      die "HTTP ${lint_code}: POST /v1/document/lint/full"
+    fi
+
+    jq -e . "$lint_tmp" >/dev/null 2>&1 \
+      || { cat "$lint_tmp" >&2; rm -f "$lint_tmp"; die "Kordoc returned invalid JSON"; }
+
+    # 지적이 있는 결과도 정상 결과다 — 항상 stdout 에 낸다.
+    jq . "$lint_tmp"
+    rm -f "$lint_tmp"
+    ;;
+
+  -h|--help|help|"")
+    usage
+    ;;
+
+  *)
+    usage >&2
+    die "unknown command: $command"
+    ;;
+esac
