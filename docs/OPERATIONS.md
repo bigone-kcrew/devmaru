@@ -1,4 +1,4 @@
-# 🛠 운영 가이드
+# 운영 가이드
 
 > 설치가 끝난 뒤 **관리자가 매일·가끔 하는 일**을 모았습니다.
 >
@@ -6,23 +6,23 @@
 >
 > 아래 `<접두어>` 는 설치 때 정한 접두어입니다(기본 `devmaru`). 명령은 모두 서버에서 `sudo` 로 실행합니다.
 
-| | 하는 일 | 대표 명령 |
-|---|---|---|
-| 👤 | [회원 추가 · 삭제 · 상태](#-1-회원-관리) | `<접두어>-member-add` · `member-remove` · `member-status` |
-| 🗄 | [회원 DB](#-2-회원-db) | `<접두어>-member-db-setup` |
-| 🌐 | [웹 공개 관리](#-3-웹-공개-관리) | `<접두어>-site-caddy` |
-| 🔁 | [업데이트](#-4-업데이트) | `<접두어>-update` · `member-update-all` · `service-update` |
-| 🩺 | [점검 · 로그](#-5-점검과-로그) | `<접두어>-doctor` |
-| 💾 | [백업·복구·이관](#-6-백업) | `<접두어>-backup-run` · `restore` · `migrate` (→ [RECOVERY](RECOVERY.md)) |
-| 🔥 | 방화벽 | `<접두어>-firewall` (→ [FIREWALL](FIREWALL.md)) |
-| 🤖 | AI 에이전트 계정(선택) | `<접두어>-agent-key` · `agent-setup` · `agent-audit` (→ [AGENT](AGENT.md)) |
-| 🔌 | [외부 MCP 서비스](#-7-외부-mcp-서비스) | `<접두어>-mcp-remote` |
+| 하는 일 | 대표 명령 |
+|---|---|
+| [회원 추가 · 삭제 · 상태](#1-회원-관리) | `<접두어>-member-add` · `member-remove` · `member-status` |
+| [회원 DB](#2-회원-db) | `<접두어>-member-db-setup` |
+| [웹 공개 관리](#3-웹-공개-관리) | `<접두어>-site-caddy` |
+| [업데이트](#4-업데이트) | `<접두어>-update` · `member-update-all` · `service-update` |
+| [점검 · 로그](#5-점검과-로그) | `<접두어>-doctor` |
+| [백업·복구·이관](#6-백업) | `<접두어>-backup-run` · `restore` · `migrate` (→ [RECOVERY](RECOVERY.md)) |
+| 방화벽 | `<접두어>-firewall` (→ [FIREWALL](FIREWALL.md)) |
+| AI 에이전트 계정(선택) | `<접두어>-agent-key` · `agent-setup` · `agent-audit` (→ [AGENT](AGENT.md)) |
+| [외부 MCP 서비스](#7-외부-mcp-서비스) | `<접두어>-mcp-remote` |
 
 ---
 
-## 👤 1. 회원 관리
+## 1. 회원 관리
 
-### ➕ 회원 추가
+### 회원 추가
 
 ```bash
 sudo <접두어>-member-add alice --email alice@example.org
@@ -30,16 +30,16 @@ sudo <접두어>-member-add alice --email alice@example.org
 
 한 번에 다음이 만들어집니다.
 
-- 🧑‍💻 리눅스 계정 · 회원 전용 폴더(`/srv/<접두어>/users/alice`) · 개발 컨테이너(`dev-alice`)
-- 🔐 초기 비밀번호(6자리) — 첫 로그인에서 바꾸도록 설정됩니다
-- 📱 Paseo 페어링 QR · 링크, 온보딩 안내 파일
-- 🗄 회원 전용 PostgreSQL DB와 접속 정보(`~/.pgpass`)
-- 🌐 `alice.<도메인>` 웹 공개 블록(Caddy)
-- 📁 파일 서비스(SFTPGo) 계정
+- 리눅스 계정 · 회원 전용 폴더(`/srv/<접두어>/users/alice`) · 개발 컨테이너(`dev-alice`)
+- 초기 비밀번호(6자리) — 첫 로그인에서 바꾸도록 설정됩니다
+- Paseo 페어링 QR · 링크, 온보딩 안내 파일
+- 회원 전용 PostgreSQL DB와 접속 정보(`~/.pgpass`)
+- `alice.<도메인>` 웹 공개 블록(Caddy)
+- 파일 서비스(SFTPGo) 계정
 
 **회원 ID 규칙:** 소문자로 시작, 소문자·숫자·`_`·`-`, 2~32자.
 
-> ℹ️ **초기 비밀번호는 어떻게 전달되나요?**
+> **초기 비밀번호는 어떻게 전달되나요?**
 >
 > 메일 자동 발송을 설정했다면 회원에게 메일로 갑니다.
 >
@@ -51,15 +51,15 @@ sudo <접두어>-member-add alice --email alice@example.org
 sudo <접두어>-onboarding-seal alice        # 온보딩 폴더의 페어링·초기 안내 임시 파일 삭제
 ```
 
-### 📱 Paseo 페어링 다시 만들기
+### Paseo 페어링 다시 만들기
 
 ```bash
 sudo <접두어>-paseo-pair-create alice       # 링크 + 안내 파일
 ```
 
-> ⚠️ 페어링 링크는 **재발급해도 같은 값인 영구 자격증명**처럼 다뤄야 합니다. 회원에게만 전달하세요.
+> 페어링 링크는 **재발급해도 같은 값인 영구 자격증명**처럼 다뤄야 합니다. 회원에게만 전달하세요.
 
-### 🔎 회원 상태 보기
+### 회원 상태 보기
 
 ```bash
 sudo <접두어>-member-status alice                          # 계정 · DB 상태
@@ -67,7 +67,7 @@ sudo docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' | grep de
 sudo <접두어>-member-tmux-status                           # 모든 회원의 tmux 세션
 ```
 
-### ➖ 회원 삭제
+### 회원 삭제
 
 ```bash
 sudo <접두어>-member-remove alice            # 확인 질문이 나옵니다
@@ -81,11 +81,11 @@ sudo <접두어>-member-remove alice --force    # 질문 없이
 3. 파일 서비스·Samba 계정 삭제
 4. 리눅스 계정과 홈 삭제, `alice.<도메인>` 웹 블록 삭제
 
-> ⚠️ **데이터가 삭제될 수 있습니다.** 삭제 전에 필요하면 회원 폴더(`/srv/<접두어>/users/<ID>`)를 백업하세요.
+> **데이터가 삭제될 수 있습니다.** 삭제 전에 필요하면 회원 폴더(`/srv/<접두어>/users/<ID>`)를 백업하세요.
 
 ---
 
-## 🗄 2. 회원 DB
+## 2. 회원 DB
 
 회원을 추가하면 DB가 자동으로 만들어집니다. 다시 하거나 암호를 바꿔야 할 때만 아래를 씁니다.
 
@@ -101,7 +101,7 @@ sudo <접두어>-member-db-setup alice --dry-run       # 무엇을 할지만 표
 
 ---
 
-## 🌐 3. 웹 공개 관리
+## 3. 웹 공개 관리
 
 회원이 만든 사이트는 `<ID>.<도메인>` 으로 공개됩니다. Caddy 블록은 등록할 때 자동으로 만들어지지만, 수동으로 다룰 수도 있습니다.
 
@@ -116,7 +116,7 @@ sudo <접두어>-site-caddy shared on|off    # 공용 정적 공개(portal 주�
 
 ---
 
-## 🔁 4. 업데이트
+## 4. 업데이트
 
 ### 새 릴리스 적용
 
@@ -129,7 +129,7 @@ sudo <접두어>-member-update-all           # 전체 회원을 새 Golden 이�
 - `update` 는 모든 설치 단계를 **다시 실행**합니다(비밀·설정은 유지, Golden 은 버전이 바뀔 때만 다시 빌드).
 - **실행 중인 회원 컨테이너는 `update` 만으로는 바뀌지 않습니다.** 새 Golden 을 쓰려면 `member-update-all` 이 필요합니다.
 
-> 🚦 **`member-update-all` 의 원칙**
+> **`member-update-all` 의 원칙**
 >
 > - 전체 회원을 한꺼번에 갱신합니다(일부만 갱신하지 않습니다).
 > - 리눅스 계정 · `/home` · workspace 는 유지하고, `dev-*` 컨테이너만 다시 만듭니다.
@@ -142,7 +142,7 @@ sudo <접두어>-member-tmux-kill-all --yes    # 강제 종료(작업 중인 Cla
 sudo <접두어>-member-runtime-recreate-all --check    # 컨테이너 설정만 다시 적용할 때(이미지 변경 없이)
 ```
 
-### 🧑‍💻 Golden 이미지(개발환경) 업데이트
+### Golden 이미지(개발환경) 업데이트
 
 Golden 은 회원 컨테이너가 쓰는 개발환경 이미지입니다. **새 릴리스에 들어 있는 버전으로** 빌드됩니다.
 
@@ -156,13 +156,13 @@ Golden 은 회원 컨테이너가 쓰는 개발환경 이미지입니다. **새 
 | 같은 버전을 처음부터 다시 빌드 (고급) | `sudo env GOLDEN_REBUILD=1 <접두어>-update --force` — 환경변수로 전달합니다 |
 | 에이전트 CLI(Claude Code · Codex …) 최신화 | 회원이 컨테이너 안에서 CLI 자체 업데이트를 할 수 있습니다. 이미지에 고정된 버전을 바꾸려면 새 릴리스를 받습니다 |
 
-> ⚠️ **현재 한계**
+> **현재 한계**
 >
 > - 회원 컨테이너 갱신은 전체를 한 번에 합니다. 새 이미지를 **먼저 격리 컨테이너로 검증하는(RC·canary)** 운영자 흐름은 [Golden 운영](GOLDEN.md) 을 보세요.
 > - 그래서 갱신 전에 `--check` 로 작업 중인 회원이 없는지 확인하고, 이전 이미지를 지우지 않은 상태에서 진행하세요.
 > - Golden 안의 도구 버전을 직접 고르는 기능은 없습니다(릴리스가 정한 버전).
 
-### 🚢 루트 서비스(PostgreSQL · n8n · SFTPGo · Kordoc …) 업데이트
+### 루트 서비스(PostgreSQL · n8n · SFTPGo · Kordoc …) 업데이트
 
 각 서비스의 이미지 버전은 **릴리스에 고정**되어 있습니다. 서비스를 올리는 정식 방법은 새 릴리스 적용입니다.
 
@@ -174,18 +174,18 @@ sudo <접두어>-doctor             # 적용 뒤 점검
 
 적용 전에 **백업을 먼저** 하세요(`sudo <접두어>-backup-run`). 특히 PostgreSQL · n8n · SFTPGo 는 데이터가 있습니다.
 
-> ⚠️ **알아 둘 한계**
+> **알아 둘 한계**
 >
 > - 서비스 하나만 올릴 때는 `sudo <접두어>-service-update <서비스> --plan` → `--apply` (백업·헬스 확인·실패 시 롤백, [SERVICE-UPDATE](SERVICE-UPDATE.md)). compose 의 이미지 태그를 직접 고치면 **다음 `update` 가 릴리스 값으로 되돌립니다.**
 > - **PostgreSQL 주 버전(현재 18) 올리기는 지원하지 않습니다.** 데이터 디렉터리가 호환되지 않아 덤프·복원 같은 별도 절차가 필요합니다.
 > - 업데이트 중에는 해당 서비스가 잠시 재시작됩니다. 회원이 많은 시간대는 피하세요.
 > - 전체 `update` 의 롤백은 백업과 이전 릴리스(`update <이전 릴리스 주소>`)를 사용합니다(서비스 개별 롤백은 `service-update` 가 합니다).
 
-> 🗺 Golden canary 는 다음 버전에서 검토합니다.
+> Golden canary 는 다음 버전에서 검토합니다.
 
 ---
 
-## 🩺 5. 점검과 로그
+## 5. 점검과 로그
 
 ```bash
 sudo <접두어>-doctor          # 컨테이너 · DB 확장 · Caddy · 포털 · Golden 이미지 · 디스크를 한 번에 점검
@@ -194,24 +194,24 @@ sudo <접두어>-help            # 관리 명령 요약
 
 | 보고 싶은 것 | 위치 |
 |---|---|
-| 📜 설치 로그 | `/var/log/<접두어>-install.log` |
-| 🧑‍💻 Golden 빌드 로그 | `/var/log/<접두어>-golden-build.log` |
-| 👤 회원 등록 로그 | `/srv/<접두어>/logs/member-add/` |
-| 🌐 웹 접근 로그 | `/var/log/caddy/access.log` |
-| 🚢 서비스 로그 | `docker logs <컨테이너>` (예: `postgres`, `n8n`, `kordoc`) |
+| 설치 로그 | `/var/log/<접두어>-install.log` |
+| Golden 빌드 로그 | `/var/log/<접두어>-golden-build.log` |
+| 회원 등록 로그 | `/srv/<접두어>/logs/member-add/` |
+| 웹 접근 로그 | `/var/log/caddy/access.log` |
+| 서비스 로그 | `docker logs <컨테이너>` (예: `postgres`, `n8n`, `kordoc`) |
 
 | 설정·데이터 | 위치 |
 |---|---|
-| ⚙️ 설치 설정 (비밀 없음) | `/etc/<접두어>/site.env` |
-| 🔑 비밀 | `/opt/<접두어>/config/env/*.env` · `/etc/<접두어>/secrets/` (root 만 읽음) |
-| 🧑‍💻 Golden 이미지 설정 | `/opt/<접두어>/config/dev-container.env` |
-| 👤 회원 데이터 | `/srv/<접두어>/users/<ID>` |
-| 📬 온보딩 | `/srv/<접두어>/onboarding/<ID>` |
-| 🧰 관리 스크립트 | `/opt/<접두어>/scripts/` |
+| 설치 설정 (비밀 없음) | `/etc/<접두어>/site.env` |
+| 비밀 | `/opt/<접두어>/config/env/*.env` · `/etc/<접두어>/secrets/` (root 만 읽음) |
+| Golden 이미지 설정 | `/opt/<접두어>/config/dev-container.env` |
+| 회원 데이터 | `/srv/<접두어>/users/<ID>` |
+| 온보딩 | `/srv/<접두어>/onboarding/<ID>` |
+| 관리 스크립트 | `/opt/<접두어>/scripts/` |
 
 ---
 
-## 💾 6. 백업
+## 6. 백업
 
 `backup` 모듈을 선택했다면 restic 저장소가 준비되어 있습니다.
 
@@ -224,7 +224,7 @@ sudo systemctl enable --now <접두어>-backup-weekly.timer    # 매주 일요�
 - 백업 결과는 `/var/lib/<접두어>/backup-last.status` 에 남습니다.
 - 저장소는 `/srv/<접두어>/backups/restic`, 암호는 `/etc/<접두어>/secrets/restic-repository-password` 입니다.
 
-> ⚠️ **저장소 암호 파일을 서버 밖에도 보관하세요.** 잃으면 백업을 복원할 수 없습니다.
+> **저장소 암호 파일을 서버 밖에도 보관하세요.** 잃으면 백업을 복원할 수 없습니다.
 >
 > 같은 서버의 디스크에만 있는 백업은 디스크 고장에 대비가 되지 않습니다. 저장소를 다른 곳으로 복사하는 것도 권합니다.
 
@@ -241,7 +241,7 @@ sudo -E restic restore latest --target /tmp/restore        # 최신 스냅샷을
 
 ---
 
-## 🔌 7. 외부 MCP 서비스
+## 7. 외부 MCP 서비스
 
 기본에서는 꺼져 있는 외부 공개 MCP 서비스(예: ALIO · K-Startup)를 «후보»로 켤 수 있습니다.
 
@@ -255,17 +255,17 @@ sudo <접두어>-mcp-remote disable alio       # 끄기
 
 ---
 
-## 📌 운영 원칙 요약
+## 운영 원칙 요약
 
-- 🧑‍💻 **Golden 갱신은 전체 회원 대상으로만** 합니다. 계정 · 홈 · workspace 는 유지하고 컨테이너만 다시 만듭니다.
-- 🚦 **작업 중인 회원(tmux)이 있으면 갱신을 멈춥니다.** 먼저 `member-tmux-status` 로 확인하세요.
-- 🔐 **비밀은 설정 파일이 아니라 `secrets/` 와 `*.env`(root 600)에 있습니다.** `site.env` 는 비밀이 없습니다.
-- 📱 **페어링 링크 · 초기 비밀번호는 회원에게만 전달**하고, 전달 뒤 `onboarding-seal` 로 정리합니다.
-- 🧩 모든 명령은 **여러 번 실행해도 안전**하도록 만들었지만, 삭제(`member-remove`)는 되돌릴 수 없습니다.
+- **Golden 갱신은 전체 회원 대상으로만** 합니다. 계정 · 홈 · workspace 는 유지하고 컨테이너만 다시 만듭니다.
+- **작업 중인 회원(tmux)이 있으면 갱신을 멈춥니다.** 먼저 `member-tmux-status` 로 확인하세요.
+- **비밀은 설정 파일이 아니라 `secrets/` 와 `*.env`(root 600)에 있습니다.** `site.env` 는 비밀이 없습니다.
+- **페어링 링크 · 초기 비밀번호는 회원에게만 전달**하고, 전달 뒤 `onboarding-seal` 로 정리합니다.
+- 모든 명령은 **여러 번 실행해도 안전**하도록 만들었지만, 삭제(`member-remove`)는 되돌릴 수 없습니다.
 
 ---
 
-## 🩺 문제 해결
+## 문제 해결
 
 | 증상 | 확인 |
 |---|---|
@@ -276,4 +276,4 @@ sudo <접두어>-mcp-remote disable alio       # 끄기
 | MCP 연결 실패 | 회원 컨테이너에서 `claude mcp list` — 허브(`127.0.0.1:18940/healthz`) 응답 확인 |
 | 디스크 부족 | `doctor` 의 `/srv` 여유 확인, 오래된 Docker 이미지·캐시 정리(`docker system df`) |
 
-> 📖 설치와 처음 설정은 [설치 가이드](INSTALL.md), 구조는 [구조 문서](ARCHITECTURE.md)를 보세요.
+> 설치와 처음 설정은 [설치 가이드](INSTALL.md), 구조는 [구조 문서](ARCHITECTURE.md)를 보세요.

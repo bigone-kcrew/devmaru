@@ -1,4 +1,4 @@
-# 📖 설치 가이드
+# 설치 가이드
 
 > 서버 한 대에 **데브마루를 처음 설치**하는 순서를 단계별로 설명합니다.
 >
@@ -8,32 +8,32 @@
 
 | | |
 |---|---|
-| 🎒 0. 준비물 | 서버 · 도메인 · 포트 · 관리자 계정 |
-| 🚀 1. 설치 시작 | 한 줄 명령 또는 웹 화면 |
-| ❓ 2. 질문 | 접두어 · 이름 · 도메인 · 서비스 선택 |
-| ⏳ 3. 진행 | 12단계와 재개 방법 |
-| ✅ 4. 끝난 뒤 | 점검 · 첫 회원 · Paseo |
-| 🔧 5. 운영 / 🩺 6. 문제 해결 | 자주 하는 작업과 증상별 확인 |
+| 0. 준비물 | 서버 · 도메인 · 포트 · 관리자 계정 |
+| 1. 설치 시작 | 한 줄 명령 또는 웹 화면 |
+| 2. 질문 | 접두어 · 이름 · 도메인 · 서비스 선택 |
+| 3. 진행 | 12단계와 재개 방법 |
+| 4. 끝난 뒤 | 점검 · 첫 회원 · Paseo |
+| 5. 운영 /  6. 문제 해결 | 자주 하는 작업과 증상별 확인 |
 
 ---
 
-## 🎒 0. 설치 전에 준비할 것
+## 0. 설치 전에 준비할 것
 
-| | 준비물 | 설명 |
-|---|---|---|
-| 🖥 | **서버** | Ubuntu **26.04 LTS** (x86_64) · 메모리 8GB 이상(회원이 많으면 16GB 이상) · 디스크 여유 60GB 이상 · 인터넷 연결 |
-| 🌍 | **도메인** | 예: `example.org`. 도메인 관리 화면에서 **A 레코드**를 만들어 서버의 공인 IP 를 가리키게 합니다 |
-| 📍 | **DNS 레코드** | `example.org` 와 `portal.example.org` 는 필수입니다.<br>나머지(`n8n.`, `files.` 등)와 회원 사이트(`<ID>.example.org`)는 **와일드카드 `*.example.org`** 한 줄로 해결하는 것을 권장합니다 |
-| 🔓 | **포트** | 80 · 443 이 외부에서 서버로 들어올 수 있어야 합니다(인증서 자동 발급).<br>SFTP 를 쓰면 2022 도 필요합니다 |
-| 👤 | **관리자 계정** | 서버에 이미 있는 리눅스 계정(보통 처음 만든 계정). `sudo` 가능해야 합니다 |
+| 준비물 | 설명 |
+|---|---|
+| **서버** | Ubuntu **26.04 LTS** (x86_64) · 메모리 8GB 이상(회원이 많으면 16GB 이상) · 디스크 여유 60GB 이상 · 인터넷 연결 |
+| **도메인** | 예: `example.org`. 도메인 관리 화면에서 **A 레코드**를 만들어 서버의 공인 IP 를 가리키게 합니다 |
+| **DNS 레코드** | `example.org` 와 `portal.example.org` 는 필수입니다.<br>나머지(`n8n.`, `files.` 등)와 회원 사이트(`<ID>.example.org`)는 **와일드카드 `*.example.org`** 한 줄로 해결하는 것을 권장합니다 |
+| **포트** | 80 · 443 이 외부에서 서버로 들어올 수 있어야 합니다(인증서 자동 발급).<br>SFTP 를 쓰면 2022 도 필요합니다 |
+| **관리자 계정** | 서버에 이미 있는 리눅스 계정(보통 처음 만든 계정). `sudo` 가능해야 합니다 |
 
-> 💡 **공인 도메인이 없는 내부망·시험 환경이라면**
+> **공인 도메인이 없는 내부망·시험 환경이라면**
 >
 > 설정 파일에 `TLS_MODE=internal` 을 넣고 설치하세요.
 >
 > 내부 인증서를 쓰므로 브라우저가 경고를 띄웁니다. 자세한 내용은 아래 «DNS·포트 준비» 를 보세요.
 
-### 📏 준비물·하드웨어 기준
+### 준비물·하드웨어 기준
 
 사전 점검(`00-preflight`)이 실제로 **막는 것(실패)** 과 **알려만 주는 것(경고)** 입니다. «실측» 칸이 «없음» 인 값은 시험해 보지 못한 것이니 참고만 하세요.
 
@@ -57,7 +57,7 @@
 - 설치 중: 패키지(apt) 저장소, Docker 이미지, Golden 이미지 빌드에 쓰는 외부 저장소.
 - 설치 뒤: Paseo 앱 연결은 릴레이를 거치므로 서버가 인터넷으로 나갈 수 있어야 합니다. 인증서 자동 발급(Let's Encrypt)도 인터넷이 필요합니다.
 
-### 🌐 DNS·포트 준비
+### DNS·포트 준비
 
 | 항목 | 해야 할 일 |
 |---|---|
@@ -68,22 +68,22 @@
 | **CGNAT 주의** | 통신사가 공인 IP 를 여러 가정에 나눠 쓰게 하면(CGNAT) 포트 포워딩이 되지 않습니다. 공유기 화면의 WAN IP 와 `curl https://api.ipify.org` 결과가 **다르면** 의심하세요. 이 경우 고정 공인 IP 를 신청하거나 클라우드 서버를 쓰세요 |
 | **방화벽** | 서버 방화벽이 80 · 443 · SSH 를 막지 않는지 확인합니다. 킷의 `<접두어>-firewall` 은 설치기가 적용하지 않으며 직접 `plan` 으로 확인 후 적용합니다([FIREWALL](FIREWALL.md)) |
 
-> 🧪 **도메인 없이 시험하기**
+> **도메인 없이 시험하기**
 >
 > 설정 파일에 `TLS_MODE=internal` 을 넣고, 설치할 때 `--skip-dns` 를 붙입니다. Caddy 가 자체(내부) 인증서를 쓰므로 인터넷에서 80 포트로 확인받는 과정이 필요 없습니다. 이 방식으로 **리허설 VM 설치가 끝까지 통과**했습니다.
 >
 > **한계:** 브라우저가 «안전하지 않음» 경고를 띄웁니다. 모바일 앱·외부 도구가 인증서를 거부할 수 있고, 회원 사이트를 다른 사람에게 보여 줄 수 없습니다. 이름은 내 PC 의 `hosts` 파일에 직접 적어 줘야 풀립니다.
 >
-> ⚠️ **공인 인증서(Let's Encrypt) 발급은 아직 시험하지 못했습니다.** 리허설 VM 은 80/443 이 인터넷에 열려 있지 않았기 때문에 `TLS_MODE=acme`(기본)의 실제 발급은 확인하지 못했습니다. 첫 설치에서 인증서가 안 받아지면 아래 «문제 해결» 과 `journalctl -u caddy -n 50` 을 확인하고, 막히면 [SUPPORT](SUPPORT.md) 의 진단 묶음을 첨부해 알려 주세요.
+> **공인 인증서(Let's Encrypt) 발급은 아직 시험하지 못했습니다.** 리허설 VM 은 80/443 이 인터넷에 열려 있지 않았기 때문에 `TLS_MODE=acme`(기본)의 실제 발급은 확인하지 못했습니다. 첫 설치에서 인증서가 안 받아지면 아래 «문제 해결» 과 `journalctl -u caddy -n 50` 을 확인하고, 막히면 [SUPPORT](SUPPORT.md) 의 진단 묶음을 첨부해 알려 주세요.
 
-### 🪟 Windows PC 에 설치하려면
+### Windows PC 에 설치하려면
 
 데브마루는 **Ubuntu 26.04 서버**를 기준으로 만들었습니다. Windows 11 PC 를 서버로 쓴다면 방법이 둘입니다.
 
 | | 방법 | 상태 |
 |---|---|---|
-| ✅ **권장** | Hyper-V(Windows Pro·Enterprise) 또는 VirtualBox 의 **Ubuntu Server 26.04 LTS VM** 안에서 이 문서의 순서를 그대로 따릅니다 | Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다) |
-| 🧪 **실험적** | **WSL2**(Windows 11) — 준비 스크립트 `windows/install-windows.ps1` | 아래 «WSL2 (실험적)» 참고 |
+| **권장** | Hyper-V(Windows Pro·Enterprise) 또는 VirtualBox 의 **Ubuntu Server 26.04 LTS VM** 안에서 이 문서의 순서를 그대로 따릅니다 | Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다) |
+| **실험적** | **WSL2**(Windows 11) — 준비 스크립트 `windows/install-windows.ps1` | 아래 «WSL2 (실험적)» 참고 |
 
 **VM 으로 설치할 때**: 메모리 8GB 이상(16GB 권장) · CPU 4코어 · 디스크 60GB 이상을 VM 에 할당하고, 다른 PC 나 외부에서 접속하려면 NAT 가 아닌 **브리지 네트워크**(Hyper-V «외부» 스위치 · VirtualBox «어댑터에 브리지»)로 연결합니다. Windows 가 켜질 때 VM 도 자동으로 시작되게 설정하세요.
 
@@ -101,7 +101,7 @@
    - 절전·최대 절전을 끄고, Windows 업데이트의 자동 재부팅 시간을 사용 시간 밖으로 잡습니다(재부팅되면 VM 도 잠시 내려갑니다).
 
 
-#### 🧪 WSL2 (실험적)
+#### WSL2 (실험적)
 
 관리자 PowerShell 에서 `windows\install-windows.ps1` 을 실행합니다(`-Apply` 없이 실행하면 **계획만** 보여 줍니다). 이 스크립트는 Windows 쪽 준비만 합니다.
 
@@ -113,7 +113,7 @@
 
 끝나면 `wsl -d Ubuntu-26.04 -u root` 로 distro 안에 들어가 이 문서의 설치 순서를 그대로 따릅니다(설정 파일에 `SSH_PORT=2222`, 공인 도메인이 없으면 `TLS_MODE=internal`).
 
-> ⚠️ **실험적 지원입니다.** 시험한 범위: Windows 11 Pro 10.0.26300 · WSL 2.7.3 **한 대**(Intel N100, 메모리 16GB, PC 는 자동 로그인 상태), Windows PowerShell 5.1 과 PowerShell 7 모두.
+> **실험적 지원입니다.** 시험한 범위: Windows 11 Pro 10.0.26300 · WSL 2.7.3 **한 대**(Intel N100, 메모리 16GB, PC 는 자동 로그인 상태), Windows PowerShell 5.1 과 PowerShell 7 모두.
 >
 > 확인한 것 — 이 스크립트로 distro 를 만든 뒤 **처음부터 설치**(모듈 postgres·caddy·golden·portal·files·n8n)·회원 등록·회원 SSH 경계(컨테이너 안에서만 실행, 호스트 경로 숨김, 포트 전달 거부)·한글 pptx→pdf 변환, 같은 LAN 의 다른 기기에서 포털·files·n8n·SSH 접속, 불필요한 내부 포트(5432·8080·5678 등)는 LAN 에서 닫힘, **재부팅 뒤 자동 복구**(mirrored·portproxy 두 방식 모두 약 2분 안에 포털 응답 — n8n 은 그보다 1분쯤 더 걸림), 두 방식을 오가는 전환과 `-Uninstall`.
 >
@@ -123,9 +123,9 @@
 
 ---
 
-## 🚀 1. 설치 시작
+## 1. 설치 시작
 
-### 1️⃣ 터미널로 설치
+### 1. 터미널로 설치
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bigone-kcrew/devmaru/main/install.sh | sudo bash
@@ -141,7 +141,7 @@ GitHub 에서 받습니다. GitLab 에서 받으려면 `sudo DEVMARU_SOURCE=gitl
 
 특정 버전을 받으려면 `DEVMARU_REF=<버전>`, 다른 주소에서 받으려면 `DEVMARU_URL=<tarball 주소>` 를 앞에 붙입니다.
 
-### 2️⃣ 웹 화면으로 설치 (선택)
+### 2. 웹 화면으로 설치 (선택)
 
 터미널 질문 대신 브라우저 화면으로 설치할 수 있습니다.
 
@@ -165,42 +165,42 @@ ssh -L 8765:127.0.0.1:8765 <사용자>@<서버 주소>
 
 ---
 
-## ❓ 2. 질문에 답하기
+## 2. 질문에 답하기
 
 Enter 만 누르면 `[대괄호]` 안의 기본값을 씁니다.
 
 | 질문 | 뜻 | 예 |
 |---|---|---|
-| 🏷 **접두어** | 명령·폴더·이미지 이름에 붙는 짧은 이름. **처음에 한 번 정하고 바꾸지 않습니다.** 소문자로 시작, 소문자·숫자 2~12자 | `devmaru`(기본), `myorg` |
-| 📛 **서비스 표시 이름** | 포털 등 화면에 보이는 이름(한글 가능) | `My Lab`, `우리 실험실` |
-| 🌍 **기본 도메인** | 위에서 준비한 도메인 | `example.org` |
-| 🧭 **포털 호스트 라벨** | 포털 주소의 앞부분 → `portal.example.org` | `portal` |
-| 👤 **관리자 계정** | 이미 있는 리눅스 계정 | `ubuntu` |
-| ✉️ **관리자 이메일** | 인증서 만료 알림 등을 받을 주소 | `admin@example.org` |
-| 🔒 **접속 허용 대역** | 관리 화면(`/ops`, Cockpit)에 들어올 수 있는 IP 대역(공백 구분).<br>지금 접속 중인 IP 가 기본으로 들어갑니다 | `127.0.0.1/32 203.0.113.5/32` |
-| 🕒 **시간대** | 컨테이너 시간대 | `Asia/Seoul` |
-| 🧰 **선택 서비스** | n8n · files(SFTPGo) · kordoc · markitdown · crawl4ai · ollama · uptime-kuma · cockpit · backup | y/n |
+| **접두어** | 명령·폴더·이미지 이름에 붙는 짧은 이름. **처음에 한 번 정하고 바꾸지 않습니다.** 소문자로 시작, 소문자·숫자 2~12자 | `devmaru`(기본), `myorg` |
+| **서비스 표시 이름** | 포털 등 화면에 보이는 이름(한글 가능) | `My Lab`, `우리 실험실` |
+| **기본 도메인** | 위에서 준비한 도메인 | `example.org` |
+| **포털 호스트 라벨** | 포털 주소의 앞부분 → `portal.example.org` | `portal` |
+| **관리자 계정** | 이미 있는 리눅스 계정 | `ubuntu` |
+| **관리자 이메일** | 인증서 만료 알림 등을 받을 주소 | `admin@example.org` |
+| **접속 허용 대역** | 관리 화면(`/ops`, Cockpit)에 들어올 수 있는 IP 대역(공백 구분).<br>지금 접속 중인 IP 가 기본으로 들어갑니다 | `127.0.0.1/32 203.0.113.5/32` |
+| **시간대** | 컨테이너 시간대 | `Asia/Seoul` |
+| **선택 서비스** | n8n · files(SFTPGo) · kordoc · markitdown · crawl4ai · ollama · uptime-kuma · cockpit · backup | y/n |
 
 필수 구성요소(**postgres · caddy · golden · 포털**)는 항상 설치됩니다.
 
 ---
 
-## ⏳ 3. 설치가 진행되는 모습
+## 3. 설치가 진행되는 모습
 
 | 단계 | 하는 일 | 걸리는 시간(참고) |
 |:---:|---|---|
-| 1 | 🔎 사전 점검 — OS · 메모리 · 디스크 · 인터넷 · 포트 · DNS | 수 초 |
-| 2 | 📦 패키지 설치 — Docker · Caddy · 기본 도구 | 1분 |
-| 3 | 🗂 파일 배포 · 네트워크 | 수 초 |
-| 4 | 🔑 설정 · 비밀 생성 | 수 초 |
-| 5 | 🚢 서비스 기동 — PostgreSQL · n8n · SFTPGo · Kordoc … | 5~10분 |
-| 6 | 📁 파일 서비스 연동 | 수 초 |
-| 7 | 📚 API 카탈로그 | 수 초 |
-| 8 | 🌐 웹 서버(Caddy) 설정 | 수 초 |
-| 9 | 🧑‍💻 **Golden 이미지 빌드** — 회원 개발환경 | 약 7분 |
-| 10 | 🔌 관리형 MCP 의존성 | 수 초 |
-| 11 | 🧭 포털 배치 | 수 초 |
-| 12 | ✅ 최종 점검 | 수 초 |
+| 1 | 사전 점검 — OS · 메모리 · 디스크 · 인터넷 · 포트 · DNS | 수 초 |
+| 2 | 패키지 설치 — Docker · Caddy · 기본 도구 | 1분 |
+| 3 | 파일 배포 · 네트워크 | 수 초 |
+| 4 | 설정 · 비밀 생성 | 수 초 |
+| 5 | 서비스 기동 — PostgreSQL · n8n · SFTPGo · Kordoc … | 5~10분 |
+| 6 | 파일 서비스 연동 | 수 초 |
+| 7 | API 카탈로그 | 수 초 |
+| 8 | 웹 서버(Caddy) 설정 | 수 초 |
+| 9 | **Golden 이미지 빌드** — 회원 개발환경 | 약 7분 |
+| 10 | 관리형 MCP 의존성 | 수 초 |
+| 11 | 포털 배치 | 수 초 |
+| 12 | 최종 점검 | 수 초 |
 
 실패하면 **어느 단계인지, 마지막 출력, 로그 위치**가 표시됩니다.
 원인을 고친 뒤 이어서 실행합니다.
@@ -211,7 +211,7 @@ sudo python3 /opt/devmaru-kit/bin/devmaru-install --config /etc/<접두어>/site
 
 ---
 
-## ✅ 4. 설치가 끝나면
+## 4. 설치가 끝나면
 
 ```bash
 sudo <접두어>-doctor                                         # 상태 점검 (전부 «성공» 이어야 합니다)
@@ -223,27 +223,27 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 
 | | 주소 |
 |---|---|
-| 🧭 **포털** | `https://portal.<도메인>/` — Guide 에 회원용 시작 안내가 있습니다 |
-| 🌐 **회원 사이트** | `https://<ID>.<도메인>/…` |
-| 📁 **파일 서비스** | `https://files.<도메인>/` |
+| **포털** | `https://portal.<도메인>/` — Guide 에 회원용 시작 안내가 있습니다 |
+| **회원 사이트** | `https://<ID>.<도메인>/…` |
+| **파일 서비스** | `https://files.<도메인>/` |
 
-### 🧾 설치 후 첫 설정 체크리스트 (서비스별)
+### 설치 후 첫 설정 체크리스트 (서비스별)
 
 설치가 끝나면 설치기도 같은 내용을 화면에 출력합니다. 비밀 값은 출력하지 않고 **위치만** 알려 줍니다.
 
 | 서비스 | 설치기가 해 주는 것 | 관리자가 할 것 |
 |---|---|---|
-| 🗄 **PostgreSQL** | 컨테이너 · 확장(pgvector · pg_bigm) · 관리자 비밀번호 생성(`/opt/<접두어>/config/env/postgres.env`) · 회원 DB 자동 | 없음 (직접 접속: `sudo docker exec -it postgres psql -U postgres`) |
-| ⚙️ **n8n** | 컨테이너 · DB 연결 · 암호화 키 생성 | **처음 여는 사람이 소유자 계정을 만듭니다** — 관리자가 먼저 열어 만드세요. 암호화 키(`config/env/n8n.env`)는 백업. 회원은 소유자가 초대 |
-| 📁 **Files(SFTPGo)** | 컨테이너 · API 키 · 공용 폴더 · 회원 계정 자동 생성 · SSH 비밀번호 동기화 | 관리자 화면 `/web/admin` 이 필요하면 `admin` / 비밀번호는 `/opt/<접두어>/compose/sftpgo/.env` |
-| 📄 **Kordoc · MarkItDown · Crawl4AI** | 키 생성 · 회원 컨테이너에 MCP 자동 연결 | 없음 |
-| 📈 **Uptime Kuma** | 컨테이너 · 관리자 대역 전용 Caddy 주소(`uptime.<도메인>`) | 처음 열면 데이터베이스 종류(SQLite 권장)를 고르고 관리자 계정 생성 |
-| 🖥 **Cockpit** | 설치 · `127.0.0.1` 바인딩 · 관리자 대역 전용 Caddy 주소 | 리눅스 관리자 계정으로 로그인 |
-| 🦙 **Ollama** | 컨테이너(`127.0.0.1:11435`) | **모델이 비어 있습니다** — `sudo docker exec <접두어>-ollama ollama pull <모델>`. 현재 이 킷의 다른 구성요소는 Ollama 를 쓰지 않습니다 |
-| 💾 **백업(restic)** | 저장소 · 암호 생성 | 암호(`/etc/<접두어>/secrets/restic-repository-password`)를 **서버 밖에도 보관**, `<접두어>-backup-run` 실행 |
-| 🔑 **회원 SSH 접속** | 로그인 시 개발환경 자동 입장 · 회원 그룹만 비밀번호 로그인 · 비밀번호 변경 동기화 | 서버 sshd 포트·방화벽 확인. 포트가 22 가 아니면 설정 파일에 `SSH_PORT` 를 넣어 안내 문구를 맞춤 |
+| **PostgreSQL** | 컨테이너 · 확장(pgvector · pg_bigm) · 관리자 비밀번호 생성(`/opt/<접두어>/config/env/postgres.env`) · 회원 DB 자동 | 없음 (직접 접속: `sudo docker exec -it postgres psql -U postgres`) |
+| **n8n** | 컨테이너 · DB 연결 · 암호화 키 생성 | **처음 여는 사람이 소유자 계정을 만듭니다** — 관리자가 먼저 열어 만드세요. 암호화 키(`config/env/n8n.env`)는 백업. 회원은 소유자가 초대 |
+| **Files(SFTPGo)** | 컨테이너 · API 키 · 공용 폴더 · 회원 계정 자동 생성 · SSH 비밀번호 동기화 | 관리자 화면 `/web/admin` 이 필요하면 `admin` / 비밀번호는 `/opt/<접두어>/compose/sftpgo/.env` |
+| **Kordoc · MarkItDown · Crawl4AI** | 키 생성 · 회원 컨테이너에 MCP 자동 연결 | 없음 |
+| **Uptime Kuma** | 컨테이너 · 관리자 대역 전용 Caddy 주소(`uptime.<도메인>`) | 처음 열면 데이터베이스 종류(SQLite 권장)를 고르고 관리자 계정 생성 |
+| **Cockpit** | 설치 · `127.0.0.1` 바인딩 · 관리자 대역 전용 Caddy 주소 | 리눅스 관리자 계정으로 로그인 |
+| **Ollama** | 컨테이너(`127.0.0.1:11435`) | **모델이 비어 있습니다** — `sudo docker exec <접두어>-ollama ollama pull <모델>`. 현재 이 킷의 다른 구성요소는 Ollama 를 쓰지 않습니다 |
+| **백업(restic)** | 저장소 · 암호 생성 | 암호(`/etc/<접두어>/secrets/restic-repository-password`)를 **서버 밖에도 보관**, `<접두어>-backup-run` 실행 |
+| **회원 SSH 접속** | 로그인 시 개발환경 자동 입장 · 회원 그룹만 비밀번호 로그인 · 비밀번호 변경 동기화 | 서버 sshd 포트·방화벽 확인. 포트가 22 가 아니면 설정 파일에 `SSH_PORT` 를 넣어 안내 문구를 맞춤 |
 
-> ℹ️ **회원 접속 규칙**
+> **회원 접속 규칙**
 >
 > 회원은 처음 SSH 로그인에서 **비밀번호를 바꿔야** 합니다(강제).
 >
@@ -253,7 +253,7 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 >
 > `ssh 회원@서버 '명령'` 도 호스트가 아니라 개발환경 안에서 실행됩니다(sshd ForceCommand). 포트 전달(-L)은 기본으로 막혀 있습니다.
 
-### 📱 Paseo 로 접속하기 (터미널 없이)
+### Paseo 로 접속하기 (터미널 없이)
 
 회원을 등록하면 온보딩 폴더(`/srv/<접두어>/onboarding/<ID>`)에 다음 파일이 만들어집니다.
 
@@ -262,7 +262,7 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 
 회원이 **Paseo 앱**에서 QR 을 스캔하거나 링크를 열면 자기 컨테이너의 Paseo 데몬에 연결됩니다.
 
-> ⚠️ **페어링 링크는 영구 자격증명처럼 다루세요**
+> **페어링 링크는 영구 자격증명처럼 다루세요**
 >
 > 재발급해도 같은 값입니다.
 >
@@ -274,28 +274,28 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 
 ---
 
-## 🔧 5. 자주 하는 작업
+## 5. 자주 하는 작업
 
 | 하고 싶은 일 | 명령 |
 |---|---|
-| 👤 회원 삭제 | `sudo <접두어>-member-remove <ID>` |
-| 🩺 상태 점검 | `sudo <접두어>-doctor` |
-| 🔁 새 릴리스로 업데이트 | `sudo <접두어>-update [릴리스 주소]` → 이어서 `sudo <접두어>-member-update-all` |
-| 🔌 외부 MCP 서비스 켜기 | `sudo <접두어>-mcp-remote list` / `enable <이름>` |
-| 💾 백업 | `sudo <접두어>-backup-run` (backup 모듈을 선택한 경우) |
-| 🌍 접속 허용 국가·대역 제한 | `/etc/caddy/geo-allow.caddy` 의 `@allowed remote_ip …` 를 허용할 대역으로 바꾸고 `sudo systemctl reload caddy` |
+| 회원 삭제 | `sudo <접두어>-member-remove <ID>` |
+| 상태 점검 | `sudo <접두어>-doctor` |
+| 새 릴리스로 업데이트 | `sudo <접두어>-update [릴리스 주소]` → 이어서 `sudo <접두어>-member-update-all` |
+| 외부 MCP 서비스 켜기 | `sudo <접두어>-mcp-remote list` / `enable <이름>` |
+| 백업 | `sudo <접두어>-backup-run` (backup 모듈을 선택한 경우) |
+| 접속 허용 국가·대역 제한 | `/etc/caddy/geo-allow.caddy` 의 `@allowed remote_ip …` 를 허용할 대역으로 바꾸고 `sudo systemctl reload caddy` |
 
 ---
 
-## 🩺 6. 문제 해결
+## 6. 문제 해결
 
 | 증상 | 확인 |
 |---|---|
-| ⚠️ 사전 점검에서 DNS 경고 | A 레코드가 서버 공인 IP 를 가리키는지 확인합니다(`dig +short portal.<도메인>`).<br>아직 전파 전이면 몇 분 뒤 `--resume` |
-| 🔒 인증서가 안 받아짐 (포털 HTTPS 응답 없음) | 80/443 포트 개방, DNS, `journalctl -u caddy -n 50` |
-| 🧑‍💻 Golden 빌드 실패 | `/var/log/<접두어>-golden-build.log` 의 끝부분.<br>대개 일시적 네트워크 오류이니 `--resume` 으로 재시도합니다 |
-| 🚢 서비스가 안 올라옴 | `docker ps -a`, `docker logs <컨테이너>` |
-| 🧠 메모리 부족 | 선택 서비스를 줄이거나(`--skip`), 서버 메모리를 늘리세요 |
+| 사전 점검에서 DNS 경고 | A 레코드가 서버 공인 IP 를 가리키는지 확인합니다(`dig +short portal.<도메인>`).<br>아직 전파 전이면 몇 분 뒤 `--resume` |
+| 인증서가 안 받아짐 (포털 HTTPS 응답 없음) | 80/443 포트 개방, DNS, `journalctl -u caddy -n 50` |
+| Golden 빌드 실패 | `/var/log/<접두어>-golden-build.log` 의 끝부분.<br>대개 일시적 네트워크 오류이니 `--resume` 으로 재시도합니다 |
+| 서비스가 안 올라옴 | `docker ps -a`, `docker logs <컨테이너>` |
+| 메모리 부족 | 선택 서비스를 줄이거나(`--skip`), 서버 메모리를 늘리세요 |
 
 ### 자주 나는 실패와 대처
 
@@ -312,12 +312,12 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 
 > GID 충돌(`groupadd: GID already exists`) 은 **재현·원인 확인을 하지 못해 표에 넣지 않았습니다.** 설치기는 접두어 그룹이 있으면 그 GID 를, 없으면 비어 있는 번호(1001부터)를 고릅니다.
 
-### 🆘 도움 요청
+### 도움 요청
 
 설치가 막히면 `sudo <접두어>-support-bundle` 로 진단 묶음을 만들어 이슈에 첨부하세요. 비밀은 마스킹되지만 **첨부 전에 직접 열어 확인**해야 합니다. 자세한 내용은 [SUPPORT](SUPPORT.md) 를 보세요. (설치가 끝나기 전에는 이 명령이 없으니 `/var/log/<접두어>-install.log` 끝부분과 `/var/lib/<접두어>/install/state.json` 을 직접 확인해 첨부하세요.)
 
 | 파일 | 위치 |
 |---|---|
-| 📜 설치 로그 | `/var/log/<접두어>-install.log` |
-| ⚙️ 설정 (비밀 없음) | `/etc/<접두어>/site.env` |
-| 🔑 비밀 (root 만 읽음) | `/opt/<접두어>/config/env/*.env` · `/etc/<접두어>/secrets/` |
+| 설치 로그 | `/var/log/<접두어>-install.log` |
+| 설정 (비밀 없음) | `/etc/<접두어>/site.env` |
+| 비밀 (root 만 읽음) | `/opt/<접두어>/config/env/*.env` · `/etc/<접두어>/secrets/` |
