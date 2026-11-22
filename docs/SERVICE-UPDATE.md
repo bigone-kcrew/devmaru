@@ -16,11 +16,11 @@ sudo <접두어>-service-update --all --apply        # 모듈 순서대로 하�
 ## 무엇을 하는가 (`--apply`)
 | 단계 | 내용 |
 |---|---|
-| 1. 백업 | `/var/backups/<접두어>/service-update/<시각>/<서비스>/` 에 compose 디렉터리 tar · 서비스 env · `/srv/<접두어>/services/<서비스>/data`(있으면) tar · **postgres 는 `pg_dumpall` 덤프** · 현재 이미지에 `<접두어>-rollback/<서비스>:<시각>` 태그 |
+| 1. 백업 | `/var/backups/<접두어>/service-update/<시각>/<서비스>/` 에 compose 디렉터리 tar ·<br>서비스 env · `/srv/<접두어>/services/<서비스>/data`(있으면) tar ·<br>**postgres 는 `pg_dumpall` 덤프** · 현재 이미지에 `<접두어>-rollback/<서비스>:<시각>` 태그 |
 | 2. 이미지 | 빌드 서비스는 `build --pull`, 그 외는 `pull`, postgres 는 설치 서버에서 다시 빌드 |
 | 3. 올리기 | `docker compose up -d --no-build` |
 | 4. 헬스 | 컨테이너가 healthy(헬스체크 없으면 running)가 될 때까지, modules.list 의 대기 시간만큼 |
-| 5. 실패 시 | compose 디렉터리 복원 → 이전 이미지 태그를 원래 이름으로 되돌림 → `up -d --force-recreate` → 헬스 재확인 |
+| 5. 실패 시 | compose 디렉터리 복원 → 이전 이미지 태그를 원래<br>이름으로 되돌림 → `up -d --force-recreate` → 헬스 재확인 |
 
 갱신할 내용(새 이미지 태그)은 보통 `<접두어>-update` 로 새 킷을 받은 뒤 compose.yml 에 반영되어 있거나, 관리자가 compose.yml 의 태그를 직접 고친 것입니다. 같은 태그의 새 빌드(재빌드·`:latest` 류)도 받습니다.
 

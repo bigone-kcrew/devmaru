@@ -24,11 +24,11 @@
 
 | | `<접두어>-migrate` ([RECOVERY](RECOVERY.md#이관)) | `devmaru-migrate-live` (이 문서) |
 |---|---|---|
-| 방식 | 설정·DB 덤프를 **암호화 묶음 1개**로 export → import | 디렉터리를 **rsync 로 그대로** 복사(DB 는 PGDATA 째로) |
+| 방식 | 설정·DB 덤프를 **암호화<br>묶음 1개**로 export → import | 디렉터리를 **rsync 로 그대로**<br>복사(DB 는 PGDATA 째로) |
 | 데이터 크기 | 작음~중간(회원 workspace 는 묶음에 없음) | 수백 GB 이상 |
 | 정지 시간 | 덤프·복원 시간만큼 | 시드 복사(가동 중) 뒤 **증분만** 최종 동기화 |
 | 두 서버 | 새 서버에 같은 킷 버전 설치 후 import | 두 서버가 같은 LAN·SSH 로 닿고 동시에 켜져 있음 |
-| 결과 | 새 서버 값 위에 설정·DB 를 복원 | 구 서버 **실물**(설정·비밀·인증서·호스트 키 포함)을 그대로 |
+| 결과 | 새 서버 값 위에 설정·DB 를 복원 | 구 서버 **실물**(설정·비밀·인증서·호스트<br>키 포함)을 그대로 |
 | 네트워크 | 바뀌지 않음 | 필요하면 구 서버 IP 를 신 서버가 승계(IP 교체) |
 
 - 회원·데이터가 적고 새 서버의 도메인·IP 가 달라도 되면 → **`<접두어>-migrate`**.
@@ -48,15 +48,15 @@ cp migrate-groups.conf.example migrate-groups.conf   # 옮길 디렉터리 그�
 
 | 도구 | 어디서 · 권한 | 하는 일 |
 |---|---|---|
-| `mig-inventory.sh` | 양쪽 · root 권장 | 파일·유닛 목록 `snapshot` → `diff`. 키트가 놓친 헬퍼·드롭인·링크·런타임 디렉터리, 없는 NIC 를 쓰는 방화벽 규칙 |
-| `mig-rsync.sh` | 구 · root | 그룹 하나 전송(push). 기본 시험 실행, `--apply` · `--seed` · `--final --stopped` · `--checksum` · `--subdir` · `--bwlimit` · `--usermap/--groupmap` |
+| `mig-inventory.sh` | 양쪽 · root 권장 | 파일·유닛 목록 `snapshot` → `diff`.<br>키트가 놓친 헬퍼·드롭인·링크·런타임 디렉터리,<br>없는 NIC 를 쓰는 방화벽 규칙 |
+| `mig-rsync.sh` | 구 · root | 그룹 하나 전송(push).<br>기본 시험 실행, `--apply` · `--seed` · `--final --stopped`<br>· `--checksum` · `--subdir` · `--bwlimit` · `--usermap/--groupmap` |
 | `mig-status.sh` | 구 · 로그 읽기(sudo) | 그룹별 마지막 전송 상태·요약 |
-| `mig-stopcheck.sh` | 구 · root | «다 멈췄다» 확인: 루트·루트리스 도커, 호스트 프로세스, `postmaster.pid`, SQLite WAL, 타이머 |
-| `mig-final.sh` | 구 · root(tmux) | `apply`: 정지 확인 → 확인 문구 → 전 그룹 최종 동기화 / `verify`: 전송 0·삭제 0 이면 «일치» 표 |
-| `mig-accounts.sh` | 구 export · 신 import · root | 회원 UID/GID/추가 그룹·subuid 범위·비밀번호 해시(화면에는 지문 12자만) |
-| `mig-images.sh` | 구 plan/send · 신 load | `docker save \| zstd \| ssh` 전송, sha256 대조, 적재 후 이미지 ID 대조(+저장 tar 의 Config 해시) |
-| `mig-containers.sh` | 구 · docker 그룹 | compose 가 아닌 `docker run` 컨테이너 설정을 재생성 스크립트로(비밀 env 는 별도 `.env` 600) |
-| `mig-ipswap.sh` | 각 서버 · root | netplan 고정 IP 교체: 콘솔 `netplan try` / 원격 «적용 + 자동 원복 타이머» |
+| `mig-stopcheck.sh` | 구 · root | «다 멈췄다» 확인: 루트·루트리스 도커,<br>호스트 프로세스, `postmaster.pid`, SQLite WAL, 타이머 |
+| `mig-final.sh` | 구 · root(tmux) | `apply`: 정지 확인 → 확인 문구 → 전 그룹 최종<br>동기화 / `verify`: 전송 0·삭제 0 이면 «일치» 표 |
+| `mig-accounts.sh` | 구 export · 신 import · root | 회원 UID/GID/추가 그룹·subuid<br>범위·비밀번호 해시(화면에는 지문 12자만) |
+| `mig-images.sh` | 구 plan/send · 신 load | `docker save \| zstd \| ssh` 전송, sha256 대조,<br>적재 후 이미지 ID 대조(+저장 tar 의 Config 해시) |
+| `mig-containers.sh` | 구 · docker 그룹 | compose 가 아닌 `docker run` 컨테이너 설정을<br>재생성 스크립트로(비밀 env 는 별도 `.env` 600) |
+| `mig-ipswap.sh` | 각 서버 · root | netplan 고정 IP 교체: 콘솔 `netplan try`<br>/ 원격 «적용 + 자동 원복 타이머» |
 
 공통 원칙: 기본은 **계획·시험 실행만**, 바꾸는 것은 `--apply`. 되돌리기 어려운 것(최종 동기화·IP 교체)은 **확인 문구**를 입력해야 합니다(`--yes` 로 생략 가능). 비밀(해시·env 값·키)은 출력하지 않습니다. 스크립트 본문은 함수로 감싸 실행 중에 파일을 고쳐도 영향이 없습니다. 시험: `bash tests/migrate_live_test.sh`(가짜 ssh·rsync·docker).
 
@@ -222,11 +222,9 @@ sudo bash mig-images.sh send --apply   # 이미지(바뀐 것이 있으면)
 
 두 서버가 같은 IP 를 동시에 가지면 안 됩니다. 맞교환은 순환이라 **임시 주소**가 필요합니다(예: 구 `192.0.2.10`, 신 `192.0.2.20`, 임시 `192.0.2.30`).
 
-| 단계 | 서버 | 명령 | 확정 |
-|:---:|---|---|---|
-| 1 | 구 | `mig-ipswap.sh 192.0.2.10 192.0.2.30 --apply …` | 구 서버가 `.30` 으로 닿는지 |
-| 2 | 신 | `mig-ipswap.sh 192.0.2.20 192.0.2.10 --apply …` | 신 서버가 `.10` 으로 닿고 외부 도달 확인 |
-| 3 | 구 | `mig-ipswap.sh 192.0.2.30 192.0.2.20 --apply …`(선택) | 구 서버를 보관 주소로(또는 전원 끔) |
+1. **구 서버**: `mig-ipswap.sh 192.0.2.10 192.0.2.30 --apply …` — 확정 기준: 구 서버가 `.30` 으로 닿는지
+2. **신 서버**: `mig-ipswap.sh 192.0.2.20 192.0.2.10 --apply …` — 확정 기준: 신 서버가 `.10` 으로 닿고 외부 도달 확인
+3. **구 서버**(선택): `mig-ipswap.sh 192.0.2.30 192.0.2.20 --apply …` — 구 서버를 보관 주소로(또는 전원 끔)
 
 **한 단계가 확정된 뒤에만 다음 단계로** 갑니다. 도구는 바꿀 IP 가 이미 응답하면(`arping -D`, 없으면 `ping`) 적용을 거부합니다. 구 서버에 `iputils-arping` 을 설치해 두세요(ping 은 방화벽에 막힐 수 있음).
 
@@ -245,11 +243,11 @@ sudo bash mig-images.sh send --apply   # 이미지(바뀐 것이 있으면)
 | 항목 | 확인 방법 |
 |---|---|
 | 데이터 | `mig-final.sh verify` 전부 «일치» |
-| DB | 첫 기동 로그의 «shut down at» = 구 서버 정지 시각, recovery 없음, 주요 테이블 건수 = 구 서버에서 정지 직전에 적어 둔 기준값 |
-| 컨테이너 | `docker ps` 전부 Up/healthy, «Created» 로 남은 것 없음(`docker ps -a --filter status=created`) |
+| DB | 첫 기동 로그의 «shut down at» = 구 서버 정지 시각, recovery 없음,<br>주요 테이블 건수 = 구 서버에서 정지 직전에 적어 둔 기준값 |
+| 컨테이너 | `docker ps` 전부 Up/healthy,<br>«Created» 로 남은 것 없음(`docker ps -a --filter status=created`) |
 | 이미지 | `mig-images.sh load --apply` 전부 «일치» |
-| 웹 | 도메인별 응답 코드가 구 서버 기준과 같다(`curl --resolve`, 교체 뒤에는 외부 망에서), Caddy 인증서 오류 없음 |
-| 자동화 | n8n 활성 워크플로 수가 같고 자격증명 복호화 오류 없음(UI 의 credential 테스트·로그 — **값은 출력하지 않는다**) |
+| 웹 | 도메인별 응답 코드가 구 서버 기준과 같다(`curl --resolve`,<br>교체 뒤에는 외부 망에서), Caddy 인증서 오류 없음 |
+| 자동화 | n8n 활성 워크플로 수가 같고 자격증명 복호화 오류 없음(UI 의 credential 테스트·로그 —<br>**값은 출력하지 않는다**) |
 | 카탈로그·건수 | 수집 데이터·카탈로그 문서 수가 전환 전에 기록한 기준값 이상 |
 | 회원 | SSH 로그인(해시 이관), 개발환경 로그인 유지, 원격 접속(페어링) 확인 — 한 명씩 |
 | 파일 서비스 | SFTP/WebDAV/SMB 접속, 업로드·다운로드 |

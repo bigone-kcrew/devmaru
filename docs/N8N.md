@@ -12,9 +12,9 @@
 
 | 선택 | 설정 | 결과 |
 |---|---|---|
-| **n8n 을 쓰지 않음** | 설치할 때 `n8n` 서비스를 선택하지 않음 | n8n 컨테이너·`n8n.<도메인>` 이 만들어지지 않습니다. 회원 등록 안내 메일은 SMTP 직접 발송을 쓰거나 화면 전달로 대신합니다 |
-| **n8n 만 설치** (기본) | `n8n` 선택 + `N8N_WORKFLOWS=none` | 빈 n8n 이 올라옵니다. 워크플로·자격증명은 관리자가 직접 만듭니다 |
-| **n8n + 범용 템플릿** | `n8n` 선택 + `N8N_WORKFLOWS=generic` | 설치 때 범용 템플릿 2종을 **비활성**으로 가져옵니다 |
+| **n8n 을 쓰지 않음** | 설치할 때 `n8n` 서비스를 선택하지 않음 | n8n 컨테이너·`n8n.<도메인>` 이 만들어지지 않습니다.<br>회원 등록 안내 메일은 SMTP 직접<br>발송을 쓰거나 화면 전달로 대신합니다 |
+| **n8n 만 설치** (기본) | `n8n` 선택 + `N8N_WORKFLOWS=none` | 빈 n8n 이 올라옵니다.<br>워크플로·자격증명은 관리자가 직접 만듭니다 |
+| **n8n + 범용 템플릿** | `n8n` 선택 + `N8N_WORKFLOWS=generic` | 설치 때 범용 템플릿 2종을<br>**비활성**으로 가져옵니다 |
 
 - 터미널 설치에서는 설정 파일에 `N8N_WORKFLOWS=generic` 을 쓰고, 웹 화면에서는 **고급 설정 → n8n 워크플로 템플릿**에서 고릅니다.
 - 설치 뒤에도 언제든 가져올 수 있습니다: `sudo <접두어>-n8n-workflows install --all`
@@ -25,8 +25,8 @@
 
 | 이름 | 용도 | 웹훅 | 필요한 것 |
 |---|---|---|---|
-| `member-onboarding` | 회원을 등록하면 **안내 메일**(초기 비밀번호 · Paseo 링크와 QR)을 보냅니다. 선택으로 n8n 초대 링크도 넣습니다 | `/webhook/<접두어>-member-onboarding` | SMTP 자격증명 · (선택) n8n API 키 |
-| `ops-notify` | 앱 만료 · 공개 종료 같은 **운영 알림**을 텔레그램으로 보냅니다 | `/webhook/<접두어>-ops-notify` | Telegram API 자격증명 · 채팅 ID |
+| `member-onboarding` | 회원을 등록하면 **안내 메일**(초기 비밀번호 ·<br>Paseo 링크와 QR)을 보냅니다.<br>선택으로 n8n 초대 링크도 넣습니다 | `/webhook/<접두어>-member-onboarding` | SMTP 자격증명 · (선택) n8n API 키 |
+| `ops-notify` | 앱 만료 · 공개 종료 같은 **운영<br>알림**을 텔레그램으로 보냅니다 | `/webhook/<접두어>-ops-notify` | Telegram API 자격증명 · 채팅 ID |
 
 > **메일만 필요하다면 n8n 이 필요 없습니다.** `member-onboarding` 은 «메일을 n8n 으로 보내고 싶을 때(`MAIL_MODE=n8n`)»의 선택지입니다. 기본은 서버가 SMTP 로 직접 보냅니다. 자세한 내용은 [메일 가이드](MAIL.md)를 보세요.
 
@@ -62,8 +62,8 @@ n8n 화면에서 가져온 워크플로를 열고, 아래 표의 노드에서 �
 | 워크플로 | 노드 | 해야 할 일 |
 |---|---|---|
 | member-onboarding | `메일 보내기` | **SMTP 자격증명**을 만들어 선택 (Credentials → New → SMTP) |
-| member-onboarding | `n8n 초대 만들기` | (선택) n8n API 키(Header Auth, `X-N8N-API-KEY`). 쓰지 않으면 이 노드를 비활성화. **실패해도 메일은 나갑니다** |
-| ops-notify | `텔레그램 보내기` | **Telegram API 자격증명**(BotFather 봇 토큰) 선택 + **Chat ID** 를 받을 채팅 ID 로 바꾸기 |
+| member-onboarding | `n8n 초대 만들기` | (선택) n8n API 키(Header Auth, `X-N8N-API-KEY`).<br>쓰지 않으면 이 노드를 비활성화. **실패해도 메일은 나갑니다** |
+| ops-notify | `텔레그램 보내기` | **Telegram API 자격증명**(BotFather 봇 토큰)<br>선택 + **Chat ID** 를 받을 채팅 ID 로 바꾸기 |
 
 > 텔레그램 대신 Slack · 메일 등을 쓰려면 `텔레그램 보내기` 노드를 해당 노드로 바꾸면 됩니다. 앞의 `토큰 확인` 노드는 그대로 두세요.
 

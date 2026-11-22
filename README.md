@@ -156,7 +156,7 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 
 | 단계 | 하는 일 |
 |---|---|
-| **설치기** | Python 표준 라이브러리만 쓰는 `devmaru-install` — 터미널 질문 · `--config` · 웹 화면, 실패하면 그 단계부터 재개 |
+| **설치기** | Python 표준 라이브러리만 쓰는 `devmaru-install`<br>터미널 질문 · `--config` · 웹 화면, 실패하면 그 단계부터 재개 |
 | **템플릿** | 이름·도메인·접두어가 들어갈 자리를 `@@토큰@@` 으로 두고, 설치할 때 사용자가 정한 값으로 렌더링 |
 | **서비스** | Docker Compose — 선택한 서비스만 올리고 PostgreSQL 은 설치 서버에서 빌드 |
 | **웹 서버** | Caddy — 호스트마다 인증서를 자동 발급하고 회원 사이트 블록을 생성 |

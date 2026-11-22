@@ -26,9 +26,9 @@
 
 | 시점 | 방법 |
 |---|---|
-| **설치할 때 (터미널)** | 질문에 답합니다 — «다른 회원이 내 workspace 를 읽게 할까요?» · «공유 프로젝트를 읽기 전용으로 할까요?» (Enter = 기본값) |
+| **설치할 때 (터미널)** | 질문에 답합니다 — «다른 회원이 내 workspace 를 읽게 할까요?» ·<br>«공유 프로젝트를 읽기 전용으로 할까요?» (Enter = 기본값) |
 | **설치할 때 (웹 화면)** | «고급 설정» 의 두 선택 상자 |
-| **설정 파일** | `/etc/<접두어>/site.env` 또는 `--config` 파일에 `WORKSPACE_OTHERS=read` · `SHARED_DEFAULT=ro` |
+| **설정 파일** | `/etc/<접두어>/site.env` 또는 `--config`<br>파일에 `WORKSPACE_OTHERS=read` · `SHARED_DEFAULT=ro` |
 | **설치한 뒤** | `sudo <접두어>-access set …` → `sudo <접두어>-access apply --all` |
 
 ---
@@ -97,7 +97,7 @@ sudo <접두어>-access verify                         # 5) 실제 계정으로 
 | 옵션 | 값 | 기본 |
 |---|---|---|
 | `--readers` | `all` 또는 `ID,ID` — 읽을 수 있는 회원 | `all` |
-| `--writers` | `all` 또는 `ID,ID` — 쓸 수 있는 회원 | `SHARED_DEFAULT` 가 `rw` 면 readers 와 같음, `ro` 면 없음 |
+| `--writers` | `all` 또는 `ID,ID` — 쓸 수 있는 회원 | `SHARED_DEFAULT` 가 `rw` 면<br>readers 와 같음, `ro` 면 없음 |
 
 - 만든 사람과 관리자는 항상 쓸 수 있습니다.
 - 프로젝트별로 정한 프로젝트는 `apply` 가 **건너뜁니다**(`.<접두어>-access` 파일로 표시). 정책을 바꿔도 이 프로젝트는 그대로입니다.
@@ -109,9 +109,9 @@ sudo <접두어>-access verify                         # 5) 실제 계정으로 
 
 | 층 | 무엇 | 정책이 `ro`·`read` 일 때 |
 |---|---|---|
-| **폴더 권한(ACL)** | 회원 workspace · 공유 `/shared/workspaces/*` | 그룹 권한과 «앞으로 만들 항목»의 기본 권한을 바꿉니다. 공유 루트는 새 항목 생성을 막고, `/shared/workspaces` 는 프로젝트를 만들 수 있되 **남의 프로젝트는 지울 수 없습니다**(sticky) |
-| **파일 서비스(SFTPGo)** | 회원 사용자 권한 | `ro` 면 `/shared` 는 **목록·내려받기만** (업로드는 403). 새 회원도 같은 권한으로 만들어집니다 |
-| **Windows 공유(Samba)** | `[shared]` | `ro` 면 `read only = yes` + 관리자만 쓰기. SMB 모듈이 없으면 건너뜁니다 |
+| **폴더 권한(ACL)** | 회원 workspace · 공유 `/shared/workspaces/*` | 그룹 권한과 «앞으로 만들 항목»의 기본 권한을 바꿉니다.<br>공유 루트는 새 항목 생성을 막고, `/shared/workspaces` 는<br>프로젝트를 만들 수 있되 **남의 프로젝트는 지울 수 없습니다**(sticky) |
+| **파일 서비스(SFTPGo)** | 회원 사용자 권한 | `ro` 면 `/shared` 는<br>**목록·내려받기만** (업로드는 403).<br>새 회원도 같은 권한으로 만들어집니다 |
+| **Windows 공유(Samba)** | `[shared]` | `ro` 면 `read only = yes`<br>+ 관리자만 쓰기.<br>SMB 모듈이 없으면 건너뜁니다 |
 
 ---
 

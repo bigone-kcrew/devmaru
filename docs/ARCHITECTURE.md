@@ -68,7 +68,7 @@ flowchart LR
 | 50 | **Caddy** — `Caddyfile.tmpl` + 선택 모듈 → 검증 → 적용 |
 | 55 | **Cockpit**(선택) |
 | 56 | **SMB**(선택 모듈 `smb`) |
-| 60 | **Golden** — 업스트림 재료 다운로드(`golden/fetch-upstream.sh`, 버전 · 커밋 · sha256 고정) → 이미지 빌드 |
+| 60 | **Golden** — 업스트림 재료 다운로드(`golden/fetch-upstream.sh`, 버전 ·<br>커밋 · sha256 고정) → 이미지 빌드 |
 | 65 | **MCP 의존성** — 관리형 MCP 서버 `npm ci`(Golden 이미지로 실행) |
 | 70 | **포털** — 정적 페이지 배치 |
 | 80 | **백업** — restic 저장소 · 암호 |
