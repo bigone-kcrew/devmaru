@@ -80,10 +80,8 @@
 
 데브마루는 **Ubuntu 26.04 서버**를 기준으로 만들었습니다. Windows 11 PC 를 서버로 쓴다면 방법이 둘입니다.
 
-| | 방법 | 상태 |
-|---|---|---|
-| **권장** | Hyper-V(Windows Pro·Enterprise) 또는 VirtualBox 의 **Ubuntu Server 26.04 LTS VM** 안에서 이 문서의 순서를 그대로 따릅니다 | Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다) |
-| **실험적** | **WSL2**(Windows 11) — 준비 스크립트 `windows/install-windows.ps1` | 아래 «WSL2 (실험적)» 참고 |
+- **권장 — VM**: Hyper-V(Windows Pro·Enterprise) 또는 VirtualBox 의 **Ubuntu Server 26.04 LTS VM** 안에서 이 문서의 순서를 그대로 따릅니다. Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다).
+- **실험적 — WSL2**(Windows 11): 준비 스크립트 `windows/install-windows.ps1` 을 씁니다. 아래 «WSL2 (실험적)» 을 참고하세요.
 
 **VM 으로 설치할 때**: 메모리 8GB 이상(16GB 권장) · CPU 4코어 · 디스크 60GB 이상을 VM 에 할당하고, 다른 PC 나 외부에서 접속하려면 NAT 가 아닌 **브리지 네트워크**(Hyper-V «외부» 스위치 · VirtualBox «어댑터에 브리지»)로 연결합니다. Windows 가 켜질 때 VM 도 자동으로 시작되게 설정하세요.
 

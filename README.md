@@ -10,7 +10,7 @@
 >
 > 셀프호스팅 · 서비스별 선택 설치 · MIT 라이선스 · 1.3.0 베타
 
-| | |
+| 구분 | 내용 |
 |---|---|
 | **릴리스** | [v1.3.0](https://github.com/bigone-kcrew/devmaru/releases/tag/v1.3.0) |
 | **필요 환경** | Ubuntu 26.04 (x86_64) · 메모리 8GB+ (16GB 권장) · 디스크 60GB+ |
@@ -18,13 +18,11 @@
 | **이런 곳에** | 공공 실험실 · 연구 모임 · 동호회 · 소규모 개발팀 |
 | **라이선스** | MIT ([`LICENSE`](LICENSE)) |
 
-| 설치 화면 — 질문 입력 | 설치 계획 확인 |
-|---|---|
-| ![설치 화면 입력 폼](docs/assets/screens/web-1-form.png) | ![설치 계획 확인](docs/assets/screens/web-2-confirm.png) |
-| **진행 상황 — 단계별 시간과 로그** | **설치 완료 — 다음에 할 일** |
-| ![설치 진행](docs/assets/screens/web-3-running.png) | ![설치 완료](docs/assets/screens/web-4-done.png) |
+![웹 설치 화면 — 질문 입력, 계획 확인, 진행, 완료](docs/assets/screens/install-web-sheet.png)
 
-터미널 설치 화면과 실패했을 때의 화면은 [설치 화면 모음](docs/INSTALL-SCREENS.md)에 있습니다.
+![웹 설치 화면 — 실패했을 때와 휴대폰 화면](docs/assets/screens/install-web-sheet2.png)
+
+위 화면은 `sudo python3 /opt/devmaru-kit/bin/devmaru-install --web` 으로 여는 웹 설치 화면입니다(예시 값 사용). 각 화면의 원본 크기 이미지는 [`docs/assets/screens/`](docs/assets/screens/)에, 터미널로 설치할 때의 화면은 [설치 화면 모음](docs/INSTALL-SCREENS.md)에 있습니다.
 
 ---
 
@@ -128,10 +126,8 @@ sudo python3 /opt/devmaru-kit/bin/devmaru-install --web
 
 데브마루는 **Ubuntu Server 26.04** 용입니다. Windows 11 PC 를 서버로 쓴다면:
 
-| | 방법 | 상태 |
-|---|---|---|
-| 권장 | Hyper-V 또는 VirtualBox 의 **Ubuntu Server 26.04 LTS VM** 을 만들고, VM 안에서 위 «설치 명령» 을 그대로 실행 | Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다) |
-| 실험적 | **WSL2** — 준비 스크립트 [`windows/install-windows.ps1`](windows/install-windows.ps1) 로 distro 를 만든 뒤 distro 안에서 설치 | Windows 11 PC 한 대에서 시험했습니다 |
+- **권장 — VM**: Hyper-V 또는 VirtualBox 에 **Ubuntu Server 26.04 LTS VM** 을 만들고, VM 안에서 위 «설치 명령» 을 그대로 실행합니다. Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다).
+- **실험적 — WSL2**: 준비 스크립트 [`windows/install-windows.ps1`](windows/install-windows.ps1) 로 distro 를 만든 뒤 distro 안에서 설치합니다. Windows 11 PC 한 대에서 시험했습니다.
 
 VM 만드는 순서와 WSL2 준비·되돌리기는 [설치 가이드의 Windows 절](docs/INSTALL.md#windows-pc-에-설치하려면)에 있습니다.
 
