@@ -116,6 +116,17 @@ sudo python3 /opt/devmaru-kit/bin/devmaru-install --web
 내 PC에서는 `ssh -L 8765:127.0.0.1:8765 <사용자>@<서버>` 터널을 연 뒤, 터미널에 표시된 주소를 여세요.
 자세한 내용은 [설치 가이드](docs/INSTALL.md)에 있습니다.
 
+### 🪟 Windows PC 에서 설치하려면
+
+데브마루는 **Ubuntu Server 26.04** 용입니다. Windows 11 PC 를 서버로 쓴다면:
+
+| | 방법 | 상태 |
+|---|---|---|
+| ✅ 권장 | Hyper-V 또는 VirtualBox 의 **Ubuntu Server 26.04 LTS VM** 을 만들고, VM 안에서 위 «설치 명령» 을 그대로 실행 | Windows 위에서 직접 시험하지는 않았습니다(Ubuntu 26.04 VM 에서는 시험했습니다) |
+| 🧪 실험적 | **WSL2** — 준비 스크립트 [`windows/install-windows.ps1`](windows/install-windows.ps1) 로 distro 를 만든 뒤 distro 안에서 설치 | Windows 11 PC 한 대에서 시험했습니다 |
+
+VM 만드는 순서와 WSL2 준비·되돌리기는 [설치 가이드의 Windows 절](docs/INSTALL.md#-windows-pc-에-설치하려면)에 있습니다.
+
 ### 3️⃣ 설치가 끝나면
 
 ```bash
@@ -203,6 +214,7 @@ ALIO · K-Startup 같은 외부 공개 MCP 서비스는 기본에서 빼고, 관
 |---|---|
 | [📖 설치 가이드](docs/INSTALL.md) | 처음 설치하는 분용 — 준비물 · 질문 · 진행 · 문제 해결 |
 | [🏗 구조](docs/ARCHITECTURE.md) | 유지보수자용 — 이름 체계 · 단계 · 모듈 추가 · 보안 스캔 예외 |
+| [🪟 Windows 에서 설치](docs/INSTALL.md#-windows-pc-에-설치하려면) | VM(Hyper-V · VirtualBox) 만드는 순서 · WSL2(실험적) 준비 스크립트 |
 | [🖼 설치 화면](docs/INSTALL-SCREENS.md) | 터미널·웹 설치 화면 미리보기 |
 | [🛠 운영 가이드](docs/OPERATIONS.md) | 회원 추가·삭제 · DB · 웹 공개 · 업데이트 · 백업 |
 | [🔐 접근 정책](docs/ACCESS.md) | workspace·공유 공간 읽기/쓰기 권한 |

@@ -87,6 +87,20 @@
 
 **VM 으로 설치할 때**: 메모리 8GB 이상(16GB 권장) · CPU 4코어 · 디스크 60GB 이상을 VM 에 할당하고, 다른 PC 나 외부에서 접속하려면 NAT 가 아닌 **브리지 네트워크**(Hyper-V «외부» 스위치 · VirtualBox «어댑터에 브리지»)로 연결합니다. Windows 가 켜질 때 VM 도 자동으로 시작되게 설정하세요.
 
+**VM 만드는 순서** (일반적인 방법입니다. 데브마루를 Windows 위의 VM 에서 직접 시험한 것은 아니므로, 화면 이름이 Windows·VirtualBox 버전에 따라 다를 수 있습니다.)
+
+1. **Ubuntu Server 26.04 LTS ISO** 를 Ubuntu 공식 사이트에서 받습니다(데스크톱판이 아니라 *Server*).
+2. VM 을 만듭니다.
+   - **Hyper-V**: «2세대» · 메모리 16GB(고정 권장) · 가상 CPU 4개 · 디스크 60GB 이상 · 네트워크는 «외부» 가상 스위치. 보안 부팅 때문에 ISO 가 부팅되지 않으면 VM 설정의 보안에서 템플릿을 «Microsoft UEFI 인증 기관» 으로 바꾸거나 보안 부팅을 끕니다.
+   - **VirtualBox**: 유형 Linux · Ubuntu(64-bit) · 메모리 16GB · CPU 4개 · 디스크 60GB 이상 · 네트워크 어댑터를 «어댑터에 브리지».
+3. Ubuntu Server 를 설치합니다. 설치 중 **OpenSSH server** 를 선택하고, `sudo` 가 되는 관리자 계정을 만듭니다.
+4. 공유기에서 VM 의 IP 를 **고정**(DHCP 예약)하고, 외부에서 쓰려면 80·443(필요하면 SSH)을 그 IP 로 포워딩합니다.
+5. **VM 안에서** 이 문서의 «설치 명령»(`curl … | sudo bash`)을 그대로 실행합니다. 이후 순서는 일반 Ubuntu 서버와 같습니다.
+6. 서버로 계속 쓰려면 Windows 쪽도 챙깁니다.
+   - Windows 가 켜질 때 VM 자동 시작: Hyper-V 는 VM 설정의 «자동 시작 동작» 을 «항상 자동으로 시작» 으로, VirtualBox 는 작업 스케줄러에서 `VBoxManage startvm "<VM 이름>" --type headless` 를 로그온 때 실행하게 합니다.
+   - 절전·최대 절전을 끄고, Windows 업데이트의 자동 재부팅 시간을 사용 시간 밖으로 잡습니다(재부팅되면 VM 도 잠시 내려갑니다).
+
+
 #### 🧪 WSL2 (실험적)
 
 관리자 PowerShell 에서 `windows\install-windows.ps1` 을 실행합니다(`-Apply` 없이 실행하면 **계획만** 보여 줍니다). 이 스크립트는 Windows 쪽 준비만 합니다.
