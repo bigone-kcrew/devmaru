@@ -100,6 +100,7 @@ show_plan(){
 }
 show_plan
 [ "$CMD" = apply ] || { echo; echo "안내: 아무것도 바꾸지 않았습니다(plan). 되돌리려면 sudo $PFX-restore apply $SCOPE${FROM:+ ...} [--snapshot $SID]"; exit 0; }
+[ -r /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh ] && { . /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh; maint_lock restore; }   # 정비 락(plan 은 위에서 종료)
 
 # ---- 승인
 PHRASE="복원 $PFX $SCOPE"

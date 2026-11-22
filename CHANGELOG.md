@@ -8,6 +8,31 @@
 
 ---
 
+## 1.3.0 — 2026-11-22 — 원격 관리(fleet) · 라이브 서버 이관 · GitHub 배포
+
+> 이 버전부터 **GitHub 릴리스**에서 배포합니다(GitLab 저장소는 점검 중). 1.2.2 는 별도 릴리스 없이 이 버전에 포함됩니다.
+
+### ✨ 새로 생긴 것
+
+- 🟢 **`<접두어>-member-update-all --json`** — `--check` 결과를 JSON 으로(`result` READY/BLOCKED/REVIEW · `image` · `summary` 집계). **회원 ID 는 넣지 않으며**, `--json --members` 일 때만 회원별 행(ID 포함)을 냅니다. 종료 코드: 0 READY · 2 BLOCKED(작업 중인 회원이 있음) · 3 REVIEW(개발 컨테이너가 없는 회원) · 1 오류. 기존 `--check` 의 출력·종료 코드는 그대로입니다(BUSY 여도 0).
+- 🔒 **공통 정비 락 `/run/<접두어>-maintenance.lock`** — 서버 전체에서 **상태를 바꾸는 정비 작업이 한 번에 하나만** 돌게 합니다: `update` 적용 · `service-update --apply` · `restore apply` · `member-update-all`(적용) · `golden-rc` · `backup-run`. 다른 정비가 실행 중이면 안내를 내고 **종료 코드 75** 로 끝납니다. `--check`·`--plan` 같은 읽기 전용 명령은 락 때문에 막히지 않습니다. 하위 명령은 재진입을 허용합니다(`<접두어>-maint-lib.sh`). 상태는 `sudo <접두어>-maintenance status [--json]`(idle/busy, 읽기 전용).
+- 🙈 **마스킹 규칙 공유** — `support-bundle` 의 비밀 마스킹을 `<접두어>-mask-lib.sh` 로 옮겼고, 같은 규칙을 파이프로 쓰는 `<접두어>-mask` 명령을 추가했습니다(`--selftest` 포함). 규칙은 한 곳에서만 고칩니다.
+- 🛡 **`agent` 모듈 허용 목록에 읽기 전용 점검 추가** — `golden check` · `member-update-all --check|--json` · `service-update --all --plan|--check` · `maintenance status [--json]`. 인자가 한 칸이라도 다르면 허용되지 않습니다(`member-update-all` 인자 없음, `--json --members`, `--apply`, `golden rc|promote` 등은 거부).
+
+- 🛰 **`devmaru-fleet` 1단계(읽기 전용 원격 점검)** — 관리자 PC 에서 여러 서버를 SSH 로 점검하는 단일 파일 도구(`tools/devmaru-fleet`, Python 표준 라이브러리만): `status`(상태·회원 READY/BUSY 집계·정비 락·킷 버전) · `check`(갱신 가능 여부) · `watch --once`(직전과 비교해 달라진 것만) · `trust`(호스트 키 지문 확인 후 등록) · `doctor`(관리자 PC 점검) · `list` · `log`. 서버에는 아무것도 설치하지 않고 **읽기 전용 명령만** 실행하며(`agent` 모듈의 제한 sudo), 회원 ID·비밀·개인키는 다루지 않습니다. 사용법은 `docs/FLEET.md`.
+
+- 🚀 **`devmaru-fleet` 2단계(원격 설치)** — `verify-release`(sha256 + 서명 `ssh-keygen -Y verify`, 서명 없으면 `--allow-unsigned` 필요) · `install plan`(서버에는 업로드한 파일 외 아무것도 설치하지 않고, 읽기 점검과 원격 `devmaru-install --plan` 만) · `install apply`(서버 이름 직접 입력, `systemd-run` 분리 실행 — 연결이 끊겨도 서버에서 계속) · `install status [--follow]` · `install resume`(재부팅·강제 중지·실패 뒤 이어서). 설치 설정에 비밀 키가 있으면 거부합니다. 발행자용 `sign-release.sh` 추가.
+- 🔄 **`devmaru-fleet` 3단계(갱신)** — `update plan|apply|status`(서명 검증 → 서버별 가드 → canary 먼저 → 서버 이름 확인 → 분리 실행 → 킷 버전·doctor 확인, 실패하면 이후 서버 중단, `--rolling N`) · `members plan|apply|status`(작업 중인 회원·컨테이너 없는 회원이 있으면 거부). 다운그레이드·정비 중·Golden 재빌드 디스크 부족은 거부합니다.
+- 🌐 **배포처 선택 `DEVMARU_SOURCE=github|gitlab`(기본 github)** — 설치 스크립트(`install.sh`)와 `<접두어>-update` 가 최신 릴리스를 GitHub 에서 찾습니다. 예전 방식(`DEVMARU_BASE` · `DEVMARU_API` · 인자로 준 주소)은 그대로 동작하고, 조회에 실패하면 설치 때 쓴 주소로 되돌아갑니다. ⚠️ GitLab 에서 설치한 서버도 이 버전부터 기본 조회처가 GitHub 로 바뀝니다(되돌리려면 `DEVMARU_SOURCE=gitlab`).
+- 🚚 **라이브 서버 이관 애드온 `tools/devmaru-migrate-live`** — 수백 GB 서버를 두 서버가 켜진 채 옮기는 관리자 셸 도구 묶음과 플레이북(`docs/MIGRATE-LIVE.md`). 설정 파일 기반 rsync 그룹 전송(시험 실행 기본·`--seed`·`--final --stopped`·이름 기준 uid/gid 보정) · 정지 확인(루트리스 도커·상주 프로세스·`postmaster.pid`) · 최종 동기화와 «일치» 표 · 회원 계정·해시(지문만 표시) · 도커 이미지 전송과 ID 대조(config 해시 보조) · `docker run` 컨테이너 export · 구/신 서버 목록 비교(누락 헬퍼·드롭인·링크·NIC 고정 방화벽) · netplan IP 교체(콘솔 `netplan try` / 원격 자동 원복 타이머). 기존 `<접두어>-migrate`(암호화 묶음)와는 용도가 다릅니다. 가짜 ssh·rsync·docker 로 분기 시험만 했고 이 판 자체는 실서버에서 실행하지 않았습니다.
+
+### ✅ 확인한 것 (Ubuntu 26.04 VM)
+`--json` 의 READY/BLOCKED/오류 종료 코드와 기존 `--check` 호환 · 락 점유 중 `member-update-all`·`service-update`·`golden-rc`·`update --force` 가 75 로 막히고 읽기 전용 명령은 통과 · 재진입 · 락 해제 뒤 정상 동작 · `support-bundle` 번들에 강한 비밀 패턴 0건 · 에이전트 계정으로 허용 7개 통과·거부 8개 거부.
+`devmaru-fleet`: 단위 시험 47개(가짜 ssh·실제 `ssh-keygen` 서명) + 별도 리허설 서버에서 실제 VM 으로 — 서명 릴리스 검증 · `trust` · `install plan`(서버에 업로드한 파일 외 변화 없음) · `install apply`(클라이언트를 강제 종료해도 서버 설치 계속, `status --follow` 로 다시 붙어 완료, doctor pass) · 서버 설치 유닛 강제 중지 뒤 `install resume`(5단계부터 이어서 완료) · 이미 설치된 서버는 거부. 3단계(update·members)는 실제 VM 에서 서명한 새 킷으로 — `update plan`(서버 무변화) · `update apply`(canary, 단계 진행 표시, 킷 버전·doctor pass 확인) · 다운그레이드·같은 버전(--force 없이)·정비 락 중 거부(묻기 전에 막음) · `--force` 재적용. 확인하지 못한 것: 서버 여러 대 `--rolling`(단위 시험만), Golden 재빌드가 필요한 갱신의 원격 실행, `members apply` 실서버 실행.
+⚠️ `restore apply`·`backup-run` 의 락은 이 VM 에 backup 모듈이 없어 동작까지는 못 보고 문법·훅 위치만 확인했습니다.
+
+---
+
 ## 1.2.2 — 2026-11-17
 
 ### 🔧 개선

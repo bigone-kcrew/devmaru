@@ -1,0 +1,1260 @@
+#!/usr/bin/env python3
+"""devmaru-fleet — 관리자 PC 에서 여러 devmaru 서버를 SSH 로 점검한다 (1단계: 읽기 전용).
+
+  devmaru-fleet list                          인벤토리 서버 목록
+  devmaru-fleet doctor                        관리자 PC 쪽 점검(ssh·호스트 키·키·인벤토리·Python)
+  devmaru-fleet trust <서버>                  SSH 호스트 키 지문을 보여 주고, 서버 이름을 직접 입력하면 known_hosts 에 등록
+  devmaru-fleet status [--hosts a,b] [--json] 서버별 상태(doctor·회원 READY/BUSY 집계·정비 락·킷 버전)
+  devmaru-fleet check  [--hosts a,b] [--json] 갱신 가능 여부(update --check · golden check · service-update --all --check)
+  devmaru-fleet watch --once [--hosts a,b]    status 를 한 번 모아 직전 결과와 비교, 달라진 것만 출력(cron/작업 스케줄러용)
+  devmaru-fleet log [--tail N]                이 도구의 감사 로그
+
+이 단계는 **아무것도 바꾸지 않는다**: 서버에서는 읽기 전용 명령(`--json`·`--check`·`--plan`·`status`)만 실행한다.
+서버에는 새 프로그램을 설치하지 않는다. 비밀번호·키·sudo 비밀번호를 읽거나 저장하지 않는다(ssh-agent 와 시스템 ssh 를 쓴다).
+서버 쪽은 `agent` 모듈의 제한 sudo(`sudo -n`, 허용 목록의 정확한 명령줄)가 필요하다. 없으면 «권한 없음» 으로 표시한다.
+
+인벤토리: `~/.config/devmaru-fleet/hosts.toml`(Windows `%APPDATA%\\devmaru-fleet\\hosts.toml`, `DEVMARU_FLEET_INVENTORY` 로 변경).
+Python 3.11 미만이면 같은 내용을 INI 형식(`hosts.ini`)으로 읽는다. 비밀은 넣지 않는다.
+
+종료 코드: 0 정상(watch: 변화 없음) · 1 경고·변화·실패 있음 · 2 서버에 닿지 못함(불통·호스트 키 미등록 포함) · 64 사용법·인벤토리 오류.
+"""
+import argparse
+import configparser
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+try:  # Python 3.11+
+    import tomllib
+except ImportError:  # pragma: no cover
+    tomllib = None
+
+TOOL = "devmaru-fleet"
+TOOL_VERSION = "0.1.0"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+ADDR_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\d{1,3}(?:\.\d{1,3}){3})$")
+PFX_RE = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+SSHCFG_RE = re.compile(r"^[A-Za-z0-9_./~:\\-]{1,200}$")
+CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+MAX_OUT = 200_000
+EX_OK, EX_WARN, EX_UNREACH, EX_USAGE = 0, 1, 2, 64
+
+
+# ───────────────────────── 경로 (OS 별 기본값 한 곳) ─────────────────────────
+def _is_windows():
+    return os.name == "nt"
+
+
+def config_dir():
+    if _is_windows():
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "devmaru-fleet"
+    return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "devmaru-fleet"
+
+
+def state_dir():
+    env = os.environ.get("DEVMARU_FLEET_STATE")
+    if env:
+        return Path(env)
+    if _is_windows():
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "devmaru-fleet"
+    return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "devmaru-fleet"
+
+
+def inventory_path():
+    env = os.environ.get("DEVMARU_FLEET_INVENTORY")
+    if env:
+        return Path(env)
+    toml = config_dir() / "hosts.toml"
+    ini = config_dir() / "hosts.ini"
+    if tomllib is None and ini.exists():
+        return ini
+    return toml if toml.exists() or not ini.exists() else ini
+
+
+# ───────────────────────── 출력 안전 ─────────────────────────
+def clean(text, limit=MAX_OUT):
+    """원격 출력은 신뢰하지 않는다: 깨진 UTF-8 은 대체, 제어 문자 제거, 길이 제한."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    return CTRL_RE.sub("", text)[:limit]
+
+
+def one_line(text, limit=120):
+    return " ".join(clean(text, 4000).split())[:limit]
+
+
+# ───────────────────────── 인벤토리 ─────────────────────────
+class InventoryError(Exception):
+    pass
+
+
+class Host:
+    def __init__(self, name, address, port=22, user="admin", prefix="devmaru", group="", canary=False, domain="", ssh_config=""):
+        self.name, self.address, self.port, self.user = name, address, port, user
+        self.prefix, self.group, self.canary, self.domain, self.ssh_config = prefix, group, canary, domain, ssh_config
+
+    def known_hosts_name(self):
+        return self.address if self.port == 22 else "[%s]:%d" % (self.address, self.port)
+
+
+def _load_raw(path):
+    if path.suffix == ".ini" or tomllib is None:
+        cp = configparser.ConfigParser(interpolation=None)
+        with open(path, encoding="utf-8") as f:
+            cp.read_file(f)
+        raw = {"defaults": dict(cp["defaults"]) if cp.has_section("defaults") else {}, "hosts": {}}
+        for sec in cp.sections():
+            if sec.startswith("hosts."):
+                raw["hosts"][sec[len("hosts."):]] = dict(cp[sec])
+        return raw
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _boolean(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_inventory(path=None):
+    path = path or inventory_path()
+    if not path.exists():
+        raise InventoryError("인벤토리 파일이 없습니다: %s\n예시는 docs/FLEET.md 를 보세요(서버 이름·주소·포트·접두어만, 비밀 없음)." % path)
+    try:
+        raw = _load_raw(path)
+    except Exception as e:  # 문법 오류 등
+        raise InventoryError("인벤토리를 읽지 못했습니다(%s): %s" % (path, one_line(str(e))))
+    d = raw.get("defaults", {}) or {}
+    hosts, errs = [], []
+    table = raw.get("hosts", {}) or {}
+    if not isinstance(table, dict) or not table:
+        raise InventoryError("인벤토리에 [hosts.<이름>] 항목이 없습니다: %s" % path)
+    for name, h in table.items():
+        h = {**d, **(h or {})}
+        e0 = len(errs)
+        if not NAME_RE.match(str(name)):
+            errs.append("서버 이름 형식 오류: %r (소문자·숫자·하이픈 1~32자)" % name)
+        addr = str(h.get("address", ""))
+        if not ADDR_RE.match(addr):
+            errs.append("%s: address 형식 오류: %r" % (name, addr))
+        try:
+            port = int(h.get("port", 22))
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except (TypeError, ValueError):
+            errs.append("%s: port 는 1~65535 정수여야 합니다" % name); port = 22
+        user = str(h.get("user", "admin"))
+        if not USER_RE.match(user):
+            errs.append("%s: user 형식 오류: %r" % (name, user))
+        prefix = str(h.get("prefix", "devmaru"))
+        if not PFX_RE.match(prefix):
+            errs.append("%s: prefix 형식 오류: %r" % (name, prefix))
+        group = str(h.get("group", ""))
+        if group and not GROUP_RE.match(group):
+            errs.append("%s: group 형식 오류: %r" % (name, group))
+        domain = str(h.get("domain", ""))
+        if domain and not ADDR_RE.match(domain):
+            errs.append("%s: domain 형식 오류: %r" % (name, domain))
+        sshcfg = str(h.get("ssh_config", ""))
+        if sshcfg and not SSHCFG_RE.match(sshcfg):
+            errs.append("%s: ssh_config 경로 형식 오류: %r" % (name, sshcfg))
+        if len(errs) == e0:
+            hosts.append(Host(str(name), addr, port, user, prefix, group, _boolean(h.get("canary", False)), domain, sshcfg))
+    if errs:
+        raise InventoryError("인벤토리 오류:\n  - " + "\n  - ".join(errs))
+    hosts.sort(key=lambda x: (not x.canary, x.name))  # canary 먼저
+    return hosts
+
+
+def select_hosts(hosts, spec):
+    if not spec:
+        return hosts
+    want = [s.strip() for s in spec.split(",") if s.strip()]
+    known = {h.name: h for h in hosts}
+    bad = [w for w in want if w not in known]
+    if bad:
+        raise InventoryError("인벤토리에 없는 서버: %s" % ", ".join(bad))
+    return [known[w] for w in want]
+
+
+# ───────────────────────── 감사 로그 ─────────────────────────
+def audit(kind, host, mode, rc):
+    """시각 · 사용자 · 서버 · 명령 종류 · 계획/적용 · 종료 코드. 원격 출력·비밀은 기록하지 않는다."""
+    try:
+        d = state_dir(); d.mkdir(parents=True, exist_ok=True)
+        p = d / "audit.log"
+        line = "%s\t%s\t%s\t%s\t%s\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), os.environ.get("USER") or os.environ.get("USERNAME") or "?", host, kind, mode, rc)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line)
+        if not _is_windows():
+            os.chmod(p, 0o600)
+    except OSError:
+        pass  # 감사 로그를 못 써도 읽기 전용 점검은 계속한다
+
+
+# ───────────────────────── SSH ─────────────────────────
+class Result:
+    def __init__(self, rc, out="", err="", kind="ok"):
+        self.rc, self.out, self.err, self.kind = rc, out, err, kind  # kind: ok | unreachable | no_trust | no_sudo | timeout
+
+
+SSH_OPTS = ["-n", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "LogLevel=ERROR"]
+
+
+def ssh_config_args(host):
+    return ["-F", os.path.expanduser(host.ssh_config)] if host.ssh_config else []
+
+
+def known_hosts_file(host):
+    """ssh 가 실제로 쓰는 known_hosts(UserKnownHostsFile) 첫 항목. `ssh -G` 로 읽고, 실패하면 ~/.ssh/known_hosts."""
+    try:
+        p = subprocess.run(["ssh"] + ssh_config_args(host) + ["-G", "-p", str(host.port), "--", "%s@%s" % (host.user, host.address)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+        for line in clean(p.stdout).splitlines():
+            if line.lower().startswith("userknownhostsfile "):
+                first = line.split(None, 1)[1].split()[0]
+                return Path(os.path.expanduser(first))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return Path.home() / ".ssh" / "known_hosts"
+
+
+def remote_string(remote):
+    """ssh 는 원격 인자를 공백으로 이어 붙여 원격 셸에 넘긴다 — 공백이 든 인자(sh -c 스크립트 등)가 깨지지 않게 토큰마다 인용해 한 문자열로 보낸다."""
+    return " ".join(shlex.quote(str(a)) for a in remote)
+
+
+def ssh_run(host, remote, timeout=90):
+    """remote 는 고정된 토큰 목록(인자 배열) — 사용자 입력을 셸에 보간하지 않는다. prefix 는 인벤토리에서 정규식 검증을 거친다."""
+    cmd = ["ssh"] + ssh_config_args(host) + SSH_OPTS + ["-p", str(host.port), "--", "%s@%s" % (host.user, host.address), remote_string(remote)]   # -- 는 목적지 앞(뒤에 두면 원격 명령의 첫 단어가 된다)
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return Result(255, "", "시간 초과(%ds)" % timeout, "timeout")
+    except FileNotFoundError:
+        return Result(255, "", "ssh 실행 파일을 찾지 못했습니다", "unreachable")
+    out, err = clean(p.stdout), clean(p.stderr, 4000)
+    kind = "ok"
+    if p.returncode == 255:
+        if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err or "Offending" in err:
+            kind, err = "no_trust", "호스트 키가 바뀌었습니다(서버 교체이거나 중간자 공격일 수 있음) — 서버 관리자에게 확인하고, 확인 전에는 접속하지 마세요"
+        elif "No ED25519 host key is known" in err or "No ECDSA host key is known" in err or "No RSA host key is known" in err or "Host key verification failed" in err:
+            kind, err = "no_trust", "호스트 키가 등록되지 않았습니다 — `devmaru-fleet trust %s` 로 지문을 확인하고 등록하세요" % host.name
+        else:
+            kind = "unreachable"
+    elif "a password is required" in err or "I'm afraid I can't do that" in err or "sudo: a terminal is required" in err:
+        kind = "no_sudo"
+    return Result(p.returncode, out, err, kind)
+
+
+def sbin(host, cmd, *args):
+    return ["sudo", "-n", "/usr/local/sbin/%s-%s" % (host.prefix, cmd)] + list(args)
+
+
+def bin_(host, cmd, *args):
+    return ["sudo", "-n", "/usr/local/bin/%s-%s" % (host.prefix, cmd)] + list(args)
+
+
+def parse_json(text):
+    try:
+        d = json.loads(text.strip().splitlines()[-1] if text.strip() else "")
+        return d if isinstance(d, dict) else None
+    except (ValueError, IndexError):
+        return None
+
+
+# ───────────────────────── 서버 하나 수집 ─────────────────────────
+def collect_status(host):
+    """읽기 전용 명령 4개. 각각 정확한 명령줄이라 agent 모듈 허용 목록과 일치해야 한다."""
+    s = {"name": host.name, "address": host.address, "group": host.group, "canary": host.canary, "state": "ok", "notes": []}
+    r = ssh_run(host, ["cat", "/opt/devmaru-kit/VERSION"])
+    if r.kind in ("unreachable", "no_trust", "timeout"):
+        s["state"] = r.kind
+        s["notes"].append(one_line(r.err) or r.kind)
+        return s
+    s["kit"] = one_line(r.out, 20) if r.rc == 0 else None
+
+    r = ssh_run(host, sbin(host, "doctor", "--json"))
+    if r.kind == "no_sudo":
+        s["state"] = "no_sudo"; s["notes"].append("권한 없음: agent 모듈의 제한 sudo 가 필요합니다(sudo -n 거부)")
+        return s
+    d = parse_json(r.out)
+    if d is None:
+        s["state"] = "error"; s["notes"].append("doctor --json 응답을 읽지 못함(종료 코드 %s)" % r.rc)
+    else:
+        s["doctor"] = d.get("status")
+        s["warnings"] = d.get("warnings", 0)
+        s["fails"] = sum(1 for c in d.get("checks", []) if isinstance(c, dict) and c.get("status") == "fail")
+        s["brand"] = one_line(str(d.get("brand", "")), 60)
+        s["domain"] = one_line(str(d.get("domain", "")), 80)
+        if host.domain and s["domain"] and s["domain"] != host.domain:
+            s["state"] = "identity_mismatch"; s["notes"].append("서버 도메인(%s)이 인벤토리(%s)와 다릅니다" % (s["domain"], host.domain))
+        elif d.get("status") != "pass" or s["fails"]:
+            s["state"] = "fail"
+        elif s["warnings"]:
+            s["state"] = "warn"
+
+    r = ssh_run(host, bin_(host, "member-update-all", "--json"))
+    m = parse_json(r.out) if r.kind != "no_sudo" else None
+    if m:
+        s["members"] = m.get("summary", {})
+        s["member_result"] = m.get("result")
+        s["image"] = m.get("image")
+    elif r.kind == "no_sudo":
+        s["notes"].append("회원 집계 권한 없음")
+
+    r = ssh_run(host, sbin(host, "maintenance", "status", "--json"))
+    mt = parse_json(r.out) if r.kind != "no_sudo" else None
+    if mt:
+        s["maintenance"] = mt.get("state")
+        if mt.get("state") == "busy":
+            s["notes"].append("정비 작업 실행 중: " + one_line(str(mt.get("holder", "")), 60))
+    else:
+        s["notes"].append("정비 락 상태 없음(서버 키트가 1.3.0 선행 과제 이전 버전일 수 있음)")
+    return s
+
+
+def collect_check(host):
+    c = {"name": host.name, "state": "ok", "notes": []}
+    v = ssh_run(host, ["cat", "/opt/devmaru-kit/VERSION"])
+    if v.kind in ("unreachable", "no_trust", "timeout"):
+        c["state"] = v.kind; c["notes"].append(one_line(v.err)); return c
+    c["kit"] = one_line(v.out, 20) if v.rc == 0 else None   # 현재 킷은 파일에서(update --check 는 릴리스 주소가 없으면 실패한다)
+    r = ssh_run(host, sbin(host, "update", "--check"))
+    if r.kind in ("unreachable", "no_trust", "timeout"):
+        c["state"] = r.kind; c["notes"].append(one_line(r.err)); return c
+    if r.kind == "no_sudo":
+        c["state"] = "no_sudo"; c["notes"].append("권한 없음(agent 모듈 필요)"); return c
+    m = re.search(r"현재 버전 (\S+) · 받을 릴리스", r.out)
+    n = re.search(r"안내: (\d+\.\d+\.\d+) → (\d+\.\d+\.\d+)", r.out)
+    c["kit"] = c.get("kit") or (m.group(1) if m else None)
+    if n:
+        c["update"] = n.group(2)
+    elif "이미 최신" in r.out:
+        c["update"] = None
+    else:
+        c["update"] = "unknown"; c["notes"].append("릴리스 조회 실패: " + one_line(r.out + r.err, 80))
+    r = ssh_run(host, sbin(host, "golden", "check"))
+    g = re.search(r"새것\s+(\d+)\s+·\s+움직임\s+(\d+)\s+·\s+같음\s+(\d+)\s+·\s+실패\s+(\d+)", r.out)
+    c["golden_new"] = int(g.group(1)) if g else None
+    if g and int(g.group(4)):
+        c["notes"].append("golden check 실패 %s건" % g.group(4))
+    r = ssh_run(host, sbin(host, "service-update", "--all", "--check"))
+    c["service_update_rc"] = r.rc if r.kind == "ok" else None
+    if c.get("update") not in (None,) or (c.get("golden_new") or 0) > 0:
+        c["state"] = "updates"
+    return c
+
+
+def run_parallel(fn, hosts, parallel):
+    if parallel <= 1 or len(hosts) <= 1:
+        return [fn(h) for h in hosts]
+    with ThreadPoolExecutor(max_workers=parallel) as ex:
+        return list(ex.map(fn, hosts))
+
+
+# ───────────────────────── 표시 ─────────────────────────
+MARK = {"ok": "성공", "warn": "경고", "fail": "실패", "updates": "갱신", "no_sudo": "권한", "unreachable": "불통",
+        "no_trust": "신뢰", "timeout": "불통", "error": "오류", "identity_mismatch": "불일치"}
+
+
+def exit_for(rows):
+    st = {r["state"] for r in rows}
+    if st & {"unreachable", "no_trust", "timeout"}:
+        return EX_UNREACH
+    return EX_OK if st <= {"ok"} else EX_WARN
+
+
+def print_status(rows):
+    print("%-14s %-6s %-5s %-8s %-9s %-14s %s" % ("서버", "상태", "경고", "킷", "회원(R/B)", "정비", "비고"))
+    for r in rows:
+        mem = r.get("members") or {}
+        rb = "%s/%s" % (mem.get("ready", "-"), mem.get("busy", "-")) if mem else "-"
+        print("%-14s %-6s %-5s %-8s %-9s %-14s %s" % (r["name"] + ("*" if r.get("canary") else ""), MARK.get(r["state"], r["state"]), r.get("warnings", "-"),
+              r.get("kit") or "-", rb, r.get("maintenance") or "-", "; ".join(r["notes"])[:90]))
+    if any(r.get("canary") for r in rows):
+        print("(* = canary)")
+
+
+def print_check(rows):
+    print("%-14s %-6s %-8s %-10s %-10s %s" % ("서버", "상태", "현재 킷", "새 킷", "Golden 새것", "비고"))
+    for r in rows:
+        u = r.get("update")
+        print("%-14s %-6s %-8s %-10s %-10s %s" % (r["name"], MARK.get(r["state"], r["state"]), r.get("kit") or "-",
+              "-" if u is None else u, "-" if r.get("golden_new") is None else r["golden_new"], "; ".join(r["notes"])[:80]))
+
+
+# ───────────────────────── 명령 ─────────────────────────
+def cmd_list(args):
+    hosts = load_inventory()
+    print("%-14s %-24s %-5s %-10s %-9s %s" % ("서버", "주소", "포트", "계정", "접두어", "그룹"))
+    for h in hosts:
+        print("%-14s %-24s %-5d %-10s %-9s %s%s" % (h.name, h.address, h.port, h.user, h.prefix, h.group, "  [canary]" if h.canary else ""))
+    return EX_OK
+
+
+def cmd_status(args):
+    hosts = select_hosts(load_inventory(), args.hosts)
+    rows = run_parallel(collect_status, hosts, args.parallel)
+    for r in rows:
+        audit("status", r["name"], "read", r["state"])
+    if args.json:
+        print(json.dumps({"version": 1, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "hosts": rows}, ensure_ascii=False))
+    else:
+        print_status(rows)
+    return exit_for(rows)
+
+
+def cmd_check(args):
+    hosts = select_hosts(load_inventory(), args.hosts)
+    rows = run_parallel(collect_check, hosts, args.parallel)
+    for r in rows:
+        audit("check", r["name"], "read", r["state"])
+    if args.json:
+        print(json.dumps({"version": 1, "hosts": rows}, ensure_ascii=False))
+    else:
+        print_check(rows)
+    return exit_for([{"state": "ok" if r["state"] == "updates" else r["state"]} for r in rows])
+
+
+def summarize(r):
+    mem = r.get("members") or {}
+    return {"state": r["state"], "warnings": r.get("warnings"), "busy": mem.get("busy"), "kit": r.get("kit"), "maintenance": r.get("maintenance")}
+
+
+def cmd_watch(args):
+    if not args.once:
+        print("watch 는 상주하지 않습니다. cron/systemd 타이머/Windows 작업 스케줄러에서 `devmaru-fleet watch --once` 를 호출하세요.", file=sys.stderr)
+        return EX_USAGE
+    hosts = select_hosts(load_inventory(), args.hosts)
+    rows = run_parallel(collect_status, hosts, args.parallel)
+    now = {r["name"]: summarize(r) for r in rows}
+    sp = state_dir() / "watch-state.json"
+    try:
+        old = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else None
+    except (OSError, ValueError):
+        old = None
+    changes = []
+    if old is None:
+        changes.append("처음 실행: 기준 상태를 저장합니다(%d대)" % len(now))
+    else:
+        for name, cur in now.items():
+            prev = old.get(name)
+            if prev is None:
+                changes.append("%s: 새로 추가됨(%s)" % (name, cur["state"])); continue
+            for k, v in cur.items():
+                if prev.get(k) != v:
+                    changes.append("%s: %s %s → %s" % (name, k, prev.get(k), v))
+        for name in old:
+            if name not in now:
+                changes.append("%s: 인벤토리에서 빠짐" % name)
+    try:
+        state_dir().mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(state_dir()))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(now, f, ensure_ascii=False)
+        if not _is_windows():
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, sp)
+    except OSError as e:
+        print("경고: 상태 파일을 저장하지 못했습니다: %s" % one_line(str(e)), file=sys.stderr)
+    for r in rows:
+        audit("watch", r["name"], "read", r["state"])
+    for c in changes:
+        print(c)
+    if not changes:
+        print("변화 없음(%d대)" % len(now))
+    if exit_for(rows) == EX_UNREACH:
+        return EX_UNREACH
+    return EX_WARN if (changes and old is not None) else EX_OK
+
+
+def cmd_log(args):
+    p = state_dir() / "audit.log"
+    if not p.exists():
+        print("감사 로그가 없습니다: %s" % p); return EX_OK
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines()[-args.tail:]:
+        print(clean(line, 300))
+    return EX_OK
+
+
+def _fingerprints(scan_text):
+    out = []
+    for line in scan_text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        p = subprocess.run(["ssh-keygen", "-lf", "-"], input=line + "\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        out.append(clean(p.stdout).strip())
+    return out
+
+
+def cmd_trust(args):
+    host = select_hosts(load_inventory(), args.host)[0]
+    kh = known_hosts_file(host)
+    have = subprocess.run(["ssh-keygen", "-F", host.known_hosts_name(), "-f", str(kh)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace").stdout if kh.exists() else ""
+    scan = subprocess.run(["ssh-keyscan", "-p", str(host.port), "-t", "ed25519,ecdsa,rsa", host.address], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", timeout=30).stdout
+    if not scan.strip():
+        print("실패: %s:%d 에서 호스트 키를 받지 못했습니다(서버가 꺼져 있거나 포트·방화벽을 확인하세요)" % (host.address, host.port)); return EX_UNREACH
+    print("서버 %s (%s:%d) 의 SSH 호스트 키 지문:" % (host.name, host.address, host.port))
+    for fp in _fingerprints(scan):
+        print("  " + fp)
+    if have.strip():
+        print("\n이미 known_hosts 에 이 서버의 키가 있습니다. 위 지문과 비교하세요. 다르면 **등록하지 말고** 서버 관리자에게 확인하세요(키 변경·중간자 공격 가능).")
+        return EX_OK
+    print("\n이 지문을 서버 콘솔/관리자가 알려 준 값과 비교한 뒤, 맞으면 서버 이름 `%s` 을(를) 그대로 입력하세요." % host.name)
+    try:
+        typed = input("입력: ").strip()
+    except EOFError:
+        typed = ""
+    if typed != host.name:
+        print("취소했습니다. 아무것도 등록하지 않았습니다."); audit("trust", host.name, "cancel", 1); return EX_WARN
+    kh.parent.mkdir(parents=True, exist_ok=True)
+    with open(kh, "a", encoding="utf-8") as f:
+        f.write(scan if scan.endswith("\n") else scan + "\n")
+    audit("trust", host.name, "write", 0)
+    print("known_hosts 에 등록했습니다: %s" % kh)
+    return EX_OK
+
+
+def cmd_doctor(args):
+    bad = 0
+
+    def line(level, msg):
+        nonlocal bad
+        print("%s: %s" % (level, msg))
+        if level == "실패":
+            bad += 1
+    line("성공", "Python %s" % sys.version.split()[0]) if sys.version_info >= (3, 8) else line("실패", "Python 3.8 이상이 필요합니다")
+    line("성공" if tomllib else "경고", "인벤토리 형식: " + ("TOML(tomllib)" if tomllib else "Python 3.11 미만 — INI(hosts.ini)로 읽습니다"))
+    for exe in ("ssh", "ssh-keyscan", "ssh-keygen"):
+        from shutil import which
+        line("성공" if which(exe) else "실패", "%s 실행 파일 %s" % (exe, "있음" if which(exe) else "없음 — OpenSSH 클라이언트를 설치하세요"))
+    if _is_windows():
+        line("성공", "Windows: ControlMaster 를 쓰지 않습니다(이 도구는 사용하지 않음)")
+    hosts = []
+    try:
+        hosts = load_inventory(); line("성공", "인벤토리 %s (%d대)" % (inventory_path(), len(hosts)))
+    except InventoryError as e:
+        line("실패", str(e).splitlines()[0])
+    for h in hosts:
+        kh = known_hosts_file(h)
+        ok = kh.exists() and subprocess.run(["ssh-keygen", "-F", h.known_hosts_name(), "-f", str(kh)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        line("성공" if ok else "경고", "%s 호스트 키 %s" % (h.name, "등록됨" if ok else "미등록 — `%s trust %s`" % (TOOL, h.name)))
+    if os.environ.get("SSH_AUTH_SOCK") or _is_windows():
+        p = subprocess.run(["ssh-add", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace") if _which("ssh-add") else None
+        line("성공" if (p and p.returncode == 0) else "경고", "ssh-agent 에 키 %s" % ("있음" if (p and p.returncode == 0) else "없음 — `ssh-add` 로 올리세요(키 파일 비밀번호는 이 도구가 다루지 않습니다)"))
+    else:
+        line("경고", "ssh-agent 가 실행 중이 아닙니다(SSH_AUTH_SOCK 없음)")
+    if not _is_windows():
+        for key in sorted((Path.home() / ".ssh").glob("id_*")):
+            if key.suffix == ".pub":
+                continue
+            mode = key.stat().st_mode & 0o777
+            if mode & 0o077:
+                line("경고", "%s 권한이 넓습니다(%o) — chmod 600" % (key.name, mode))
+    try:
+        state_dir().mkdir(parents=True, exist_ok=True); t = state_dir() / ".w"; t.write_text("x"); t.unlink()
+        line("성공", "상태·감사 로그 폴더 쓰기 가능: %s" % state_dir())
+    except OSError:
+        line("경고", "상태 폴더에 쓸 수 없습니다: %s (감사 로그가 남지 않습니다)" % state_dir())
+    return EX_OK if not bad else EX_WARN
+
+
+def _which(exe):
+    from shutil import which
+    return which(exe)
+
+
+
+# ───────────────────────── 2단계: 릴리스 검증 · 원격 설치 ─────────────────────────
+SIGN_NS = "devmaru-release"
+REMOTE_UNIT = "devmaru-fleet-install"
+REMOTE_LOG = "/var/log/devmaru-fleet-install.log"
+SECRETISH_KEY = re.compile(r"(PASS|PASSWD|SECRET|TOKEN|CREDENTIAL|PRIVATE|API_?KEY)", re.I)
+CONFIG_KEYS = {"PFX", "BRAND", "DOMAIN", "PORTAL_LABEL", "ADMIN_USER", "SUDO_USER", "ADMIN_EMAIL", "ADMIN_CIDRS", "TZ", "GID", "MODULES",
+               "N8N_WORKFLOWS", "WORKSPACE_OTHERS", "SHARED_DEFAULT", "GOLDEN_VOICE", "GOLDEN_OFFICE", "TLS_MODE", "SSH_PORT", "SMB_TRANSPORTS",
+               "AGENT_EXPIRES", "MAIL_MODE", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY", "MAIL_SMTP_USER", "MAIL_FROM",
+               "MAIL_SMTP_VERIFY", "MAIL_TEST_SEND", "FILES_HOST", "N8N_HOST", "PORTAL_HOST"}
+
+
+def sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def signers_path():
+    env = os.environ.get("DEVMARU_FLEET_SIGNERS")
+    return Path(env) if env else config_dir() / "release-allowed-signers"
+
+
+def verify_release(tarball, allow_unsigned=False, quiet=False):
+    """sha256(필수) + 서명(ssh-keygen -Y verify). 서명이 없으면 --allow-unsigned 가 있어야 통과한다. (ok, 메시지 목록)"""
+    msgs, ok = [], True
+    t = Path(tarball)
+    if not t.is_file():
+        return False, ["실패: 파일이 없습니다: %s" % t]
+    sumf = Path(str(t) + ".sha256")
+    if not sumf.is_file():
+        return False, ["실패: %s 가 없습니다(릴리스의 sha256 파일이 필요합니다)" % sumf.name]
+    want = sumf.read_text(encoding="utf-8", errors="replace").split()[0].lower() if sumf.read_text(encoding="utf-8", errors="replace").split() else ""
+    have = sha256_file(t)
+    if want != have:
+        return False, ["실패: sha256 불일치(파일 %s… ≠ 기록 %s…) — 받은 파일이 손상됐거나 바뀌었습니다" % (have[:12], want[:12])]
+    msgs.append("성공: sha256 일치(%s…)" % have[:16])
+    sig = Path(str(t) + ".sig"); signers = signers_path()
+    if sig.is_file() and signers.is_file():
+        with open(t, "rb") as f:
+            p = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", SIGN_NS, "-n", SIGN_NS, "-s", str(sig)],
+                               stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode == 0:
+            msgs.append("성공: 서명 확인(%s)" % one_line(p.stdout.decode("utf-8", "replace"), 100))
+        else:
+            return False, msgs + ["실패: 서명이 올바르지 않습니다 — %s" % one_line(p.stderr.decode("utf-8", "replace"), 120)]
+    else:
+        why = "서명 파일(.sig) 없음" if not sig.is_file() else "신뢰하는 서명자 파일 없음(%s)" % signers
+        if allow_unsigned:
+            msgs.append("경고: 서명되지 않은 릴리스를 허용했습니다(%s)" % why)
+        else:
+            return False, msgs + ["실패: 서명을 확인할 수 없습니다(%s). 서명 없는 릴리스를 쓰려면 --allow-unsigned" % why]
+    return ok, msgs
+
+
+def read_install_config(path, host):
+    """설치 설정 파일(KEY=값). 비밀은 설정 파일에 두지 않는다 — 비밀처럼 보이는 키는 거부."""
+    errs, cfg = [], {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        raise InventoryError("설정 파일을 읽지 못했습니다: %s" % one_line(str(e)))
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
+        if not m:
+            errs.append("%d행: KEY=값 형식이 아닙니다" % n); continue
+        k, v = m.group(1), m.group(2)
+        if SECRETISH_KEY.search(k):
+            errs.append("%d행: %s — 비밀(비밀번호·토큰·키)은 설정 파일에 넣지 않습니다(서버에서 따로 설정)" % (n, k)); continue
+        if k not in CONFIG_KEYS:
+            errs.append("%d행: 알 수 없는 설정 키 %s" % (n, k)); continue
+        try:
+            parts = shlex.split(v)
+        except ValueError:
+            errs.append("%d행: 따옴표가 맞지 않습니다" % n); continue
+        cfg[k] = " ".join(parts)
+    for need in ("PFX", "BRAND", "DOMAIN", "ADMIN_USER", "ADMIN_EMAIL"):
+        if not cfg.get(need):
+            errs.append("필수 설정이 없습니다: %s" % need)
+    if cfg.get("PFX") and cfg["PFX"] != host.prefix:
+        errs.append("설정의 PFX(%s)가 인벤토리 접두어(%s)와 다릅니다" % (cfg["PFX"], host.prefix))
+    if cfg.get("ADMIN_USER") and not USER_RE.match(cfg["ADMIN_USER"]):
+        errs.append("ADMIN_USER 형식 오류")
+    if errs:
+        raise InventoryError("설치 설정 오류(%s):\n  - %s" % (path, "\n  - ".join(errs)))
+    return cfg
+
+
+REMOTE_TMP = "/tmp/devmaru-fleet-%s"   # % host.user (정규식 검증을 거친 값)
+
+PREFLIGHT_SH = (
+    '. /etc/os-release 2>/dev/null; echo "os=${ID:-?} ${VERSION_ID:-?}"; echo "arch=$(uname -m)"; '
+    'echo "mem_gb=$(awk \'/MemTotal/{print int($2/1024/1024)}\' /proc/meminfo)"; echo "cpus=$(nproc)"; '
+    'd=/srv; [ -d "$d" ] || d=/; echo "disk_gb=$(df --output=avail -BG "$d" | tail -1 | tr -dc 0-9)"; '
+    'echo "ports=$(ss -ltnH 2>/dev/null | awk \'{print $4}\' | grep -E \':(80|443)$\' | tr \'\\n\' \' \')"; '
+    'echo "installed=$(test -d /opt/devmaru-kit && echo yes || echo no)"; echo "python=$(python3 --version 2>&1)"; '
+    'sudo -n true >/dev/null 2>&1 && echo "sudo_nopass=yes" || echo "sudo_nopass=no"'
+)
+
+
+def kv_lines(text):
+    d = {}
+    for line in clean(text).splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1); d[k.strip()] = v.strip()
+    return d
+
+
+def ssh_tty(host, remote, timeout=None):
+    """대화형 sudo(비밀번호를 사람이 입력)용: 터미널을 그대로 연결한다. 도구는 비밀번호를 다루지 않는다."""
+    opts = [o for o in SSH_OPTS if o != "-n"]
+    cmd = ["ssh"] + ssh_config_args(host) + ["-t"] + opts + ["-p", str(host.port), "--", "%s@%s" % (host.user, host.address), remote_string(remote)]
+    return subprocess.run(cmd, timeout=timeout).returncode
+
+
+def run_sudo(host, argv, interactive):
+    """sudo 가 비밀번호 없이 되면 그대로, 아니면 터미널이 있을 때만 `ssh -t`(사람이 입력). (rc, out)"""
+    r = ssh_run(host, ["sudo", "-n"] + argv, timeout=3600)
+    if r.kind != "no_sudo":
+        return r.rc, r.out
+    if not interactive:
+        return 1, "sudo 비밀번호가 필요합니다. 터미널에서 직접 실행하거나, 이 서버 계정에 비밀번호 없는 sudo 를 설정하세요."
+    return ssh_tty(host, ["sudo"] + argv), ""
+
+
+def upload(host, local, remote_dir, remote_name):
+    """ssh 로 파일을 올린다(권한 0600). remote_dir/remote_name 은 이 도구가 만든 고정 경로."""
+    cmd = ["ssh"] + ssh_config_args(host) + [o for o in SSH_OPTS if o != "-n"] + ["-p", str(host.port), "--", "%s@%s" % (host.user, host.address),
+           "umask 077; mkdir -p %s && cat > %s/%s" % (remote_dir, remote_dir, remote_name)]
+    with open(local, "rb") as f:
+        p = subprocess.run(cmd, stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
+    return p.returncode == 0, clean(p.stderr, 400)
+
+
+def stage_progress(text):
+    """설치 로그에서 마지막 단계·결과를 읽는다."""
+    stage = None; exit_code = None; failed = None
+    for line in clean(text).splitlines():
+        m = re.match(r"^\[(\d+)/(\d+)\]\s+(.*)$", line.strip())
+        if m:
+            stage = "%s/%s %s" % (m.group(1), m.group(2), m.group(3))
+        m = re.match(r"^FLEET_EXIT=(\d+)$", line.strip())
+        if m:
+            exit_code = int(m.group(1))
+        if "설치 중단" in line or line.strip().startswith("ERROR"):
+            failed = one_line(line, 100)
+    return stage, exit_code, failed
+
+
+def install_state_path(name):
+    return state_dir() / ("install-%s.json" % name)
+
+
+def save_install_state(name, data):
+    state_dir().mkdir(parents=True, exist_ok=True)
+    install_state_path(name).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    if not _is_windows():
+        os.chmod(install_state_path(name), 0o600)
+
+
+def load_install_state(name):
+    try:
+        return json.loads(install_state_path(name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def rotate_log(host, log, interactive=False):
+    """새 작업을 시작하기 전에 이전 로그를 .prev 로 옮긴다 — 이전 작업의 FLEET_EXIT 를 현재 결과로 오인하지 않게."""
+    rc, out = run_sudo(host, ["sh", "-c", "mv -f %s %s.prev 2>/dev/null; : > %s" % (log, log, log)], interactive)
+    return rc == 0
+
+
+def poll_install(host, state, timeout=7200, interval=10, out=print, unit=None, log=None, label="install"):
+    """분리 실행된 설치를 따라간다. Ctrl-C 로 끊어도 서버에서는 계속 돈다(`install status` 로 다시 붙는다)."""
+    unit = unit or REMOTE_UNIT; log = log or REMOTE_LOG
+    t0 = time.time(); last = None; idle = 0
+    while time.time() - t0 < timeout:
+        r = ssh_run(host, ["sh", "-c", "systemctl is-active %s 2>/dev/null; echo ---; tail -n 300 %s 2>/dev/null" % (unit, log)])
+        if r.kind in ("unreachable", "timeout", "no_trust"):
+            out("  (연결 끊김 — 서버에서는 작업이 계속됩니다. 다시 붙으려면 `%s %s status %s --follow`)" % (TOOL, label, host.name))
+            time.sleep(interval); continue
+        head, _, text = r.out.partition("---\n")
+        active = head.strip() == "active"
+        stage, code, failed = stage_progress(text)
+        if stage and stage != last:
+            out("  [%s] · %s" % (host.name, stage) if label != "install" else "  · " + stage); last = stage
+        if code is not None:
+            return code, stage, failed
+        idle = 0 if active else idle + 1
+        if idle >= 2 and stage:   # 작업이 끝났는데 종료 기록이 없다 = 중단(서버 재부팅·강제 중지 등)
+            return None, stage, "설치 작업이 중단됐습니다(서버 재부팅이나 강제 중지일 수 있음)"
+        if not active and not text.strip() and time.time() - t0 > 60:
+            return None, stage, "설치 작업과 로그를 찾지 못했습니다"
+        time.sleep(interval)
+    return None, last, "시간 초과(%ds) — 서버에서는 계속 진행 중일 수 있습니다" % timeout
+
+
+def remote_preflight(host, cfg):
+    r = ssh_run(host, ["sh", "-c", PREFLIGHT_SH])
+    if r.kind != "ok" and r.kind != "no_sudo":
+        return None, [("실패", one_line(r.err) or r.kind)]
+    k = kv_lines(r.out); notes = []
+    def lvl(ok, okmsg, badmsg, warn=False):
+        notes.append(("성공" if ok else ("경고" if warn else "실패"), okmsg if ok else badmsg))
+    lvl(k.get("arch") == "x86_64", "x86_64", "x86_64 만 지원합니다(현재 %s)" % k.get("arch"))
+    lvl(k.get("os") == "ubuntu 26.04", "Ubuntu 26.04", "Ubuntu 26.04 에서만 검증됨(현재 %s)" % k.get("os"), warn=True)
+    mem = int(k.get("mem_gb") or 0); lvl(mem >= 7, "메모리 %dGB" % mem, "메모리 %dGB — 최소 8GB 필요" % mem)
+    disk = int(k.get("disk_gb") or 0); lvl(disk >= 30, "/srv 여유 %dGB" % disk, "/srv 여유 %dGB — 최소 30GB 필요" % disk)
+    lvl(not k.get("ports"), "80·443 비어 있음", "80/443 사용 중(%s) — 설치기가 다시 점검합니다" % k.get("ports"), warn=True)
+    lvl(k.get("installed") == "no", "이미 설치된 흔적 없음", "이미 devmaru 가 설치돼 있습니다(/opt/devmaru-kit) — 갱신은 update 를 쓰세요")
+    lvl(k.get("sudo_nopass") == "yes", "sudo 비밀번호 없이 가능", "sudo 에 비밀번호가 필요합니다 — 적용 때 터미널에서 직접 입력해야 합니다", warn=True)
+    lvl(k.get("python", "").startswith("Python 3"), k.get("python", ""), "python3 가 필요합니다")
+    return k, notes
+
+
+def cmd_install(args):
+    host = select_hosts(load_inventory(), args.host)[0]
+    sub = args.action
+    if sub == "status":
+        return install_status(host, follow=args.follow, timeout=args.timeout)
+    if sub == "resume":
+        return install_resume(host, args)
+    if not args.config or not args.kit:
+        print("실패: install %s 에는 --config <설정 파일> 과 --kit <릴리스 tarball> 이 필요합니다" % sub, file=sys.stderr); return EX_USAGE
+    cfg = read_install_config(args.config, host)
+    print("== %s install %s — %s (%s:%d)" % (TOOL, sub, host.name, host.address, host.port))
+    print("설정: 접두어 %s · 서비스 '%s' · 도메인 %s · 모듈 %s" % (cfg["PFX"], one_line(cfg["BRAND"], 40), cfg["DOMAIN"], cfg.get("MODULES", "(기본)")))
+    ok, msgs = verify_release(args.kit, args.allow_unsigned)
+    for m in msgs:
+        print(m)
+    if not ok:
+        audit("install-" + sub, host.name, "plan" if sub == "plan" else "apply", "verify-fail"); return EX_WARN
+    k, notes = remote_preflight(host, cfg)
+    if k is None:
+        print("실패: 서버에 접속하지 못했습니다: %s" % notes[0][1]); audit("install-" + sub, host.name, sub, "unreachable"); return EX_UNREACH
+    bad = False
+    for lv, msg in notes:
+        print("%s: %s" % (lv, msg)); bad = bad or lv == "실패"
+    tarname = "kit.tar.gz"; cfgname = "site-config.env"; rdir = REMOTE_TMP % host.user
+    ok1, e1 = upload(host, args.kit, rdir, tarname); ok2, e2 = upload(host, args.config, rdir, cfgname)
+    if not (ok1 and ok2):
+        print("실패: 킷/설정 업로드 실패: %s" % (e1 or e2)); return EX_UNREACH
+    r = ssh_run(host, ["sha256sum", "%s/%s" % (rdir, tarname)])
+    if r.rc != 0 or r.out.split()[:1] != [sha256_file(args.kit)]:
+        print("실패: 올린 킷의 sha256 이 로컬과 다릅니다(전송 오류)"); return EX_WARN
+    print("성공: 킷 업로드·sha256 일치(%s/%s)" % (rdir, tarname))
+    inter = sys.stdin.isatty() and sys.stdout.isatty()
+    plan_cmd = ["sh", "-c", "mkdir -p {d}/kit && tar -xzf {d}/{t} -C {d}/kit --strip-components=1 && python3 {d}/kit/bin/devmaru-install --config {d}/{c} --plan --skip-dns --yes".format(d=rdir, t=tarname, c=cfgname)]
+    rc, out = run_sudo(host, plan_cmd, inter)
+    print("\n── 서버에서 devmaru-install --plan (아무것도 설치되지 않음) ──")
+    for line in clean(out).splitlines()[-14:]:
+        print("  " + line)
+    if rc != 0:
+        print("실패: 원격 계획이 실패했습니다(종료 코드 %s)" % rc); bad = True
+    if sub == "plan":
+        audit("install-plan", host.name, "plan", "fail" if bad else "ok")
+        print("\n계획만 보여 드렸습니다. 서버에는 %s 에 올린 파일 외에 아무것도 설치되지 않았습니다." % rdir)
+        return EX_WARN if bad else EX_OK
+    # apply
+    if bad:
+        print("\n실패 항목이 있어 적용하지 않습니다. 위 내용을 해결한 뒤 다시 실행하세요."); audit("install-apply", host.name, "apply", "blocked"); return EX_WARN
+    print("\n이 서버에 devmaru 를 **설치**합니다. 서버 이름 `%s` 을(를) 그대로 입력하세요." % host.name)
+    try:
+        typed = input("입력: ").strip()
+    except EOFError:
+        typed = ""
+    if typed != host.name:
+        print("취소했습니다. 아무것도 설치하지 않았습니다."); audit("install-apply", host.name, "apply", "cancel"); return EX_WARN
+    skip = " --skip-dns" if args.skip_dns else ""
+    launch = ["systemd-run", "--unit=" + REMOTE_UNIT, "--collect", "--property=StandardOutput=append:" + REMOTE_LOG, "--property=StandardError=inherit",
+              "sh", "-c", "DEVMARU_LOCAL={d}/{t} bash {d}/kit/install.sh --config {d}/{c} --yes{s}; echo FLEET_EXIT=$?".format(d=rdir, t=tarname, c=cfgname, s=skip)]
+    rc, out = run_sudo(host, launch, inter)
+    if rc != 0:
+        print("실패: 설치를 시작하지 못했습니다: %s" % one_line(out, 200)); audit("install-apply", host.name, "apply", "start-fail"); return EX_WARN
+    save_install_state(host.name, {"unit": REMOTE_UNIT, "log": REMOTE_LOG, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "kit_sha": sha256_file(args.kit)})
+    audit("install-apply", host.name, "apply", "started")
+    print("설치를 시작했습니다(서버에서 분리 실행 — 연결이 끊겨도 계속됩니다). 진행:")
+    code, stage, failed = poll_install(host, load_install_state(host.name), timeout=args.timeout)
+    return finish_install(host, code, stage, failed)
+
+
+def finish_install(host, code, stage, failed):
+    if code == 0:
+        r = ssh_run(host, ["sudo", "-n", "/usr/local/sbin/%s-doctor" % host.prefix, "--json"])
+        d = parse_json(r.out)
+        res = "doctor %s(경고 %s)" % (d.get("status"), d.get("warnings")) if d else "doctor 는 sudo 권한이 필요해 확인하지 못했습니다(`%s status` 로 확인)" % TOOL
+        print("성공: 설치가 끝났습니다 — %s" % res); audit("install-apply", host.name, "apply", "ok"); return EX_OK
+    print("실패: 설치가 끝나지 않았습니다 — %s%s" % (stage or "?", " · " + failed if failed else ""))
+    print("  원인 확인 후 이어서: `%s install resume %s`" % (TOOL, host.name)); audit("install-apply", host.name, "apply", "fail-%s" % code); return EX_WARN
+
+
+def install_status(host, follow=False, timeout=7200):
+    st = load_install_state(host.name)
+    r = ssh_run(host, ["sh", "-c", "systemctl is-active %s 2>/dev/null; echo ---; tail -n 300 %s 2>/dev/null" % (REMOTE_UNIT, REMOTE_LOG)])
+    if r.kind in ("unreachable", "timeout", "no_trust"):
+        print("서버에 닿지 못했습니다: %s" % one_line(r.err)); return EX_UNREACH
+    head, _, log = r.out.partition("---\n")
+    stage, code, failed = stage_progress(log)
+    print("서버 %s — 설치 작업 %s%s" % (host.name, head.strip() or "없음", " · 시작 " + st["started"] if st else ""))
+    if stage:
+        print("  마지막 단계: " + stage)
+    if code is not None:
+        print("  결과: 종료 코드 %s%s" % (code, " · " + failed if failed else "")); return EX_OK if code == 0 else EX_WARN
+    if head.strip() == "active":
+        if follow:
+            print("  끝까지 따라갑니다(Ctrl-C 로 끊어도 서버에서는 계속됩니다):")
+            code, stage, failed = poll_install(host, st, timeout=timeout)
+            return finish_install(host, code, stage, failed)
+        print("  진행 중입니다. 끝까지 따라가려면 `%s install status %s --follow`" % (TOOL, host.name)); return EX_OK
+    if stage:
+        print("  작업이 중단됐습니다(종료 기록 없음). 이어서: `%s install resume %s`" % (TOOL, host.name)); return EX_WARN
+    print("  기록된 설치가 없습니다."); return EX_WARN
+
+
+def install_resume(host, args):
+    r = ssh_run(host, ["sh", "-c", "systemctl is-active %s 2>/dev/null; echo ---; tail -n 300 %s 2>/dev/null" % (REMOTE_UNIT, REMOTE_LOG)])
+    head, _, log = r.out.partition("---\n")
+    stage, code, failed = stage_progress(log)
+    if head.strip() == "active":
+        print("설치가 아직 진행 중입니다(%s). 끝난 뒤 실패했다면 다시 실행하세요." % (stage or "?")); return EX_WARN
+    if code == 0 or (code is None and not stage):
+        print("이어서 할 실패·중단된 설치가 없습니다(결과: %s)." % ("성공" if code == 0 else "기록 없음")); return EX_WARN
+    print("직전 설치가 %s: %s%s" % ("실패했습니다" if code is not None else "중단됐습니다", stage or "?", " · " + failed if failed else ""))
+    print("서버 이름 `%s` 을(를) 그대로 입력하면 실패한 단계부터 이어서 실행합니다(--resume)." % host.name)
+    try:
+        typed = input("입력: ").strip()
+    except EOFError:
+        typed = ""
+    if typed != host.name:
+        print("취소했습니다."); return EX_WARN
+    inter = sys.stdin.isatty() and sys.stdout.isatty()
+    rotate_log(host, REMOTE_LOG, inter)   # 직전 실패의 FLEET_EXIT 가 남아 있으면 이어서 하는 작업의 결과로 오인된다
+    cmd = ["systemd-run", "--unit=" + REMOTE_UNIT, "--collect", "--property=StandardOutput=append:" + REMOTE_LOG, "--property=StandardError=inherit",
+           "sh", "-c", "python3 /opt/devmaru-kit/bin/devmaru-install --config /etc/{p}/site.env --yes --resume --skip-dns; echo FLEET_EXIT=$?".format(p=host.prefix)]
+    rc, out = run_sudo(host, cmd, inter)
+    if rc != 0:
+        print("실패: 이어서 시작하지 못했습니다: %s" % one_line(out, 200)); return EX_WARN
+    audit("install-resume", host.name, "apply", "started")
+    code, stage, failed = poll_install(host, None, timeout=args.timeout)
+    return finish_install(host, code, stage, failed)
+
+
+def cmd_verify_release(args):
+    ok, msgs = verify_release(args.tarball, args.allow_unsigned)
+    for m in msgs:
+        print(m)
+    audit("verify-release", "-", "read", "ok" if ok else "fail")
+    return EX_OK if ok else EX_WARN
+
+
+
+# ───────────────────────── 3단계: 안내형 갱신(update) · 회원 컨테이너 갱신(members) ─────────────────────────
+UPDATE_UNIT, UPDATE_LOG = "devmaru-fleet-update", "/var/log/devmaru-fleet-update.log"
+MEMBERS_UNIT, MEMBERS_LOG = "devmaru-fleet-members", "/var/log/devmaru-fleet-members.log"
+
+
+def ver_key(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except ValueError:
+        return None
+
+
+def kit_info(tarball):
+    """tarball 안의 킷 버전·Golden 버전을 읽는다(풀지 않고 지정한 두 파일만)."""
+    import tarfile
+    info = {"version": None, "golden": None}
+    with tarfile.open(tarball, "r:gz") as tf:
+        names = tf.getnames()
+        top = names[0].split("/")[0] if names else ""
+        for key, path in (("version", top + "/VERSION"), ("golden", top + "/tree/golden/GOLDEN_VERSION")):
+            try:
+                info[key] = tf.extractfile(path).read().decode("utf-8", "replace").strip()
+            except (KeyError, AttributeError):
+                pass
+    return info
+
+
+def remote_facts(host):
+    """갱신·회원 갱신 가드용 읽기 전용 사실. sudo -n 이 필요한 것(정비 락·회원 집계)은 sudo 가능 여부도 함께 돌려준다."""
+    r = ssh_run(host, ["sh", "-c", "cat /opt/devmaru-kit/VERSION 2>/dev/null; echo ---; cat /opt/%s/images/dev/GOLDEN_VERSION 2>/dev/null; echo ---; "
+                       "d=/srv; [ -d $d ] || d=/; df --output=avail -BG $d | tail -1 | tr -dc 0-9" % host.prefix])
+    if r.kind != "ok":
+        return None, r
+    parts = (r.out.split("---\n") + ["", "", ""])[:3]
+    f = {"kit": parts[0].strip() or None, "golden": parts[1].strip() or None, "disk_gb": int(re.sub(r"\D", "", parts[2]) or 0)}
+    m = ssh_run(host, sbin(host, "maintenance", "status", "--json"))
+    f["sudo"] = m.kind != "no_sudo"
+    mt = parse_json(m.out) if f["sudo"] else None
+    f["maint"] = mt.get("state") if mt else None
+    mu = ssh_run(host, bin_(host, "member-update-all", "--json")) if f["sudo"] else None
+    f["members"] = parse_json(mu.out) if mu else None
+    return f, None
+
+
+def evaluate_update(f, new, force):
+    notes = []
+
+    def add(ok, okm, badm, warn=False):
+        notes.append(("성공" if ok else ("경고" if warn else "실패"), okm if ok else badm))
+    cur = f.get("kit")
+    add(cur is not None, "설치된 킷 %s" % cur, "설치된 devmaru 를 찾지 못했습니다(/opt/devmaru-kit/VERSION) — 새 서버는 install 을 쓰세요")
+    nv, cv = ver_key(new.get("version")), (ver_key(cur) if cur else None)
+    if not nv:
+        add(False, "", "tarball 의 버전을 읽지 못했습니다")
+    elif cur and cv:
+        if nv < cv:
+            add(False, "", "새 킷(%s)이 설치된 킷(%s)보다 낮습니다 — 다운그레이드는 지원하지 않습니다" % (new["version"], cur))
+        elif nv == cv:
+            add(force, "같은 버전(%s)을 다시 적용합니다(--force)" % cur, "이미 같은 버전(%s)입니다 — 다시 적용하려면 --force" % cur)
+        else:
+            add(True, "킷 %s → %s" % (cur, new["version"]), "")
+    add(f.get("sudo", False), "sudo -n 가능(가드 점검)", "가드 점검에 비밀번호 없는 sudo(또는 agent 모듈의 제한 sudo)가 필요합니다")
+    add(f.get("maint") == "idle", "다른 정비 작업 없음", "다른 정비 작업이 실행 중이거나 확인할 수 없습니다(상태: %s)" % f.get("maint"))
+    if new.get("golden") and new["golden"] != f.get("golden"):
+        gb = f.get("disk_gb", 0)
+        add(gb >= 30, "Golden 이미지를 다시 빌드합니다(%s → %s) — /srv 여유 %dGB" % (f.get("golden"), new["golden"], gb),
+            "Golden 재빌드(%s → %s)가 필요한데 /srv 여유가 %dGB 입니다 — 최소 30GB" % (f.get("golden"), new["golden"], gb))
+    else:
+        notes.append(("성공", "Golden 이미지 변경 없음(재빌드 안 함)"))
+    mem = (f.get("members") or {}).get("summary")
+    if mem is None:
+        add(False, "", "회원 집계를 확인하지 못했습니다(서버 킷이 1.3.0 이전이거나 권한 없음)", warn=True)
+    elif mem.get("busy"):
+        add(False, "", "작업 중인 회원 %d명 — 갱신은 서비스를 다시 적용하므로 잠시 연결이 끊길 수 있습니다" % mem["busy"], warn=True)
+    return notes
+
+
+def evaluate_members(f):
+    """(notes, 할 일 있음). 작업 중인 회원이 있으면 거부(BLOCKED), 컨테이너가 없는 회원이 있으면 검토(REVIEW)도 거부."""
+    notes = []
+    notes.append(("성공" if f.get("sudo") else "실패", "sudo -n 가능(가드 점검)" if f.get("sudo") else "가드 점검에 비밀번호 없는 sudo(또는 agent 모듈의 제한 sudo)가 필요합니다"))
+    notes.append(("성공" if f.get("maint") == "idle" else "실패", "다른 정비 작업 없음" if f.get("maint") == "idle" else "다른 정비 작업이 실행 중이거나 확인할 수 없습니다(상태: %s)" % f.get("maint")))
+    mj = f.get("members") or {}
+    res = mj.get("result"); summ = mj.get("summary") or {}
+    if res == "READY":
+        notes.append(("성공", "작업 중인 회원 없음(READY) — 회원 %s명" % summ.get("members")))
+    elif res == "BLOCKED":
+        notes.append(("실패", "작업 중인 회원 %s명(BLOCKED) — 컨테이너를 다시 만들면 진행 중인 작업이 끊깁니다. 끝난 뒤 다시 하세요" % summ.get("busy")))
+    elif res == "REVIEW":
+        notes.append(("실패", "개발 컨테이너가 없는 회원 %s명(REVIEW) — 먼저 확인하세요" % summ.get("missing")))
+    else:
+        notes.append(("실패", "회원 상태를 확인하지 못했습니다(%s)" % one_line(str(mj.get("error", "응답 없음")), 80)))
+    todo = (summ.get("outdated") or 0) > 0
+    notes.append(("성공", "새 Golden 이미지를 쓰지 않는 컨테이너 %s개를 갱신합니다" % summ.get("outdated") if todo else "모든 회원 컨테이너가 이미 최신입니다 — 할 일 없음"))
+    return notes, todo
+
+
+def show_notes(host, notes, quiet_ok=False):
+    bad = False
+    for lv, msg in notes:
+        print("  [%s] %s: %s" % (host.name, lv, msg)); bad = bad or lv == "실패"
+    return bad
+
+
+def launch_job(host, unit, log, shell_cmd, interactive):
+    rotate_log(host, log, interactive)
+    cmd = ["systemd-run", "--unit=" + unit, "--collect", "--property=StandardOutput=append:" + log, "--property=StandardError=inherit",
+           "sh", "-c", shell_cmd + "; echo FLEET_EXIT=$?"]
+    return run_sudo(host, cmd, interactive)
+
+
+def ask_typed(prompt_text, expected):
+    print(prompt_text)
+    try:
+        typed = input("입력: ").strip()
+    except EOFError:
+        typed = ""
+    return typed == expected
+
+
+def update_prepare(host, args, new, quiet=False):
+    """읽기 전용 가드. 반환: 'ok' | 'blocked' | 'unreachable'(+ facts)."""
+    facts, err = remote_facts(host)
+    if facts is None:
+        print("  [%s] 실패: 서버에 접속하지 못했습니다: %s" % (host.name, one_line(err.err) or err.kind)); return "unreachable", None
+    bad = show_notes(host, evaluate_update(facts, new, args.force))
+    return ("blocked" if bad else "ok"), facts
+
+
+def update_run(host, args, kit, new, interactive):
+    """업로드 → 분리 실행 → 따라가기 → 확인. 반환 True/False."""
+    rdir = REMOTE_TMP % host.user
+    sumfile = Path(tempfile.mkdtemp()) / "kit.tar.gz.sha256"
+    sumfile.write_text("%s  kit.tar.gz\n" % sha256_file(kit), encoding="utf-8")
+    ok1, e1 = upload(host, kit, rdir, "kit.tar.gz"); ok2, e2 = upload(host, str(sumfile), rdir, "kit.tar.gz.sha256")
+    if not (ok1 and ok2):
+        print("  [%s] 실패: 킷 업로드 실패: %s" % (host.name, e1 or e2)); return False
+    r = ssh_run(host, ["sha256sum", "%s/kit.tar.gz" % rdir])
+    if r.rc != 0 or r.out.split()[:1] != [sha256_file(kit)]:
+        print("  [%s] 실패: 올린 킷의 sha256 이 로컬과 다릅니다(전송 오류)" % host.name); return False
+    cmd = "/usr/local/sbin/{p}-update --yes{f} file://{d}/kit.tar.gz".format(p=host.prefix, f=" --force" if args.force else "", d=rdir)
+    rc, out = launch_job(host, UPDATE_UNIT, UPDATE_LOG, cmd, interactive)
+    if rc != 0:
+        print("  [%s] 실패: 갱신을 시작하지 못했습니다: %s" % (host.name, one_line(out, 160))); audit("update-apply", host.name, "apply", "start-fail"); return False
+    audit("update-apply", host.name, "apply", "started")
+    print("  [%s] 갱신을 시작했습니다(서버에서 분리 실행 — 연결이 끊겨도 계속됩니다)" % host.name)
+    code, stage, failed = poll_install(host, None, timeout=args.timeout, unit=UPDATE_UNIT, log=UPDATE_LOG, label="update")
+    if code != 0:
+        print("  [%s] 실패: 갱신이 끝나지 않았습니다 — %s%s" % (host.name, stage or "?", " · " + failed if failed else "")); audit("update-apply", host.name, "apply", "fail-%s" % code); return False
+    facts, _ = remote_facts(host)
+    d = parse_json(ssh_run(host, sbin(host, "doctor", "--json")).out)
+    good = bool(facts) and facts.get("kit") == new["version"] and bool(d) and d.get("status") == "pass"
+    print("  [%s] %s: 킷 %s · doctor %s(경고 %s)" % (host.name, "성공" if good else "실패", (facts or {}).get("kit"), (d or {}).get("status"), (d or {}).get("warnings")))
+    audit("update-apply", host.name, "apply", "ok" if good else "verify-fail")
+    return good
+
+
+def cmd_update(args):
+    hosts = select_hosts(load_inventory(), args.hosts)
+    if args.action == "status":
+        if len(hosts) != 1:
+            print("실패: update status 는 --hosts 로 서버 하나를 지정하세요", file=sys.stderr); return EX_USAGE
+        return job_status(hosts[0], UPDATE_UNIT, UPDATE_LOG, "갱신", "update", args.follow, args.timeout)
+    if not args.kit:
+        print("실패: update %s 에는 --kit <릴리스 tarball> 이 필요합니다" % args.action, file=sys.stderr); return EX_USAGE
+    ok, msgs = verify_release(args.kit, args.allow_unsigned)
+    for m in msgs:
+        print(m)
+    if not ok:
+        audit("update-" + args.action, "-", args.action, "verify-fail"); return EX_WARN
+    new = kit_info(args.kit)
+    print("새 킷 %s (Golden %s) — 서버 %d대: %s" % (new["version"], new["golden"], len(hosts), ", ".join(h.name + ("*" if h.canary else "") for h in hosts)))
+    if not any(h.canary for h in hosts):
+        print("안내: 선택한 서버에 canary 가 없습니다 — 한 번에 한 서버씩, 서버별 확인으로 진행합니다.")
+    states = {}
+    for h in hosts:
+        print("\n== %s (%s:%d)" % (h.name, h.address, h.port))
+        st, facts = update_prepare(h, args, new); states[h.name] = (st, facts)
+    blocked = [n for n, (st, _) in states.items() if st != "ok"]
+    if args.action == "plan":
+        audit("update-plan", "-", "plan", "blocked" if blocked else "ok")
+        print("\n계획만 보여 드렸습니다. 서버에는 아무것도 바꾸지 않았습니다." + (" 막힌 서버: " + ", ".join(blocked) if blocked else ""))
+        return EX_WARN if blocked else EX_OK
+    if blocked:
+        print("\n막힌 서버가 있어 적용하지 않습니다(%s). 해결한 뒤 다시 실행하거나 --hosts 로 막히지 않은 서버만 고르세요." % ", ".join(blocked)); return EX_WARN
+    print("\n※ 갱신을 되돌리는 공식 도구는 없습니다. 실패하면 `update` 를 다시 실행하거나 이전 킷으로 다시 적용해야 합니다.")
+    inter = sys.stdin.isatty() and sys.stdout.isatty()
+    n = max(1, args.rolling)
+    if n > 1 and not all((states[h.name][1] or {}).get("sudo") for h in hosts):
+        print("실패: --rolling %d 은 서버 여러 대를 동시에 진행하므로 모든 서버에 비밀번호 없는 sudo 가 필요합니다" % n); return EX_WARN
+    canaries = [h for h in hosts if h.canary]; rest = [h for h in hosts if not h.canary]
+    batches = [[h] for h in canaries] + [rest[i:i + n] for i in range(0, len(rest), n)]
+    results = {}
+    for bi, batch in enumerate(batches):
+        names = ", ".join(h.name for h in batch)
+        if len(batch) == 1:
+            if not ask_typed("\n서버 `%s` 을(를) 갱신합니다%s. 서버 이름을 그대로 입력하세요." % (batch[0].name, " (canary)" if batch[0].canary else ""), batch[0].name):
+                print("취소했습니다. 이후 서버는 진행하지 않습니다."); audit("update-apply", batch[0].name, "apply", "cancel"); break
+        else:
+            groups = {h.group for h in batch}
+            token = (groups.pop() if len(groups) == 1 else "") or "all"
+            if not ask_typed("\n서버 %d대(%s)를 동시에 갱신합니다. 확인 문구 `%s` 를 그대로 입력하세요." % (len(batch), names, token), token):
+                print("취소했습니다. 이후 서버는 진행하지 않습니다."); audit("update-apply", names, "apply", "cancel"); break
+        if len(batch) == 1:
+            results[batch[0].name] = update_run(batch[0], args, args.kit, new, inter)
+        else:
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                for h, okh in zip(batch, ex.map(lambda x: update_run(x, args, args.kit, new, False), batch)):
+                    results[h.name] = okh
+        if not all(results.get(h.name) for h in batch):
+            print("\n실패한 서버가 있어 이후 서버는 진행하지 않습니다."); break
+    print("\n== 결과")
+    for h in hosts:
+        print("  %-14s %s" % (h.name, "성공" if results.get(h.name) else ("실패" if h.name in results else "진행 안 함")))
+    return EX_OK if all(results.get(h.name) for h in hosts) else EX_WARN
+
+
+def cmd_members(args):
+    host = select_hosts(load_inventory(), args.host)[0]
+    if args.action == "status":
+        return job_status(host, MEMBERS_UNIT, MEMBERS_LOG, "회원 갱신", "members", args.follow, args.timeout)
+    facts, err = remote_facts(host)
+    if facts is None:
+        print("실패: 서버에 접속하지 못했습니다: %s" % (one_line(err.err) or err.kind)); return EX_UNREACH
+    print("== %s members %s — %s" % (TOOL, args.action, host.name))
+    notes, todo = evaluate_members(facts)
+    bad = show_notes(host, notes)
+    if args.action == "plan":
+        audit("members-plan", host.name, "plan", "blocked" if bad else "ok")
+        print("\n계획만 보여 드렸습니다. 서버에는 아무것도 바꾸지 않았습니다."); return EX_WARN if bad else EX_OK
+    if bad:
+        print("\n막힌 항목이 있어 적용하지 않습니다."); audit("members-apply", host.name, "apply", "blocked"); return EX_WARN
+    if not todo:
+        return EX_OK
+    if not ask_typed("\n서버 `%s` 의 회원 컨테이너를 **다시 만듭니다**(홈·workspace 는 유지, 실행 중인 프로세스는 끊김). 서버 이름을 그대로 입력하세요." % host.name, host.name):
+        print("취소했습니다."); audit("members-apply", host.name, "apply", "cancel"); return EX_WARN
+    inter = sys.stdin.isatty() and sys.stdout.isatty()
+    rc, out = launch_job(host, MEMBERS_UNIT, MEMBERS_LOG, "/usr/local/bin/%s-member-update-all" % host.prefix, inter)
+    if rc != 0:
+        print("실패: 시작하지 못했습니다: %s" % one_line(out, 160)); return EX_WARN
+    audit("members-apply", host.name, "apply", "started")
+    code, stage, failed = poll_install(host, None, timeout=args.timeout, unit=MEMBERS_UNIT, log=MEMBERS_LOG, label="members")
+    f2, _ = remote_facts(host)
+    summ = ((f2 or {}).get("members") or {}).get("summary") or {}
+    good = code == 0 and summ.get("outdated") == 0
+    print("%s: 회원 컨테이너 갱신 %s(최신 아님 %s개)" % ("성공" if good else "실패", "완료" if code == 0 else "끝나지 않음 — %s%s" % (stage or "?", " · " + failed if failed else ""), summ.get("outdated")))
+    audit("members-apply", host.name, "apply", "ok" if good else "fail"); return EX_OK if good else EX_WARN
+
+
+def job_status(host, unit, log, label, cmdname, follow=False, timeout=7200):
+    r = ssh_run(host, ["sh", "-c", "systemctl is-active %s 2>/dev/null; echo ---; tail -n 300 %s 2>/dev/null" % (unit, log)])
+    if r.kind in ("unreachable", "timeout", "no_trust"):
+        print("서버에 닿지 못했습니다: %s" % one_line(r.err)); return EX_UNREACH
+    head, _, text = r.out.partition("---\n")
+    stage, code, failed = stage_progress(text)
+    print("서버 %s — %s 작업 %s" % (host.name, label, head.strip() or "없음"))
+    if stage:
+        print("  마지막 단계: " + stage)
+    if code is not None:
+        print("  결과: 종료 코드 %s%s" % (code, " · " + failed if failed else "")); return EX_OK if code == 0 else EX_WARN
+    if head.strip() == "active":
+        if follow:
+            c, st, fl = poll_install(host, None, timeout=timeout, unit=unit, log=log, label=cmdname)
+            print("%s: %s" % ("성공" if c == 0 else "실패", st or "?")); return EX_OK if c == 0 else EX_WARN
+        print("  진행 중입니다. 끝까지 따라가려면 `%s %s status … --follow`" % (TOOL, cmdname)); return EX_OK
+    print("  기록된 %s 작업이 없습니다." % label if not stage else "  작업이 중단됐습니다(종료 기록 없음)."); return EX_WARN
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog=TOOL, description="devmaru 여러 서버를 SSH 로 점검(1단계: 읽기 전용)")
+    p.add_argument("--version", action="version", version="%s %s" % (TOOL, TOOL_VERSION))
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="인벤토리 서버 목록").set_defaults(fn=cmd_list)
+    sub.add_parser("doctor", help="관리자 PC 쪽 점검").set_defaults(fn=cmd_doctor)
+    t = sub.add_parser("trust", help="SSH 호스트 키 지문 확인·등록"); t.add_argument("host"); t.set_defaults(fn=cmd_trust)
+    for name, fn, h in (("status", cmd_status, "서버별 상태"), ("check", cmd_check, "갱신 가능 여부"), ("watch", cmd_watch, "변화만 알림")):
+        s = sub.add_parser(name, help=h)
+        s.add_argument("--hosts", default="", help="쉼표로 구분한 서버 이름(기본: 전체)")
+        s.add_argument("--parallel", type=int, default=4, help="동시 조회 수(읽기 전용, 기본 4)")
+        if name != "watch":
+            s.add_argument("--json", action="store_true", help="JSON 으로 출력")
+        else:
+            s.add_argument("--once", action="store_true", help="한 번만 수집하고 끝(필수)")
+        s.set_defaults(fn=fn)
+    ins = sub.add_parser("install", help="원격 설치(계획 우선)")
+    ins.add_argument("action", choices=("plan", "apply", "status", "resume")); ins.add_argument("host")
+    ins.add_argument("--config", help="설치 설정 파일(KEY=값, 비밀 없음)"); ins.add_argument("--kit", help="릴리스 tarball(+ .sha256, 선택 .sig)")
+    ins.add_argument("--allow-unsigned", action="store_true", help="서명 없는 릴리스를 경고와 함께 허용")
+    ins.add_argument("--skip-dns", action="store_true", help="DNS 점검 건너뜀(내부망·시험용)")
+    ins.add_argument("--timeout", type=int, default=7200, help="진행 따라가기 최대 초(서버에서는 계속 진행)")
+    ins.add_argument("--follow", action="store_true", help="status: 진행 중이면 끝날 때까지 따라간다")
+    ins.set_defaults(fn=cmd_install)
+    up = sub.add_parser("update", help="킷 갱신(canary 먼저, 서버별 확인)")
+    up.add_argument("action", choices=("plan", "apply", "status")); up.add_argument("--hosts", default="", help="쉼표로 구분한 서버 이름(기본: 전체)")
+    up.add_argument("--kit", help="새 릴리스 tarball(+ .sha256, 선택 .sig)"); up.add_argument("--allow-unsigned", action="store_true")
+    up.add_argument("--force", action="store_true", help="같은 버전을 다시 적용"); up.add_argument("--rolling", type=int, default=1, help="canary 뒤 한 번에 N대(기본 1)")
+    up.add_argument("--timeout", type=int, default=7200); up.add_argument("--follow", action="store_true"); up.set_defaults(fn=cmd_update)
+    mb = sub.add_parser("members", help="회원 컨테이너 갱신(작업 중인 회원이 있으면 거부)")
+    mb.add_argument("action", choices=("plan", "apply", "status")); mb.add_argument("host")
+    mb.add_argument("--timeout", type=int, default=3600); mb.add_argument("--follow", action="store_true"); mb.set_defaults(fn=cmd_members)
+    vr = sub.add_parser("verify-release", help="릴리스 tarball 의 sha256·서명 검증")
+    vr.add_argument("tarball"); vr.add_argument("--allow-unsigned", action="store_true"); vr.set_defaults(fn=cmd_verify_release)
+    lg = sub.add_parser("log", help="이 도구의 감사 로그"); lg.add_argument("--tail", type=int, default=50); lg.set_defaults(fn=cmd_log)
+    return p
+
+
+def main(argv=None):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # 파일·파이프로 보낼 때도 진행 줄이 바로 보이게(cron·nohup 용)
+    except (AttributeError, ValueError):
+        pass
+    args = build_parser().parse_args(argv)
+    if getattr(args, "parallel", 1) < 1 or getattr(args, "parallel", 1) > 16:
+        print("--parallel 은 1~16", file=sys.stderr); return EX_USAGE
+    try:
+        return args.fn(args)
+    except InventoryError as e:
+        print("실패: " + str(e), file=sys.stderr); return EX_USAGE
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,6 +9,53 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# --json: 집계 JSON(회원 ID 없음). `--json --members` 는 회원별 행(ID 포함)도 낸다.
+# 종료 코드(--json 에만 적용): 0 READY · 2 BLOCKED(작업 중인 회원이 있음) · 3 REVIEW(개발 컨테이너가 없는 회원) · 1 오류.
+# 기존 `--check` 의 종료 코드는 바꾸지 않는다(호환). 이 블록은 같은 파일의 `--check` 출력을 읽어 JSON 으로 바꾼다.
+if [[ "${1:-}" == "--json" ]]; then
+  WITH_MEMBERS=0
+  if [[ $# -eq 2 && "$2" == "--members" ]]; then
+    WITH_MEMBERS=1
+  elif [[ $# -ne 1 ]]; then
+    echo "Usage: @@PFX@@-member-update-all [--check | --json [--members]]" >&2
+    exit 1
+  fi
+  OUT="$("$0" --check 2>&1)" && RC=0 || RC=$?
+  WITH_MEMBERS="$WITH_MEMBERS" CHECK_RC="$RC" python3 -c '
+import json, os, re, sys, time
+text = sys.stdin.read()
+lines = text.splitlines()
+res = {"version": 1, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+rc = int(os.environ["CHECK_RC"])
+m = re.search(r"^RESULT:\s*(\w+)", text, re.M)
+if rc != 0 or not m:
+    err = next((l.strip() for l in lines if l.startswith("ERROR")), "member-update-all --check failed")
+    res.update(result="ERROR", error=err[:200])
+    print(json.dumps(res, ensure_ascii=False)); sys.exit(1)
+res["result"] = m.group(1)
+for i, l in enumerate(lines):
+    if l.strip() == "Target image:" and i + 2 < len(lines):
+        res["image"] = lines[i + 1].strip(); res["image_id"] = lines[i + 2].strip()
+summ = {}
+for l in lines:
+    s = re.match(r"^\s+(members|ready|busy|missing|current|outdated):\s+(\d+)\s*$", l)
+    if s: summ[s.group(1)] = int(s.group(2))
+res["summary"] = summ
+if os.environ.get("WITH_MEMBERS") == "1":
+    rows = []; on = False
+    for l in lines:
+        if l.startswith("------------------"): on = True; continue
+        if on:
+            c = l.split()
+            if len(c) == 6: rows.append({"user": c[0], "container": c[1], "tmux": int(c[2]) if c[2].isdigit() else None, "state": c[3], "image": c[4], "result": c[5]})
+            elif not l.strip(): break
+    res["members"] = rows
+print(json.dumps(res, ensure_ascii=False))
+sys.exit({"READY": 0, "BLOCKED": 2, "REVIEW": 3}.get(res["result"], 1))
+' <<<"$OUT"
+  exit $?
+fi
+
 MODE="update"
 
 if [[ $# -gt 1 ]]; then
@@ -242,6 +289,7 @@ echo "All member containers are safe for Golden Image update."
 if [[ "$MODE" == "check" ]]; then
   exit 0
 fi
+[ -r /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh ] && { . /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh; maint_lock member-update-all; }
 
 echo
 echo "=============================================="

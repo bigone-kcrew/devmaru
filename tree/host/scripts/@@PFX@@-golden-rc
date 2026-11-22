@@ -223,6 +223,22 @@ def main():
         except EOFError:
             die("확인 입력을 받을 수 없다. --yes 를 주거나 대화형으로 실행한다")
 
+    # 정비 락: 한 번에 하나의 정비 작업만(sudo @@PFX@@-maintenance status 로 확인). 계획(--plan)은 위에서 이미 끝났다.
+    global _MAINT_LK
+    if not os.environ.get("@@PFX_UP@@_MAINT_HELD"):
+        import fcntl
+        _MAINT_LK = open("/run/@@PFX@@-maintenance.lock", "a+")
+        try:
+            fcntl.flock(_MAINT_LK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            _MAINT_LK.seek(0)
+            h = _MAINT_LK.read(200).split("\n")[0]
+            print("실패: 다른 정비 작업이 실행 중이라 golden-rc 를 시작하지 않는다" + (" — 실행 중: " + h if h else ""), file=sys.stderr)
+            return 75
+        _MAINT_LK.seek(0); _MAINT_LK.truncate()
+        _MAINT_LK.write("golden-rc pid=%d since=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S%z"))); _MAINT_LK.flush()
+        os.environ["@@PFX_UP@@_MAINT_HELD"] = "golden-rc"
+
     # ---- 6~8단계: artifact · checksum · Dockerfile -------------------
     step(1, "artifact · checksum · Dockerfile")
     text = open(DOCKERFILE, encoding="utf-8").read()

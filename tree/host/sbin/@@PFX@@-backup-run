@@ -23,6 +23,7 @@ done
 install -d -m 0755 /var/lib/@@PFX@@
 exec 9>"$LOCK"
 flock -n 9 || { echo "이미 실행 중이다(lock)"; exit 3; }
+[ -r /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh ] && { . /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh; maint_lock backup-run; }
 
 ts() { date --iso-8601=seconds; }
 RESULT="PASS"; FAILED_STEP=""

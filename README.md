@@ -8,11 +8,11 @@
 >
 > 서비스 이름 · 도메인 · 명령 접두어는 설치할 때 직접 정합니다.
 >
-> 셀프호스팅 · 서비스별 선택 설치 · MIT 라이선스 · 1.2.2 베타
+> 셀프호스팅 · 서비스별 선택 설치 · MIT 라이선스 · 1.3.0 베타
 
 | | |
 |---|---|
-| 📦 **릴리스** | [v1.2.2](https://gitlab.aigov.go.kr/bigone-kised/devmaru/-/releases/v1.2.2) |
+| 📦 **릴리스** | [v1.3.0](https://github.com/bigone-kcrew/devmaru/releases/tag/v1.3.0) |
 | 💻 **필요 환경** | Ubuntu 26.04 (x86_64) · 메모리 8GB+ (16GB 권장) · 디스크 60GB+ |
 | ⏱ **설치 시간** | 약 18분 (Golden 빌드 포함, 네트워크에 따라 다름) |
 | 🧑‍💻 **이런 곳에** | 공공 실험실 · 연구 모임 · 동호회 · 소규모 개발팀 |
@@ -99,8 +99,10 @@
 ### 2️⃣ 설치 명령
 
 ```bash
-curl -fsSL https://gitlab.aigov.go.kr/bigone-kised/devmaru/-/raw/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/bigone-kcrew/devmaru/main/install.sh | sudo bash
 ```
+
+> GitLab 저장소(`bigone-kised/devmaru`)는 점검 중이라 **GitHub 릴리스**에서 받습니다. 예전처럼 GitLab 에서 받으려면 `DEVMARU_SOURCE=gitlab` 을 앞에 붙입니다(`curl … | sudo DEVMARU_SOURCE=gitlab bash`). `sudo <접두어>-update` 도 같은 규칙입니다.
 
 질문에 답하면 됩니다. Enter 만 누르면 [기본값]을 씁니다.
 
@@ -191,7 +193,7 @@ ALIO · K-Startup 같은 외부 공개 MCP 서비스는 기본에서 빼고, 관
 - 웹 관리 콘솔(멤버·업데이트·상태 화면)은 아직 없습니다. 설치용 웹 화면만 제공합니다.
 - 공개 도메인에서의 인증서 발급 흐름은 내부 인증서 모드로만 시험했습니다.
 - Paseo 페어링 링크는 재발급해도 같은 값인 **영구 자격증명**처럼 다뤄야 합니다. 회원에게만 전달하세요.
-- 이 저장소는 푸시할 때 서버의 보안 스캔(Gitleaks · Semgrep · OSV-Scanner · Trivy · Syft)을 통과했습니다. 억제한 규칙 1건은 [구조 문서](docs/ARCHITECTURE.md)에 근거와 함께 적었습니다.
+- 1.2.1 까지는 GitLab 서버의 푸시 보안 스캔(Gitleaks · Semgrep · OSV-Scanner · Trivy · Syft)을 통과했습니다(억제한 규칙 1건은 [구조 문서](docs/ARCHITECTURE.md)에 근거와 함께 적었습니다). GitHub 로 옮긴 뒤의 릴리스는 `check-release.sh`(비밀 패턴 · 조직 이름 잔여 · 렌더링 점검)를 통과한 것만 올리며, 위 다섯 스캐너는 이 저장소에서 돌리지 않았습니다.
 
 ---
 
@@ -204,6 +206,7 @@ ALIO · K-Startup 같은 외부 공개 MCP 서비스는 기본에서 빼고, 관
 | [🖼 설치 화면](docs/INSTALL-SCREENS.md) | 터미널·웹 설치 화면 미리보기 |
 | [🛠 운영 가이드](docs/OPERATIONS.md) | 회원 추가·삭제 · DB · 웹 공개 · 업데이트 · 백업 |
 | [🔐 접근 정책](docs/ACCESS.md) | workspace·공유 공간 읽기/쓰기 권한 |
+| [🚚 라이브 서버 이관](docs/MIGRATE-LIVE.md) | 큰 데이터를 두 서버가 켜진 채 rsync 로 옮기고 짧게 전환(IP 교체·함정 목록) |
 | [✉️ 메일](docs/MAIL.md) · [🗄 SMB](docs/SMB.md) · [🔁 n8n](docs/N8N.md) | 선택 모듈 안내 |
 | [🤖 AI 관리자](docs/ADMIN-AGENT.md) · [`AGENTS.md`](AGENTS.md) | Claude Code·Codex 로 설치·운영 |
 | [🗺 로드맵](docs/ROADMAP.md) · [📝 변경 내역](CHANGELOG.md) | 앞으로의 계획 · 버전별 변경 |

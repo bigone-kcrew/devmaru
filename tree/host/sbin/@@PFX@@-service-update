@@ -113,7 +113,7 @@ update_one() { # <name> <dir> <ctr> <secs>
   return 1
 }
 
-[ "$MODE" = apply ] && { TS=$(date +%Y%m%d-%H%M%S); BK=/var/backups/$PFX/service-update/$TS; install -d -m 0700 "$BK"; LG=/var/backups/$PFX/service-update/last-good; }
+[ "$MODE" = apply ] && { [ -r /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh ] && { . /opt/@@PFX@@/scripts/@@PFX@@-maint-lib.sh; maint_lock service-update; }; TS=$(date +%Y%m%d-%H%M%S); BK=/var/backups/$PFX/service-update/$TS; install -d -m 0700 "$BK"; LG=/var/backups/$PFX/service-update/last-good; }
 echo "== $PFX-service-update ($MODE) — 대상: $(echo $NAMES)"
 rc=0
 for n in $NAMES; do

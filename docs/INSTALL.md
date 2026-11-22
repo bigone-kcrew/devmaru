@@ -114,8 +114,10 @@
 ### 1️⃣ 터미널로 설치
 
 ```bash
-curl -fsSL https://gitlab.aigov.go.kr/bigone-kised/devmaru/-/raw/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/bigone-kcrew/devmaru/main/install.sh | sudo bash
 ```
+
+GitHub 에서 받습니다. GitLab 에서 받으려면 `sudo DEVMARU_SOURCE=gitlab bash` 로 바꿉니다.
 
 스크립트는 다음 순서로 일합니다.
 

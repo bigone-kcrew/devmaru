@@ -1,0 +1,20 @@
+# migrate.conf — devmaru-migrate-live 설정. 이 파일을 migrate.conf 로 복사해 고친다(구·신 서버 양쪽에 같은 도구 폴더를 둔다).
+# 형식: KEY=값 (셸로 실행하지 않는다 — 아래 키만 허용). 비밀(암호·토큰)은 넣지 않는다.
+PFX=devmaru
+# 신 서버: 이관 중에 쓰는 주소 · hostname(방향 확인: 구 서버와 달라야 한다) · 받는 계정(신 서버에 «sudo -n rsync» 만 허용된 계정)
+NEW_HOST=192.0.2.20
+NEW_HOSTNAME=newserver
+RUSER=migrate
+SSH_PORT=22
+# 이관 전용 키와 known_hosts(구 서버 root). 키는 신 서버 authorized_keys 에 from="<구 서버 IP>" 로 제한해 등록하고 이관 뒤 지운다
+SSH_KEY=/root/.ssh/migrate_ed25519
+SSH_KNOWN_HOSTS=/root/.ssh/known_hosts_migrate
+REMOTE_RSYNC=sudo -n /usr/bin/rsync
+# 속도 제한 KB/s(0=없음). 구 서버 디스크가 운영 부하로 이미 바쁘면 낮게
+BWLIMIT=0
+# 로그 폴더(기본 /var/log/<PFX>-migrate-live)
+LOG_DIR=
+# 계정 이관 대상(공백 구분). 운영자 계정은 넣지 않는 것을 권장
+MEMBERS=alice bob
+# 정지 확인에서 «아직 떠 있으면 안 되는» 추가 프로세스(pgrep -f 정규식, | 로 여러 개). 예: 재시작 가드 스크립트
+EXTRA_PROC_PATTERNS=

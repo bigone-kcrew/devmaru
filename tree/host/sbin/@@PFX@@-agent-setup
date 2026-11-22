@@ -7,7 +7,7 @@
 # 키는 @@PFX@@-agent-key 로 관리자가 등록한다. 허용 명령은 아래 ALLOW 의 «정확한 명령줄» 만(인자 와일드카드 없음).
 set -uo pipefail
 [[ $EUID -eq 0 ]] || { echo "실패: root 로 실행하세요(sudo)" >&2; exit 1; }
-PFX=@@PFX@@; A=$PFX-agent; S=/usr/local/sbin/$PFX
+PFX=@@PFX@@; A=$PFX-agent; S=/usr/local/sbin/$PFX; B=/usr/local/bin/$PFX
 SUDOERS=/etc/sudoers.d/$A; SSHD=/etc/ssh/sshd_config.d/$A.conf; KEYS=/etc/$PFX/agent-authorized_keys
 LOGDIR=/var/log/$PFX; LOG=$LOGDIR/agent-audit.log
 # 읽기성 명령만. 인자 없는 명령은 "" 로 «인자 없음» 을 못박는다(그렇지 않으면 아무 인자나 허용된다).
@@ -16,6 +16,12 @@ ALLOW=(
   "$S-update --check"
   "$S-access status" "$S-access verify" "$S-access apply --all --plan"
   "$S-backup-run \"\""
+  # 원격 관리(fleet)·콘솔용 읽기 전용(2026-11-18, DESIGN-fleet Q4): 모두 --check/--plan/--json/status 전용 — 인자가 한 칸이라도 다르면 허용되지 않는다.
+  # (member-update-all 은 인자 없이 부르면 전체 회원 컨테이너를 재생성하고, --json --members 는 회원 ID 를 내므로 둘 다 목록에 넣지 않는다)
+  "$S-golden check"
+  "$B-member-update-all --check" "$B-member-update-all --json"
+  "$S-service-update --all --plan" "$S-service-update --all --check"
+  "$S-maintenance status" "$S-maintenance status --json"
 )
 die(){ echo "실패: $*" >&2; exit 1; }
 

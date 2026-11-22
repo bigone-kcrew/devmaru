@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# @@PFX@@-maintenance — 정비 락 상태(읽기 전용)
+#   @@PFX@@-maintenance status [--json]     idle(없음) / busy(어떤 작업이 잡고 있는지)
+# 종료 코드: 0 idle · 2 busy · 1 사용법 오류. 락을 잡지 않고, 파일을 바꾸지 않는다.
+set -euo pipefail
+LOCK=${@@PFX_UP@@_MAINT_LOCK:-/run/@@PFX@@-maintenance.lock}
+CMD=${1:-status}; JSON=0
+[[ $CMD == status ]] || { echo "Usage: @@PFX@@-maintenance status [--json]" >&2; exit 1; }
+shift || true
+if [[ ${1:-} == --json ]]; then JSON=1; shift; fi
+[[ $# -eq 0 ]] || { echo "Usage: @@PFX@@-maintenance status [--json]" >&2; exit 1; }
+state=idle; holder=""
+if [[ -r $LOCK ]]; then
+  exec 9<"$LOCK"
+  if flock -n -s 9; then state=idle; else state=busy; holder=$(head -c 200 "$LOCK" 2>/dev/null | tr -d '\000' | head -n1); fi
+fi
+if (( JSON )); then
+  python3 -c 'import json,sys; print(json.dumps({"version":1,"state":sys.argv[1],"holder":sys.argv[2]}, ensure_ascii=False))' "$state" "$holder"
+else
+  if [[ $state == idle ]]; then echo "정비 작업 없음(idle)"; else echo "정비 작업 실행 중(busy)${holder:+: $holder}"; fi
+fi
+[[ $state == idle ]]  || exit 2

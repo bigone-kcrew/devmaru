@@ -18,6 +18,7 @@
 | 📋 `config/modules.list` · `networks.list` | 모듈 · 도커 네트워크 목록 |
 | 🌳 `tree/` | **템플릿 트리** — 사용자가 고른 접두어 · 이름 · 도메인이 `@@토큰@@` 으로 들어갈 자리 |
 | 📚 `docs/` | 설치 가이드 · 구조 |
+| 🧰 `tools/` | 관리자용 도구 — `devmaru-fleet`(원격 점검·설치, [FLEET](FLEET.md)) · `devmaru-migrate-live/`(라이브 서버 이관, [MIGRATE-LIVE](MIGRATE-LIVE.md)) |
 
 ---
 

@@ -33,8 +33,9 @@ sudo <접두어>-agent-setup remove                 # 계정 삭제(감사 로�
 - `sudo <접두어>-update --check` (확인만)
 - `sudo <접두어>-access status` · `verify` · `apply --all --plan`
 - `sudo <접두어>-backup-run` (인자 없이 — 백업 실행)
+- **읽기 전용 점검(원격 관리·콘솔용, 1.3.0 선행)**: `sudo <접두어>-golden check` · `sudo <접두어>-member-update-all --check` · `sudo <접두어>-member-update-all --json`(회원 ID 없는 집계) · `sudo <접두어>-service-update --all --plan` · `--all --check` · `sudo <접두어>-maintenance status`(`--json`)
 
-`member-remove` · `update`(적용) · `member-update-all` · `rm` 등 파괴적·변경 명령은 목록에 없으므로 에이전트가 직접 실행할 수 없습니다. 에이전트에게 «이 명령을 승인해 주세요» 라고 말하게 하고 **관리자가 직접** `! sudo …` 로 실행하세요.
+`member-remove` · `update`(적용) · `member-update-all`(인자 없음 = 전체 회원 컨테이너 재생성, `--json --members` = 회원 ID 출력) · `golden rc|promote` · `service-update --apply` · `rm` 등 파괴적·변경 명령은 목록에 없으므로 에이전트가 직접 실행할 수 없습니다. 에이전트에게 «이 명령을 승인해 주세요» 라고 말하게 하고 **관리자가 직접** `! sudo …` 로 실행하세요.
 
 ## 감사 로그
 

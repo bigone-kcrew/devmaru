@@ -39,6 +39,9 @@
 | `sudo <접두어>-member-status <ID>` | 회원 계정 · DB 상태 |
 | `sudo <접두어>-member-tmux-status` | 회원 tmux 세션 유무(집계) |
 | `sudo <접두어>-member-update-all --check` | 회원 Golden 갱신 사전 점검 |
+| `sudo <접두어>-member-update-all --json` | 같은 점검을 **JSON**(회원 ID 없는 집계)으로. 종료 코드 0 READY · 2 BLOCKED(작업 중인 회원) · 3 REVIEW · 1 오류 |
+| `sudo <접두어>-maintenance status [--json]` | 정비 작업(update·service-update·restore·golden rc·회원 갱신·백업)이 실행 중인지(`idle`/`busy`) |
+| `<접두어>-mask` | 표준 입력의 비밀(토큰·비밀번호·키·링크·이메일)을 지워 출력하는 필터(`어떤 명령 \| <접두어>-mask`) |
 | `sudo <접두어>-site-caddy status` | 회원 웹 블록 일치 여부 |
 | `sudo <접두어>-mcp-remote list` | 외부 MCP 후보와 켜짐 여부 |
 | `sudo <접두어>-service-update <서비스>\|--all --plan\|--check` | 서비스별 업데이트 계획·점검(읽기 전용). `--apply` 는 승인 필요 |
@@ -110,4 +113,4 @@
 
 ## 🗺 앞으로
 
-전용 에이전트 계정 · 제한된 sudo · 감사 로그는 **선택 모듈 `agent`**(기본 꺼짐)로 제공됩니다. 켜져 있으면 `<접두어>-agent` 계정이 허용 목록(`doctor`·`doctor --json`·`update --check`·`access status|verify|apply --all --plan`·`backup-run`)만 비밀번호 없이 실행할 수 있고, 그 밖의 명령은 사람 승인이 필요합니다. 기록은 `sudo <접두어>-agent-audit`. 자세한 내용은 [docs/AGENT.md](docs/AGENT.md). 모듈을 켜지 않았다면 **관리자가 sudo 를 직접 실행**하는 방식(`! sudo …`)을 권장합니다.
+전용 에이전트 계정 · 제한된 sudo · 감사 로그는 **선택 모듈 `agent`**(기본 꺼짐)로 제공됩니다. 켜져 있으면 `<접두어>-agent` 계정이 허용 목록(`doctor`·`doctor --json`·`update --check`·`access status|verify|apply --all --plan`·`backup-run`, 읽기 전용 점검 `golden check`·`member-update-all --check|--json`·`service-update --all --plan|--check`·`maintenance status [--json]`)만 비밀번호 없이 실행할 수 있고, 그 밖의 명령은 사람 승인이 필요합니다. 기록은 `sudo <접두어>-agent-audit`. 자세한 내용은 [docs/AGENT.md](docs/AGENT.md). 모듈을 켜지 않았다면 **관리자가 sudo 를 직접 실행**하는 방식(`! sudo …`)을 권장합니다.

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# @@PFX@@-mask — 표준 입력의 비밀(토큰·비밀번호·키·링크·이메일 등)을 지워 표준 출력으로 낸다(읽기 전용 필터).
+#   어떤 명령 | @@PFX@@-mask          # 규칙은 support-bundle 과 같다(@@PFX@@-mask-lib.sh)
+#   @@PFX@@-mask --selftest            # 가짜 비밀로 자체 시험
+set -uo pipefail
+. /opt/@@PFX@@/scripts/@@PFX@@-mask-lib.sh
+case "${1:-}" in
+  "") mask ;;
+  --selftest) mask_selftest; exit $? ;;
+  *) echo "Usage: @@PFX@@-mask [--selftest]   (표준 입력을 마스킹)" >&2; exit 2 ;;
+esac
