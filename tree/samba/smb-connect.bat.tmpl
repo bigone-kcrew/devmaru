@@ -1,0 +1,21 @@
+@echo off
+chcp 65001 >nul
+rem SMB 네트워크 드라이브 연결 - 비밀번호는 이 파일에 들어 있지 않습니다. 서버 __SMB_HOST__
+set "SERVER=__SMB_HOST__"
+set /p "MYID=회원 ID: "
+set /p "DRV=사용할 드라이브 문자 예 L: "
+set "DRV=%DRV::=%"
+echo.
+echo 비밀번호는 SSH 비밀번호입니다. 다음에 입력창이 나옵니다.
+cmdkey /add:%SERVER% /user:%MYID% /pass
+net use %DRV%: \\%SERVER%\%MYID% __NET_USE_OPTS__ /PERSISTENT:YES
+if errorlevel 1 goto fail
+echo.
+echo 연결되었습니다: %DRV%:
+goto end
+:fail
+echo.
+echo 연결에 실패했습니다. 위 메시지를 관리자에게 알려 주세요.
+:end
+echo.
+pause

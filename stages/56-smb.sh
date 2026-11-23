@@ -72,6 +72,14 @@ else
   fi
 fi
 
+# ---- Windows 연결 파일 — 포털 Guide 에서 받는다. 서버 이름·포트만 채우고 비밀번호는 넣지 않는다(CRLF 로 쓴다)
+BAT_OPTS=""; qp=$(printf '%s' "$TRANSPORTS" | tr ',' '\n' | sed -n 's/^ *quic:\([0-9][0-9]*\).*/\1/p' | head -1)
+[ -n "$qp" ] && BAT_OPTS="/TRANSPORT:QUIC /QUICPORT:$qp"
+PD=/srv/$PFX/public/portal; install -d -m 0755 "$PD"
+if [ -r "$O/samba/smb-connect.bat.tmpl" ] && sed -e "s|__SMB_HOST__|$SMB_HOST|g" -e "s|__NET_USE_OPTS__|$BAT_OPTS|g" -e 's/$/\r/' "$O/samba/smb-connect.bat.tmpl" > "$PD/smb-connect.bat.new"; then
+  chmod 0644 "$PD/smb-connect.bat.new"; mv -f "$PD/smb-connect.bat.new" "$PD/smb-connect.bat"; echo "성공: Windows 연결 파일($PD/smb-connect.bat — 포털 Guide 의 «연결 파일 받기»)"
+else rm -f "$PD/smb-connect.bat.new"; warn "Windows 연결 파일을 만들지 못했습니다(템플릿 $O/samba/smb-connect.bat.tmpl)"; fi
+
 # ---- 서비스
 # 유닛은 시작 전에 quic 모듈을 적재한다 — quic 전송을 쓰지 않으면(예: tcp 만) 그 단계를 뺀다
 UD=/etc/systemd/system/$PFX-samba-quic.service.d
