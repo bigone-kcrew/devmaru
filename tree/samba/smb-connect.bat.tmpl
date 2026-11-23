@@ -2,16 +2,30 @@
 chcp 65001 >nul
 rem SMB 네트워크 드라이브 연결 - 비밀번호는 이 파일에 들어 있지 않습니다. 서버 __SMB_HOST__
 set "SERVER=__SMB_HOST__"
+set "SDRV="
 set /p "MYID=회원 ID: "
-set /p "DRV=사용할 드라이브 문자 예 L: "
+set /p "DRV=내 폴더에 쓸 드라이브 문자 예 L: "
+set /p "SDRV=공용 폴더도 연결하려면 드라이브 문자 예 M, 안 하려면 그냥 Enter: "
 set "DRV=%DRV::=%"
+if defined SDRV set "SDRV=%SDRV::=%"
+if /i "%SDRV%"=="%DRV%" goto samedrive
 echo.
 echo 비밀번호는 SSH 비밀번호입니다. 다음에 입력창이 나옵니다.
 cmdkey /add:%SERVER% /user:%MYID% /pass
 net use %DRV%: \\%SERVER%\%MYID% __NET_USE_OPTS__ /PERSISTENT:YES
 if errorlevel 1 goto fail
+echo 내 폴더가 연결되었습니다: %DRV%:
+if not defined SDRV goto done
+net use %SDRV%: \\%SERVER%\shared __NET_USE_OPTS__ /PERSISTENT:YES
+if errorlevel 1 goto fail
+echo 공용 폴더가 연결되었습니다: %SDRV%:
+:done
 echo.
-echo 연결되었습니다: %DRV%:
+echo 완료되었습니다.
+goto end
+:samedrive
+echo.
+echo 내 폴더와 공용 폴더는 서로 다른 드라이브 문자여야 합니다. 다시 실행하세요.
 goto end
 :fail
 echo.
