@@ -8,6 +8,15 @@
 
 ---
 
+## 1.4.1 — 2026-11-23 — `onboarding-seal` 명령이 PATH 에 없던 문제
+
+### 🐛 고친 것
+
+- 문서(INSTALL·OPERATIONS)와 `member-add` 안내가 `sudo <접두어>-onboarding-seal <ID>` 로 쓰라고 하는데, 설치가 이 명령을 `/opt/<접두어>/scripts/` 에만 두어 **«command not found»** 가 났습니다. 이제 설치(20 단계)가 `/usr/local/sbin/<접두어>-onboarding-seal` 링크를 만듭니다. 1.4.0 을 쓰던 서버는 `sudo <접두어>-update` 뒤 링크가 생기고, 급하면 전체 경로(`/opt/<접두어>/scripts/<접두어>-onboarding-seal <ID>`)로 실행해도 됩니다.
+- 가상 머신(LXD)에 새로 설치해 확인했습니다: 링크 열람(GET 은 소비하지 않음·POST 1회·재사용 거부), Caddy 로그에 토큰이 남지 않음, `//start/`·대문자·끝 슬래시 404, 링크 서비스는 127.0.0.1 만, 봉인 뒤 재발급 거부.
+
+---
+
 ## 1.4.0 — 2026-11-23 — 회원 안내 «전달 채널» · 1회 열람 링크 · webhook · 출력용 안내문
 
 > 회원 등록 때 초기 비밀번호·Paseo QR 을 전달하는 방식을 **채널 목록**(`ONBOARD_CHANNELS`)으로 일반화했습니다. **설정이 없으면 예전과 같이 동작**합니다(`MAIL_MODE` 에서 유도: none→화면 · smtp→메일 · n8n→n8n). 자세한 내용은 [docs/ONBOARDING.md](docs/ONBOARDING.md).

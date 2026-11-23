@@ -24,6 +24,8 @@ install -d -o root -g root -m 0700 "/etc/$PFX/secrets"
 cp_tree(){ [ -e "$R/$1" ] && { mkdir -p "$2"; rsync -a "$R/$1/" "$2/"; }; }
 cp_tree host/scripts "$O/scripts"; cp_tree host/sbin /usr/local/sbin; cp_tree host/bin /usr/local/bin; cp_tree host/admin-bin "$S/admin-harness/bin"
 cp_tree host/systemd /etc/systemd/system; cp_tree host/libexec /usr/local/libexec
+# 문서가 안내하는 짧은 명령 이름(<접두어>-onboarding-seal)이 PATH 에 있게 한다 — 실제 파일은 $O/scripts 에 있다(1.4.0 은 이 링크가 없어 «command not found» 였다)
+[ -x "$O/scripts/$PFX-onboarding-seal" ] && ln -sfn "$O/scripts/$PFX-onboarding-seal" "/usr/local/sbin/$PFX-onboarding-seal"
 [ -d "$R/host/etc" ] && rsync -a --ignore-existing "$R/host/etc/" "/etc/$PFX/"   # 공개 샌드박스 설정·앱 한도(관리자가 고친 파일은 덮어쓰지 않는다)
 # 회원 SSH 진입: 로그인 훅(자동으로 개발환경 입장) · sudoers(member-shell 한 명령만) · sshd 드롭인(회원 그룹만 비밀번호 로그인)
 [ -d "$R/host/profile.d" ] && install -m 0644 "$R"/host/profile.d/* /etc/profile.d/
