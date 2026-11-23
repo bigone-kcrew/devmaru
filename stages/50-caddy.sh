@@ -13,9 +13,12 @@ install -d -m 0755 "$C/members.d" "$C/sites.d" "$C/apps.d" /var/log/caddy
 }
 X
 [ -e "$C/$PFX-shared.caddy" ] || : > "$C/$PFX-shared.caddy"
+[ -e "$C/$PFX-link.caddy" ] || : > "$C/$PFX-link.caddy"   # 회원 안내 1회 열람 링크 연결 조각(53 단계가 채운다)
 chown caddy:caddy /var/log/caddy 2>/dev/null || true
 T=$(mktemp)
 LC=""; [ "${TLS_MODE:-acme}" = internal ] && LC=$'\tlocal_certs\n'
+# 전역: 헤더 읽기 10초 제한(slowloris — read_body 는 큰 업로드를 끊으므로 두지 않는다) · 기본(오류) 로그에서도 /start/ 뒤 경로(1회 열람 링크 토큰)를 지운다
+LC+=$'\tservers {\n\t\ttimeouts {\n\t\t\tread_header 10s\n\t\t}\n\t}\n\tlog {\n\t\tformat filter {\n\t\t\twrap json\n\t\t\tfields {\n\t\t\t\trequest>uri regexp "(?i)(/+start/)[^?]*|\\?.*" "$1"\n\t\t\t}\n\t\t}\n\t}\n'
 { printf '{\n\temail %s\n%s}\n\n' "$ADMIN_EMAIL" "$LC"; cat "$O/caddy/Caddyfile.tmpl"
   has files && cat "$O/caddy/modules/files.caddy"; has cockpit && cat "$O/caddy/modules/cockpit.caddy"
   has n8n && cat "$O/caddy/modules/n8n.caddy"; has uptime-kuma && cat "$O/caddy/modules/uptime-kuma.caddy"; has smb && cat "$O/caddy/modules/smb-acme.caddy"; true; } > "$T"

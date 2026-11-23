@@ -239,6 +239,7 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 | **Cockpit** | 설치 · `127.0.0.1` 바인딩 · 관리자 대역 전용 Caddy 주소 | 리눅스 관리자 계정으로 로그인 |
 | **Ollama** | 컨테이너(`127.0.0.1:11435`) | **모델이 비어 있습니다** — `sudo docker exec <접두어>-ollama ollama pull <모델>`. 현재 이 킷의 다른 구성요소는 Ollama 를 쓰지 않습니다 |
 | **백업(restic)** | 저장소 · 암호 생성 | 암호(`/etc/<접두어>/secrets/restic-repository-password`)를 **서버 밖에도 보관**, `<접두어>-backup-run` 실행 |
+| **메일/전달 방식 정하기** | 회원 등록 때 초기 비밀번호·Paseo QR 을 **어떻게 전달할지** 정합니다(`ONBOARD_CHANNELS`). 기본은 화면 표시(관리자가 직접 전달)이고, SMTP 메일 · **1회 열람 링크** · webhook · 출력용 안내문을 고를 수 있습니다. 링크는 공개 도메인 443 이 필요합니다. 설치 전·후 언제든 바꿀 수 있습니다 → [회원 안내 전달 가이드](ONBOARDING.md) · SMTP 는 [메일 가이드](MAIL.md) |
 | **회원 SSH 접속** | 로그인 시 개발환경 자동 입장 · 회원 그룹만 비밀번호 로그인 · 비밀번호 변경 동기화 | 서버 sshd 포트·방화벽 확인. 포트가 22 가 아니면 설정 파일에 `SSH_PORT` 를 넣어 안내 문구를 맞춤 |
 
 > **회원 접속 규칙**

@@ -12,7 +12,7 @@
 			wrap json
 			fields {
 				request>headers delete
-				request>uri regexp \?.* ""
+				request>uri regexp "(?i)(/+start/)[^?]*|\?.*" "$1"
 				resp_headers>Set-Cookie delete
 				resp_headers>Location delete
 			}
@@ -29,6 +29,8 @@ import /etc/caddy/geo-allow.caddy
 		root * /srv/@@PFX@@/public/assets
 		file_server
 	}
+	# 회원 안내 1회 열람 링크(@@PFX@@-link 서비스) — 조각 파일은 53 단계가 채운다(비어 있으면 /start/* 는 없는 주소)
+	import /etc/caddy/@@PFX@@-link.caddy
 	respond "@@BRAND@@ Caddy OK" 200
 }
 

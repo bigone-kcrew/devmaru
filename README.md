@@ -8,11 +8,11 @@
 >
 > 서비스 이름 · 도메인 · 명령 접두어는 설치할 때 직접 정합니다.
 >
-> 셀프호스팅 · 서비스별 선택 설치 · MIT 라이선스 · 1.3.0 베타
+> 셀프호스팅 · 서비스별 선택 설치 · MIT 라이선스 · 1.4.0 베타
 
 | 구분 | 내용 |
 |---|---|
-| **릴리스** | [v1.3.0](https://github.com/bigone-kcrew/devmaru/releases/tag/v1.3.0) |
+| **릴리스** | [v1.4.0](https://github.com/bigone-kcrew/devmaru/releases/tag/v1.4.0) |
 | **필요 환경** | Ubuntu 26.04 (x86_64) · 메모리 8GB+ (16GB 권장) · 디스크 60GB+ |
 | **설치 시간** | 약 18분 (Golden 빌드 포함, 네트워크에 따라 다름) |
 | **이런 곳에** | 공공 실험실 · 연구 모임 · 동호회 · 소규모 개발팀 |
@@ -223,6 +223,7 @@ ALIO · K-Startup 같은 외부 공개 MCP 서비스는 기본에서 빼고, 관
 | [ 운영 가이드](docs/OPERATIONS.md) | 회원 추가·삭제 · DB · 웹 공개 · 업데이트 · 백업 |
 | [ 접근 정책](docs/ACCESS.md) | workspace·공유 공간 읽기/쓰기 권한 |
 | [ 라이브 서버 이관](docs/MIGRATE-LIVE.md) | 큰 데이터를 두 서버가 켜진 채 rsync 로 옮기고 짧게 전환(IP 교체·함정 목록) |
+| [ 회원 안내 전달](docs/ONBOARDING.md) | 초기 비밀번호·Paseo QR 전달 채널 — 화면·메일·1회 열람 링크·webhook·출력용 |
 | [ 메일](docs/MAIL.md) · [ SMB](docs/SMB.md) · [ n8n](docs/N8N.md) | 선택 모듈 안내 |
 | [ AI 관리자](docs/ADMIN-AGENT.md) · [`AGENTS.md`](AGENTS.md) | Claude Code·Codex 로 설치·운영 |
 | [ 로드맵](docs/ROADMAP.md) · [ 변경 내역](CHANGELOG.md) | 앞으로의 계획 · 버전별 변경 |

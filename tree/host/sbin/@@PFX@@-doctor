@@ -47,6 +47,21 @@ if has mail; then
       case "$p" in 404) pass "공개 주소로는 메일 웹훅이 막혀 있음";; 000|"") wrn "공개 주소 점검 불가(인증서 발급 전)";; *) fail "공개 주소로 메일 웹훅이 열려 있음($p)";; esac ;;
   esac
 fi
+# 회원 안내 전달 채널(ONBOARD_CHANNELS, 없으면 MAIL_MODE 에서 유도) — 어떤 채널이 문제여도 회원 등록은 끝나므로 «경고» 로만 알린다
+if [ -x "/usr/local/sbin/$PFX-onboard-deliver" ]; then
+  o=$("/usr/local/sbin/$PFX-onboard-deliver" --check 2>&1); rc=$?
+  [ -n "$o" ] && pass "회원 안내 전달 $(printf '%s\n' "$o" | head -1)"
+  [ "$rc" = 0 ] || printf '%s\n' "$o" | grep '^실패' | while IFS= read -r l; do wrn "전달 채널 — ${l#실패: } (docs/ONBOARDING.md)"; done
+  case " ${ONBOARD_CHANNELS:-} " in *" link "*)
+    grep -q "$PFX-link.caddy" /etc/caddy/Caddyfile 2>/dev/null && [ -s "/etc/caddy/$PFX-link.caddy" ] && pass "Caddy 에 /start/* 연결(1회 열람 링크)" || wrn "Caddy 에 /start/* 연결이 없음 — sudo python3 /opt/devmaru-kit/bin/devmaru-install --config $SITE --yes --only 50,53"
+    h=$(curl -ks -o /dev/null -m 10 -D - --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/start/$(head -c 32 /dev/urandom | base64 | tr -d '=+/\n' | head -c 43)" 2>/dev/null | tr -d '\r' || true)
+    case "$h" in
+      HTTP/*" 404"*) printf '%s' "$h" | grep -qi '^cache-control: *no-store' && printf '%s' "$h" | grep -qi '^referrer-policy: *no-referrer' && pass "공개 주소 /start/ 응답(404)·보안 헤더 확인" || wrn "공개 주소 /start/ 응답에 보안 헤더(Cache-Control·Referrer-Policy)가 없음";;
+      "") wrn "공개 주소 /start/ 점검 불가(인증서 발급 전이거나 DNS 가 이 서버를 가리키지 않음)";;
+      *) wrn "공개 주소 /start/ 응답이 예상과 다릅니다($(printf '%s' "$h" | head -1))";;
+    esac;;
+  esac
+fi
 if has smb; then
   TR=$(sed -n 's/^SMB_TRANSPORTS=//p' "$SITE" | tr -d "'\"" | head -1); TR=${TR:-quic:1443}
   systemctl is-active --quiet $PFX-samba-quic && pass "SMB 서비스($PFX-samba-quic, 전송 $TR)" || fail "SMB 서비스 중지됨(journalctl -u $PFX-samba-quic)"

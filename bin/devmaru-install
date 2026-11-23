@@ -29,12 +29,16 @@ QUESTIONS = [  # (키, 설명, 기본값 함수)
 OPTIONAL_VARS = {"N8N_WORKFLOWS": "none", "WORKSPACE_OTHERS": "none", "SHARED_DEFAULT": "rw", "GOLDEN_VOICE": "0", "GOLDEN_OFFICE": "1", "TLS_MODE": "acme", "SSH_PORT": "22", "SMB_TRANSPORTS": "quic:1443"}   # 설정 파일에서만 바꾸는 옵션(음성 모델 포함·사무 문서 도구 제외·인증서 방식 internal)
 OPTIONAL = ["n8n", "files", "kordoc", "markitdown", "crawl4ai", "ollama", "uptime-kuma", "cockpit", "backup", "mail", "smb", "agent"]
 DEPS = {"smb": ["files"]}   # 선택하면 같이 켜지는 모듈(mail 은 n8n 불필요 — MAIL_MODE=n8n 일 때만 n8n 이 같이 켜진다)
-MAIL_KEYS = ["MAIL_MODE", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY", "MAIL_SMTP_USER", "MAIL_FROM", "MAIL_SMTP_VERIFY", "MAIL_TEST_SEND"]   # 비밀 아님(site.env 에 기록). 비밀번호는 /etc/<접두어>/secrets/
+MAIL_KEYS = ["MAIL_MODE", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY", "MAIL_SMTP_USER", "MAIL_FROM", "MAIL_SMTP_VERIFY", "MAIL_TEST_SEND", "MAIL_LINK_ONLY"]   # 비밀 아님(site.env 에 기록). 비밀번호는 /etc/<접두어>/secrets/
+ETC = "/etc"   # 시험이 바꿀 수 있게 상수로 둔다
+ONBOARD_CHANNELS = ["screen", "smtp", "n8n", "link", "webhook", "print"]   # 회원 안내 전달 채널(docs/ONBOARDING.md)
+WEBHOOK_FORMATS = ["generic", "slack", "discord", "telegram"]
+ONBOARD_KEYS = ["ONBOARD_CHANNELS", "ONBOARD_LINK_TTL_HOURS", "ONBOARD_LINK_PORT", "ONBOARD_WEBHOOK_FORMAT", "ONBOARD_WEBHOOK_URL_FILE", "ONBOARD_WEBHOOK_TELEGRAM_FILE", "ONBOARD_WEBHOOK_ALLOW_HTTP", "ONBOARD_WEBHOOK_INCLUDE_LINK"]   # 비밀 아님(경로만). 주소·토큰은 /etc/<접두어>/secrets/
 DEFAULT_OPTIONAL = "n8n files kordoc markitdown crawl4ai backup"
 CORE = ["postgres", "caddy", "golden", "portal"]
 
 STAGE_TITLES = {"00": "사전 점검", "10": "패키지 설치", "20": "파일 배포·네트워크", "30": "설정·비밀 생성", "40": "서비스 기동", "45": "파일 서비스 연동", "47": "API 카탈로그", "48": "n8n 워크플로 템플릿",
-                "50": "웹 서버(Caddy) 설정", "52": "메일 자동 발송 연동", "55": "Cockpit 설정", "56": "SMB(QUIC) 설정", "58": "AI 에이전트 계정", "60": "Golden 이미지 빌드", "65": "관리형 MCP 의존성", "70": "포털 배치", "80": "백업 준비", "85": "주기 작업 켜기", "90": "최종 점검"}
+                "50": "웹 서버(Caddy) 설정", "52": "메일 자동 발송 연동", "53": "회원 안내 전달 채널", "55": "Cockpit 설정", "56": "SMB(QUIC) 설정", "58": "AI 에이전트 계정", "60": "Golden 이미지 빌드", "65": "관리형 MCP 의존성", "70": "포털 배치", "80": "백업 준비", "85": "주기 작업 켜기", "90": "최종 점검"}
 def title(s): return STAGE_TITLES.get(s[:2], s)
 
 def default_cidrs():
@@ -110,6 +114,8 @@ def checklist(v):
         mm = v.get("MAIL_MODE", "smtp")
         L.append(("메일", f"회원 등록 안내 메일을 SMTP 로 자동 발송합니다 — 설정은 /etc/{pfx}/secrets/smtp.env(root 만) · 시험 sudo {pfx}-notify-mail --test <주소> · 발송에 실패하면 회원 등록 화면에 초기 비밀번호가 표시됩니다 (docs/MAIL.md)" if mm == "smtp"
                   else f"MAIL_MODE={mm} — SMTP 직접 발송은 꺼져 있습니다. 켜려면 docs/MAIL.md"))
+    ch = v.get("ONBOARD_CHANNELS", "screen")
+    L.append(("회원 안내 전달", f"전달 채널: {ch} — 회원 등록 때 순서대로 시도하고 모두 실패해도 화면에 표시됩니다. 점검 sudo {pfx}-onboard-deliver --check" + (f" · 1회 열람 링크 https://{dom}/start/<토큰> (유효 {v.get('ONBOARD_LINK_TTL_HOURS', '24')}시간, DNS·443 필요, 관리 명령 sudo {pfx}-member-link)" if "link" in ch.split() else "") + " (docs/ONBOARDING.md)"))
     if "smb" in mods:
         tr = v.get("SMB_TRANSPORTS", "quic:1443")
         L.append(("SMB(네트워크 드라이브)", f"DNS 에 {h('SMB')} 가 이 서버를 가리켜야 하고 방화벽에서 전송 포트({tr})를 열어야 합니다 · Windows 11 24H2 이상에서 \\\\{h('SMB')}\\<회원ID> · 자체 서명 인증서(TLS_MODE=internal)면 /srv/{pfx}/samba/tls/cert.pem 을 클라이언트의 «신뢰할 수 있는 루트»에 등록 · 실제 Windows 접속은 설치기가 시험하지 못했습니다 (docs/SMB.md)"))
@@ -153,6 +159,13 @@ def finalize(v, skip_golden=False, interactive=False):
         for d in DEPS.get(m, []):
             if d not in mods: mods.append(d)
     v["MODULES"] = " ".join(mods)
+    chans = v.get("ONBOARD_CHANNELS", "").split()
+    if chans:   # 채널 목록이 있으면 메일 방식·mail 모듈은 거기서 정한다(없으면 아래에서 MAIL_MODE 로 정하고 채널을 유도)
+        bad = [c for c in chans if c not in ONBOARD_CHANNELS]
+        if bad: raise PlanError(f"ONBOARD_CHANNELS 에 알 수 없는 채널: {' '.join(bad)} (사용 가능: {' '.join(ONBOARD_CHANNELS)})")
+        if "smtp" in chans and "n8n" in chans: raise PlanError("전달 채널 smtp 와 n8n 은 둘 다 메일 방식이라 같이 쓸 수 없습니다")
+        v["MAIL_MODE"] = "smtp" if "smtp" in chans else "n8n" if "n8n" in chans else "none"
+        mods = [m for m in mods if m != "mail"] + (["mail"] if v["MAIL_MODE"] != "none" else [])
     mm = v.get("MAIL_MODE", "")
     if interactive and "mail" in mods and not mm:
         mm = ask("메일 발송 방식(smtp=서버가 SMTP 로 직접 보냄 · n8n=n8n 워크플로로 보냄)", "smtp")
@@ -163,7 +176,43 @@ def finalize(v, skip_golden=False, interactive=False):
     if mm == "n8n" and "n8n" not in mods: mods.append("n8n")
     v["MAIL_MODE"] = mm; v["MODULES"] = " ".join(mods)
     if mm == "smtp": check_mail(v, interactive)
+    if not chans: v["ONBOARD_CHANNELS"] = {"smtp": "smtp screen", "n8n": "n8n screen"}.get(mm, "screen")   # 하위 호환: MAIL_MODE 에서 유도
+    check_onboard(v, v["ONBOARD_CHANNELS"].split())
     return v
+
+def check_onboard(v, chans):
+    """전달 채널 설정 검증(link·webhook). 주소·토큰 값은 v 에만 두고 store_onboard_secrets 가 /etc/<접두어>/secrets/ 로 옮긴다."""
+    if "screen" not in chans and not any(c in chans for c in ("smtp", "n8n", "link", "print")):
+        v["ONBOARD_CHANNELS"] = " ".join(chans + ["screen"])   # 비밀을 전달하는 채널이 없으면 화면 표시를 보루로 둔다
+    if v.get("MAIL_LINK_ONLY", "0") not in ("0", "1"): raise PlanError("MAIL_LINK_ONLY 는 0 또는 1 입니다")
+    if v.get("MAIL_LINK_ONLY") == "1" and not ("smtp" in chans and "link" in chans): raise PlanError("MAIL_LINK_ONLY=1 은 smtp 와 link 채널이 모두 있어야 합니다")
+    if "link" in chans:
+        v.setdefault("ONBOARD_LINK_TTL_HOURS", "24"); v.setdefault("ONBOARD_LINK_PORT", "8431")
+        if not (v["ONBOARD_LINK_TTL_HOURS"].isdigit() and 1 <= int(v["ONBOARD_LINK_TTL_HOURS"]) <= 168): raise PlanError("ONBOARD_LINK_TTL_HOURS 는 1~168(시간) 정수입니다")
+        if not (v["ONBOARD_LINK_PORT"].isdigit() and 1024 <= int(v["ONBOARD_LINK_PORT"]) <= 65535): raise PlanError("ONBOARD_LINK_PORT 는 1024~65535 입니다")
+    if v.get("ONBOARD_WEBHOOK_INCLUDE_LINK", "0") not in ("0", "1"): raise PlanError("ONBOARD_WEBHOOK_INCLUDE_LINK 는 0 또는 1 입니다")
+    if v.get("ONBOARD_WEBHOOK_INCLUDE_LINK") == "1" and not ("webhook" in chans and "link" in chans): raise PlanError("ONBOARD_WEBHOOK_INCLUDE_LINK=1 은 webhook 과 link 채널이 모두 있어야 합니다(링크를 알림 채널 구성원 전원에게 보여 주는 설정입니다)")
+    if "webhook" in chans:
+        fmt = v.setdefault("ONBOARD_WEBHOOK_FORMAT", "generic")
+        if fmt not in WEBHOOK_FORMATS: raise PlanError(f"ONBOARD_WEBHOOK_FORMAT 은 {' · '.join(WEBHOOK_FORMATS)} 중 하나입니다")
+        sec = f"{ETC}/{v['PFX']}/secrets"
+        if fmt == "telegram":
+            have = (v.get("ONBOARD_WEBHOOK_TELEGRAM_BOT_TOKEN") and v.get("ONBOARD_WEBHOOK_TELEGRAM_CHAT_ID")) or v.get("ONBOARD_WEBHOOK_TELEGRAM_FILE") or os.path.exists(f"{sec}/onboard-telegram.env")
+            if not have: raise PlanError("webhook(telegram)에는 봇 토큰·chat id(ONBOARD_WEBHOOK_TELEGRAM_BOT_TOKEN · ONBOARD_WEBHOOK_TELEGRAM_CHAT_ID 또는 ONBOARD_WEBHOOK_TELEGRAM_FILE)가 필요합니다")
+        else:
+            url = webhook_url_input(v)
+            if url is None and not os.path.exists(f"{sec}/onboard-webhook-url"): raise PlanError("webhook 채널에는 주소(ONBOARD_WEBHOOK_URL 또는 ONBOARD_WEBHOOK_URL_FILE)가 필요합니다")
+            if url is not None and not (re.fullmatch(r"https://\S+", url) or (v.get("ONBOARD_WEBHOOK_ALLOW_HTTP") == "1" and re.fullmatch(r"http://\S+", url))):
+                raise PlanError("webhook 주소는 https:// 여야 합니다(내부 시험용 http 는 ONBOARD_WEBHOOK_ALLOW_HTTP=1 로 명시)")
+
+def webhook_url_input(v):
+    """입력된 webhook 주소(값 또는 파일). 없으면 None. 이미 비밀 폴더에 있는 파일이면 None(그대로 둠)."""
+    if v.get("ONBOARD_WEBHOOK_URL"): return v["ONBOARD_WEBHOOK_URL"].strip()
+    f = v.get("ONBOARD_WEBHOOK_URL_FILE", "")
+    if f and f != f"{ETC}/{v['PFX']}/secrets/onboard-webhook-url":
+        try: return open(f).read().strip().splitlines()[0]
+        except (OSError, IndexError): raise PlanError(f"ONBOARD_WEBHOOK_URL_FILE 을 읽을 수 없거나 비어 있습니다: {f}")
+    return None
 
 def check_mail(v, interactive):
     """mail 모듈: SMTP 설정이 있어야 한다(대화형이면 묻고, 아니면 오류). 비밀번호는 v["MAIL_SMTP_PASSWORD"] 로만 다룬다(site.env 에 쓰지 않는다)."""
@@ -199,7 +248,7 @@ def write_site(v, site):
     os.makedirs(os.path.dirname(site), exist_ok=True)
     with open(site, "w") as f:
         f.write(f"# {v['BRAND']} 설치 설정 — devmaru-install 이 만들었다. 비밀은 여기 없다.\n")
-        for k in [q[0] for q in QUESTIONS] + ["GID", "MODULES", "N8N_WORKFLOWS", "WORKSPACE_OTHERS", "SHARED_DEFAULT", "TLS_MODE", "GOLDEN_VOICE", "GOLDEN_OFFICE", "SSH_PORT", "SMB_TRANSPORTS", "AGENT_EXPIRES"] + MAIL_KEYS:
+        for k in [q[0] for q in QUESTIONS] + ["GID", "MODULES", "N8N_WORKFLOWS", "WORKSPACE_OTHERS", "SHARED_DEFAULT", "TLS_MODE", "GOLDEN_VOICE", "GOLDEN_OFFICE", "SSH_PORT", "SMB_TRANSPORTS", "AGENT_EXPIRES"] + MAIL_KEYS + ONBOARD_KEYS:
             if k in v: f.write(f"{k}={shlex.quote(str(v[k]))}\n")
     os.chmod(site, 0o644)
 
@@ -224,13 +273,35 @@ def store_mail_secret(v):
         except OSError as e: raise PlanError(f"MAIL_SMTP_PASSWORD_FILE 을 읽을 수 없습니다: {e}")
     v.pop("MAIL_SMTP_PASSWORD_FILE", None)
     if "mail" not in v.get("MODULES", "").split() or not pw: return
-    d = f"/etc/{v['PFX']}/secrets"; os.makedirs(d, mode=0o700, exist_ok=True)
+    d = f"{ETC}/{v['PFX']}/secrets"; os.makedirs(d, mode=0o700, exist_ok=True)
     fd = os.open(f"{d}/mail-smtp-password", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f: f.write(pw)
 
+def store_onboard_secrets(v):
+    """webhook 주소·텔레그램 토큰(입력값·파일)을 /etc/<접두어>/secrets/(0600)에만 둔다. 설정 파일·단계 환경에는 경로만 남긴다."""
+    url = webhook_url_input(v) if "webhook" in v.get("ONBOARD_CHANNELS", "").split() else None
+    tg = {k: v.pop(k, "") for k in ("ONBOARD_WEBHOOK_TELEGRAM_BOT_TOKEN", "ONBOARD_WEBHOOK_TELEGRAM_CHAT_ID")}
+    tgf = v.pop("ONBOARD_WEBHOOK_TELEGRAM_FILE", "")
+    v.pop("ONBOARD_WEBHOOK_URL", None); v.pop("ONBOARD_WEBHOOK_URL_FILE", None)
+    if "webhook" not in v.get("ONBOARD_CHANNELS", "").split(): return
+    d = f"{ETC}/{v['PFX']}/secrets"; os.makedirs(d, mode=0o700, exist_ok=True)
+    def put(name, text):
+        fd = os.open(f"{d}/{name}", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: f.write(text)
+        os.chmod(f"{d}/{name}", 0o600)
+    if v.get("ONBOARD_WEBHOOK_FORMAT") == "telegram":
+        if tgf:
+            try: put("onboard-telegram.env", open(tgf).read())
+            except OSError as e: raise PlanError(f"ONBOARD_WEBHOOK_TELEGRAM_FILE 을 읽을 수 없습니다: {e}")
+        elif tg["ONBOARD_WEBHOOK_TELEGRAM_BOT_TOKEN"]: put("onboard-telegram.env", f"TELEGRAM_BOT_TOKEN={tg['ONBOARD_WEBHOOK_TELEGRAM_BOT_TOKEN']}\nTELEGRAM_CHAT_ID={tg['ONBOARD_WEBHOOK_TELEGRAM_CHAT_ID']}\n")
+        v["ONBOARD_WEBHOOK_TELEGRAM_FILE"] = f"{d}/onboard-telegram.env"
+    else:
+        if url: put("onboard-webhook-url", url + "\n")
+        v["ONBOARD_WEBHOOK_URL_FILE"] = f"{d}/onboard-webhook-url"
+
 def execute(v, stages, resume, skip_dns, emit):
     """단계를 차례로 실행. 반환: 종료 코드(0 성공)."""
-    store_mail_secret(v)
+    store_mail_secret(v); store_onboard_secrets(v)
     env, site = make_env(v, skip_dns); pfx = v["PFX"]; write_site(v, site)
     st = State(pfx); logp = f"/var/log/{pfx}-install.log"; t_all = time.time(); n = len(stages)
     emit("plan", stages=[[s[:2], title(s)] for s in stages], site=site, log=logp)

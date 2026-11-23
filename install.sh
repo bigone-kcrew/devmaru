@@ -10,7 +10,7 @@ DEST=/opt/devmaru-kit
 if [ -n "${DEVMARU_LOCAL:-}" ]; then            # 시험용: 이미 받은 tarball 경로
   T="$DEVMARU_LOCAL"
 else
-  REF="${DEVMARU_REF:-1.3.0}"
+  REF="${DEVMARU_REF:-1.4.0}"
   # 배포처: github(기본) · gitlab — DEVMARU_SOURCE 로 고른다. DEVMARU_BASE(예전 방식, <기본주소>/<버전>/파일) 나 DEVMARU_URL 을 직접 지정하면 그대로 쓴다.
   if [ -n "${DEVMARU_BASE:-}" ]; then DEFAULT_URL="$DEVMARU_BASE/$REF/devmaru-kit-$REF.tar.gz"
   else

@@ -1,0 +1,48 @@
+[Unit]
+Description=@@BRAND@@ 회원 안내 1회 열람 링크 서비스(127.0.0.1 전용, 공개는 Caddy /start/*)
+After=network.target
+
+[Service]
+Type=simple
+User=@@PFX@@-link
+Group=@@PFX@@-link
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/@@PFX@@-link-server
+# 저장소는 /run(메모리) — 재부팅하면 사라지고 백업에 들어가지 않는다. 서비스를 다시 시작해도 남긴다.
+RuntimeDirectory=@@PFX@@-link
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 네트워크: 루프백 외 주소와는 통신하지 못한다(이 서비스는 127.0.0.1 에서 받기만 한다)
+IPAddressDeny=any
+IPAddressAllow=localhost
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

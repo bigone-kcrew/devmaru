@@ -46,6 +46,7 @@ touch "$LOG_FILE"
 chown root:@@PFX@@ "$LOG_FILE"
 chmod 640 "$LOG_FILE"
 
+exec 3>&1
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 SECRET_DIR="/run/@@PFX@@/member-secrets"
@@ -57,7 +58,7 @@ BOOTSTRAP_PASSWORD="$(
   python3 - <<'PY2'
 import secrets
 alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-print("".join(secrets.choice(alphabet) for _ in range(6)), end="")
+print("".join(secrets.choice(alphabet) for _ in range(12)), end="")
 PY2
 )"
 
@@ -297,53 +298,16 @@ CURRENT_STAGE="NOTIFY_ONBOARDING"
 echo
 echo "[8/8] Send onboarding notification..."
 
-N8N_WEBHOOK_URL="http://127.0.0.1:5678/webhook/@@PFX@@-member-onboarding"
-MAIL_MODE="$(sed -n 's/^MAIL_MODE=//p' /etc/@@PFX@@/site.env 2>/dev/null | tr -d "'\"" | head -1)"; MAIL_MODE="${MAIL_MODE:-none}"
-NOTIFY_ERR=""
-
-notify_member() {
-  case "$MAIL_MODE" in
-    smtp)
-      [[ -x /usr/local/sbin/@@PFX@@-notify-mail ]] || { NOTIFY_ERR="@@PFX@@-notify-mail 명령이 없습니다"; return 1; }
-      /usr/local/sbin/@@PFX@@-notify-mail send --user "$USERNAME" --email "$EMAIL" --password-file "$SECRET_FILE" >>"$LOG_FILE" 2>&1 \
-        || { NOTIFY_ERR="SMTP 로 메일을 보내지 못했습니다(원인은 $LOG_FILE)"; return 1; }
-      ;;
-    n8n)
-      local tok=/etc/@@PFX@@/secrets/onboarding-notify-token hdr payload rc
-      [[ -r "$tok" ]] || { NOTIFY_ERR="n8n 웹훅 토큰이 없습니다($tok) — sudo @@PFX@@-n8n-workflows install member-onboarding"; return 1; }
-      hdr="$(mktemp)"; chmod 600 "$hdr"; printf 'X-Onboarding-Token: %s\n' "$(cat "$tok")" > "$hdr"
-      payload="$(jq -nc --arg username "$USERNAME" --arg email "$EMAIL" --rawfile bootstrap_password "$SECRET_FILE" '{username:$username,email:$email,bootstrap_password:($bootstrap_password | rtrimstr("\n"))}')"
-      curl --fail --silent --show-error --max-time 20 -X POST "$N8N_WEBHOOK_URL" -H 'Content-Type: application/json' -H @"$hdr" --data-binary @- <<<"$payload" >>"$LOG_FILE" 2>&1; rc=$?
-      rm -f "$hdr"
-      (( rc == 0 )) || { NOTIFY_ERR="n8n 웹훅 호출에 실패했습니다(워크플로가 켜져 있는지 확인: sudo @@PFX@@-n8n-workflows list)"; return 1; }
-      ;;
-    *) NOTIFY_ERR="메일 자동 발송이 설정되어 있지 않습니다(MAIL_MODE=none)"; return 1 ;;
-  esac
-}
-
-if notify_member; then
-
-  rm -f "$SECRET_FILE"
-  echo "OK"
-
-  # n8n 워크플로(웹훅 즉시 응답형)가 pairing-url.txt·pairing.png 를 읽어 메일을 보낼 시간을 준 뒤
-  # 페어링 링크 파일을 지운다 — 링크가 멤버끼리 읽히는 폴더에 오래 남지 않게 한다. 링크는 같은
-  # 값으로 다시 만들 수 있다(@@PFX@@-paseo-pair-create · @@PFX@@-paseo-pair-qr-create).
-  if systemd-run --quiet --on-active=15min --unit="@@PFX@@-onboarding-seal-${USERNAME}" \
-       /opt/@@PFX@@/scripts/@@PFX@@-onboarding-seal "$USERNAME" >>"$LOG_FILE" 2>&1; then
-    echo "  페어링 링크 파일은 15분 뒤 자동 삭제된다(예약)"
-  else
-    echo "WARNING: 페어링 파일 삭제 예약에 실패했다 — 수동: sudo /opt/@@PFX@@/scripts/@@PFX@@-onboarding-seal ${USERNAME}"
-  fi
+# 전달 채널(docs/ONBOARDING.md): screen · smtp · n8n · link · webhook · print — 비밀은 fd 3(터미널)으로만 나가 로그에 남지 않는다
+if [[ -x /usr/local/sbin/@@PFX@@-onboard-deliver ]]; then
+  /usr/local/sbin/@@PFX@@-onboard-deliver deliver --user "$USERNAME" --email "$EMAIL" --password-file "$SECRET_FILE" --secret-fd 3 \
+    || echo "안내: 전달 채널을 실행하지 못했습니다 — 초기 비밀번호 파일(root 전용): $SECRET_FILE  (sudo @@PFX@@-onboard-deliver --check 로 점검)"
 else
-  echo "안내: ${NOTIFY_ERR} — 아래 정보를 회원에게 직접 전달하세요."
-  echo "  초기 비밀번호: $(cat "$SECRET_FILE")"
-  echo "  온보딩 파일  : /srv/@@PFX@@/onboarding/$USERNAME  (README.md · pairing-url.txt · pairing.png)"
-  echo "  전달한 뒤 파일 정리: sudo /opt/@@PFX@@/scripts/@@PFX@@-onboarding-seal $USERNAME  (초기 비밀번호 파일은 재부팅하면 사라집니다)"
+  echo "안내: @@PFX@@-onboard-deliver 명령이 없어 안내를 전달하지 못했습니다 — 초기 비밀번호 파일(root 전용): $SECRET_FILE"
 fi
 
-
 echo
+
 echo "================================="
 echo " Provisioning Complete"
 echo "================================="

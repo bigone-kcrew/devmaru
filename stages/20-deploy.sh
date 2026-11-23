@@ -16,7 +16,9 @@ getent group "$PFX" >/dev/null || groupadd --gid "$GID" "$PFX"
 [ "$(getent group "$PFX" | cut -d: -f3)" = "$GID" ] || { echo "실패: 그룹 $PFX 의 GID 가 $GID 가 아닙니다"; exit 1; }
 usermod -aG "$PFX" "$ADMIN_USER"
 echo "성공: 그룹 $PFX (gid $GID), $ADMIN_USER 추가"
-install -d -o root -g "$PFX" -m 2775 "$O" "$S" "$S/users" "$S/shared" "$S/public" "$S/services" "$S/onboarding"
+install -d -o root -g "$PFX" -m 2775 "$O" "$S" "$S/users" "$S/shared" "$S/public" "$S/services"
+# 온보딩 폴더: 그룹(회원 포함)이 쓸 수 없다 — 회원이 파일·심볼릭 링크를 심어 root 도구가 엉뚱한 파일을 읽거나 쓰게 하는 것을 막는다(0750, setgid 없음)
+install -d -o root -g "$PFX" -m 0750 "$S/onboarding"
 install -d -o root -g root -m 0755 "/etc/$PFX" "$S/admin-ops/site" "$S/admin-harness/bin" "$S/nvme" "$S/canary" "$S/public/portal" "$S/public/skills" "$S/public/tools" "$S/public/assets" "$O/config" "$O/config/env" "$O/images" "$O/compose" "$O/docs" "$O/tools"
 install -d -o root -g root -m 0700 "/etc/$PFX/secrets"
 cp_tree(){ [ -e "$R/$1" ] && { mkdir -p "$2"; rsync -a "$R/$1/" "$2/"; }; }

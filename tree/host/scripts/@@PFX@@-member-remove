@@ -114,6 +114,7 @@ echo "OK"
 
 echo "[5/7] Removing onboarding..."
 
+[[ -x /usr/local/sbin/@@PFX@@-member-link ]] && /usr/local/sbin/@@PFX@@-member-link revoke "$USERNAME" --quiet || true   # 1회 열람 링크 폐기
 rm -rf "$ONBOARDING_DIR"
 rm -f "$SECRET_FILE"
 

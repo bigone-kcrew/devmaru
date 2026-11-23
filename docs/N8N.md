@@ -29,6 +29,8 @@
 | `ops-notify` | 앱 만료 · 공개 종료 같은 **운영<br>알림**을 텔레그램으로 보냅니다 | `/webhook/<접두어>-ops-notify` | Telegram API 자격증명 · 채팅 ID |
 
 > **메일만 필요하다면 n8n 이 필요 없습니다.** `member-onboarding` 은 «메일을 n8n 으로 보내고 싶을 때(`MAIL_MODE=n8n`)»의 선택지입니다. 기본은 서버가 SMTP 로 직접 보냅니다. 자세한 내용은 [메일 가이드](MAIL.md)를 보세요.
+>
+> **메일 노드는 Gmail 노드(OAuth)가 아니라 «SMTP 자격증명»(Send Email 노드)을 쓰세요.** 템플릿 `member-onboarding` 은 SMTP 자격증명을 고르도록 되어 있습니다. Gmail 로 보내려면 Gmail 의 SMTP 주소와 앱 비밀번호를 SMTP 자격증명에 넣는 방식입니다(조건·한도는 [메일 가이드](MAIL.md)의 Gmail 항목). 전달 채널 전체는 [회원 안내 전달 가이드](ONBOARDING.md).
 
 ---
 

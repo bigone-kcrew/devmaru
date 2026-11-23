@@ -8,6 +8,43 @@
 
 ---
 
+## 1.4.0 — 2026-11-23 — 회원 안내 «전달 채널» · 1회 열람 링크 · webhook · 출력용 안내문
+
+> 회원 등록 때 초기 비밀번호·Paseo QR 을 전달하는 방식을 **채널 목록**(`ONBOARD_CHANNELS`)으로 일반화했습니다. **설정이 없으면 예전과 같이 동작**합니다(`MAIL_MODE` 에서 유도: none→화면 · smtp→메일 · n8n→n8n). 자세한 내용은 [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
+### ✨ 새로 생긴 것
+
+- 🔗 **`link` 채널 — 1회 열람 링크.** 링크를 열면 확인 화면만 나오고(GET 은 소비하지 않음 — 메신저·메일 보안 검사기가 먼저 열어도 안전), «열기»(POST·1회용 폼 토큰)를 눌러야 초기 비밀번호·QR 이 **한 번** 보입니다. 24시간(`ONBOARD_LINK_TTL_HOURS`)·1회 후 폐기, 토큰은 256비트·서버에는 sha256 해시만, IP 별 실패 제한, 엄격한 응답 헤더·CSP. 표준 라이브러리 파이썬 서비스(`<접두어>-link`, 전용 계정·127.0.0.1·systemd 하드닝), Caddy 는 `/start/*` 로 프록시. 관리 명령 `<접두어>-member-link issue|revoke|status|--check`.
+- 📣 **`webhook` 채널** — `generic`(JSON) · `slack` · `discord` · `telegram`. 비밀번호·QR·페어링 링크는 **싣지 않고**(회원 ID·생성 사실·링크 채널이 만든 1회 열람 링크만), https 만 허용, 주소·토큰은 `/etc/<접두어>/secrets/` 의 root 전용 파일.
+- 🖨 **`print` 채널** — 온보딩 폴더에 한 장짜리 출력용 안내문(`print.html`). `onboarding-seal` 이 지웁니다.
+- ✉ **`MAIL_LINK_ONLY=1`** — `smtp` + `link` 일 때 메일에 비밀번호·QR 대신 링크만 보냅니다.
+- 🧰 새 명령 `<접두어>-onboard-deliver`(채널 순회·`--check`·`--test-webhook`), 설치 단계 `53`(전달 채널 준비), 웹 설치 화면 «고급 설정» 의 채널 체크박스, `doctor` 의 전달 채널 점검.
+
+### 🔧 바뀐 것
+
+- 회원 등록(`member-add`)이 채널 목록을 순서대로 시도하고, 한 채널이 실패해도 다음을 계속합니다. 비밀을 전달한 채널이 없으면 화면 표시가 마지막 보루입니다. 비밀(초기 비밀번호·링크)은 터미널로만 나가고 **회원 등록 로그 파일에는 남지 않습니다**.
+- `onboarding-seal` 이 링크 폐기·초기 비밀번호 파일 삭제·`print.html` 삭제를 같이 하고, `member-remove` 가 링크를 폐기합니다.
+- 웹 설치 화면의 메일 항목은 «SMTP» 만 두었습니다(n8n 으로 보내기는 «고급 설정»).
+- Caddy 접근 로그가 `/start/` 뒤 경로(토큰)를 지웁니다.
+- 문서: [ONBOARDING.md](docs/ONBOARDING.md) 신설, [MAIL.md](docs/MAIL.md) 에 Gmail 등 외부 SMTP 안내, [N8N.md](docs/N8N.md) 에 «SMTP 자격증명» 안내.
+
+### 🔒 보안 보강 (독립 검토 반영)
+
+- 온보딩 폴더를 `0750 root:<접두어>`(그룹 쓰기 없음)로 만들고, 페어링 파일은 기본 `0600 root:root`(n8n 채널만 그룹 읽기). 읽기·쓰기는 `lstat`/`O_NOFOLLOW`/`fstat`(일반 파일·root 소유)로 확인하고 `print.html` 은 `O_EXCL` 로 만든 뒤 `fchown`/`fchmod`.
+- 메일 링크를 명령줄이 아니라 0600 임시 파일(`--link-file`)로 전달. 비밀을 명령줄·환경변수로 넘기는 호출이 없는지 전수 점검.
+- 링크 서비스: 요청 총 시간 15초·동시 연결 64 상한(초과 503)·비ASCII 입력도 400(바이트 비교)·정확히 `/start/<토큰>` 만 허용·`X-Forwarded-For` 대신 Caddy 가 덮어쓰는 `X-Onboard-Client-IP` 만 신뢰·안내 문구 구분(이미 열림/기간 지남/다시 열어 주세요)·systemd `IPAddressDeny=any`.
+- Caddy: `/start/*` 접근 로그 생략(`log_skip`)·로그 필터를 `(?i)(/+start/)[^?]*|\?.*` 로(기본 오류 로그에도 적용)·헤더 읽기 10초 제한.
+- webhook 에 링크를 싣는 것은 `ONBOARD_WEBHOOK_INCLUDE_LINK=1`(기본 0)일 때만. `--secret-fd` 가 열려 있지 않으면 표준 출력으로 돌리지 않고 실패. 이메일·ID 검증은 `fullmatch` 와 ASCII 문자 집합.
+- print.html 그룹 읽기는 관리자의 «개인 그룹»일 때만. link 를 끄면 남은 기록 삭제, 재발급 때 옛 봉인 예약 취소·새 예약.
+- **초기 비밀번호 6자 → 12자**(회원 등록 패치). 첫 로그인 전까지 SSH 비밀번호 인증이 열려 있어 6자(약 35비트)는 짧다는 검토 결과입니다.
+
+### ⚠ 알아 둘 것
+
+- 기존 설치를 업데이트한 뒤 `link` 를 켜려면 Caddy 설정을 다시 만들어야 합니다: `sudo python3 /opt/devmaru-kit/bin/devmaru-install --config /etc/<접두어>/site.env --yes --only 50,53`.
+- 이 버전의 새 채널은 실제 메일·메신저 발송, 실서버 설치, 공인 도메인 접근으로는 시험하지 못했습니다(자동 시험은 가짜 서버·가짜 root 기준).
+
+---
+
 ## 1.3.0 — 2026-11-22 — 원격 관리(fleet) · 라이브 서버 이관 · GitHub 배포
 
 > 이 버전부터 **GitHub 릴리스**에서 배포합니다(GitLab 저장소는 점검 중). 1.2.2 는 별도 릴리스 없이 이 버전에 포함됩니다.

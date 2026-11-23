@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# @@PFX@@-member-link (root) — 회원 안내 «1회 열람 링크» 관리(파이썬 표준 라이브러리만).
+#   @@PFX@@-member-link issue <ID> [--ttl-hours N]   링크 발급(재발급이면 이전 링크는 폐기). 토큰 원문은 이때 한 번만 출력된다
+#   @@PFX@@-member-link revoke <ID>                  그 회원의 링크 폐기
+#   @@PFX@@-member-link status [<ID>]                남은 링크 목록(토큰은 보여 주지 않는다 — 서버에도 해시만 있다)
+#   @@PFX@@-member-link --check                      서비스 기동·응답 헤더 점검
+# 링크는 초기 비밀번호 파일(/run/@@PFX@@/member-secrets/<ID>.password)이 있고 비밀번호가 아직 첫 로그인 변경 전일 때만 만든다.
+# 봉인(@@PFX@@-onboarding-seal)하면 그 파일이 지워지고 링크도 폐기된다 — 봉인한 회원에게는 재발급되지 않는다.
+import argparse, base64, hashlib, json, os, pwd, re, secrets, stat, subprocess, sys, time, urllib.error, urllib.request
+
+SITE = "/etc/@@PFX@@/site.env"
+STORE = "/run/@@PFX@@-link"
+SECRET_DIR = "/run/@@PFX@@/member-secrets"
+ONBOARD = "/srv/@@PFX@@/onboarding"
+LINK_USER = "@@PFX@@-link"
+SEAL = "/opt/@@PFX@@/scripts/@@PFX@@-onboarding-seal"
+ROOT_UID = 0   # 온보딩 폴더·파일은 root 소유여야 읽는다(회원이 심은 파일·심볼릭 링크로 root 가 다른 파일을 읽게 되는 것을 막는다)
+USER_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+
+def read_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1); v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"": v = v[1:-1]
+                out[k.strip()] = v
+    except OSError:
+        pass
+    return out
+
+def die(msg):
+    print("실패: " + msg, file=sys.stderr); sys.exit(1)
+
+def ttl_hours(env, override=None):
+    raw = str(override if override is not None else env.get("ONBOARD_LINK_TTL_HOURS", "24") or "24")
+    if not re.fullmatch(r"\d{1,3}", raw) or not 1 <= int(raw) <= 168: die("ONBOARD_LINK_TTL_HOURS 는 1~168(시간) 정수입니다")
+    return int(raw)
+
+def safe_read(d, name, cap=262144):
+    """온보딩 파일 읽기: 폴더는 root 소유·심볼릭 링크 아님(lstat), 파일은 O_NOFOLLOW 로 열어 fstat 가 «일반 파일·root 소유». 없으면 None, 위반이면 실패."""
+    try: ds = os.lstat(d)
+    except OSError: return None
+    if stat.S_ISLNK(ds.st_mode) or not stat.S_ISDIR(ds.st_mode) or ds.st_uid != ROOT_UID or ds.st_mode & 0o022:
+        die(f"온보딩 폴더가 안전하지 않습니다(root 소유가 아니거나 심볼릭 링크이거나 쓰기 권한이 넓음): {d}")
+    try: fd = os.open(os.path.join(d, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError: return None
+    except OSError as e: die(f"온보딩 파일을 열 수 없습니다({name}: {e.strerror}) — 심볼릭 링크일 수 있습니다")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != ROOT_UID: die(f"온보딩 파일이 일반 파일이 아니거나 root 소유가 아닙니다: {name}")
+        b = os.read(fd, cap + 1)
+    finally: os.close(fd)
+    return None if len(b) > cap else b
+
+def cancel_seal(user):
+    """이 회원의 옛 봉인 예약(타이머)을 멈춘다 — 옛 예약이 새 링크를 일찍 끝내지 않게."""
+    subprocess.run(["systemctl", "stop", f"@@PFX@@-onboarding-seal-{user}.timer", f"@@PFX@@-onboarding-seal-{user}-*.timer"], capture_output=True)
+
+def must_change(user):
+    """첫 로그인 비밀번호 변경 전인가(shadow 의 마지막 변경일 = 0, 회원 생성 때 chage -d 0)."""
+    try: out = subprocess.run(["getent", "shadow", user], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError): return False
+    f = out.split(":")
+    return len(f) > 2 and f[2] == "0"
+
+def records(user=None):
+    try: names = sorted(n for n in os.listdir(STORE) if n.endswith(".json"))
+    except OSError: return
+    for n in names:
+        p = os.path.join(STORE, n)
+        try: rec = json.load(open(p, encoding="utf-8"))
+        except (OSError, ValueError): continue
+        if user is None or rec.get("user") == user: yield p, rec
+
+def revoke(user):
+    n = 0
+    for p, _ in records(user):
+        try: os.unlink(p); n += 1
+        except OSError: pass
+    return n
+
+def ensure_store():
+    try: u = pwd.getpwnam(LINK_USER)
+    except KeyError: die(f"링크 서비스 계정({LINK_USER})이 없습니다 — 설치기의 53 단계를 실행하세요(docs/ONBOARDING.md)")
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    os.chown(STORE, u.pw_uid, u.pw_gid); os.chmod(STORE, 0o700)
+    return u
+
+def issue(user, env, ttl=None, machine=False):
+    if not USER_RE.fullmatch(user): die("회원 ID 형식이 올바르지 않습니다")
+    try: pwd.getpwnam(user)
+    except KeyError: die(f"회원 계정 {user} 이(가) 없습니다")
+    pf = os.path.join(SECRET_DIR, user + ".password")
+    try: password = open(pf, encoding="utf-8").read().rstrip("\r\n")
+    except OSError: password = ""
+    if not password:
+        die(f"{user} 의 초기 비밀번호 파일이 없습니다(봉인했거나 서버를 재부팅했거나 이미 정리됨). 비밀번호가 이미 바뀌었을 수 있어 옛 비밀번호 링크는 만들지 않습니다 — 새 비밀번호가 필요하면 관리자가 초기화한 뒤 직접 전달하세요")
+    if not must_change(user): die(f"{user} 은(는) 초기 비밀번호를 이미 바꾼 것으로 보여 링크를 만들지 않습니다")
+    hours = ttl_hours(env, ttl); u = ensure_store()
+    revoke(user)
+    token = secrets.token_urlsafe(32)                 # 256 비트
+    h = hashlib.sha256(token.encode()).hexdigest()    # 서버에는 해시만 둔다
+    d = os.path.join(ONBOARD, user)
+    url = (safe_read(d, "pairing-url.txt", 4096) or b"").decode("utf-8", "replace").strip().splitlines()
+    png = safe_read(d, "pairing.png")
+    ssh_port = env.get("SSH_PORT", "22")
+    payload = {"user": user, "password": password,
+               "ssh": f"ssh {user}@@@SSH_HOST@@" + ("" if ssh_port == "22" else f" -p {ssh_port}"),
+               "portal": "https://@@PORTAL_HOST@@/guide/",
+               "pairing_url": url[0] if url else "", "qr_png_b64": base64.b64encode(png).decode() if png else ""}
+    now = time.time()
+    rec = {"v": 1, "h": h, "user": user, "created": int(now), "exp": int(now + hours * 3600), "payload": payload}
+    tmp = os.path.join(STORE, f".{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchown(fh.fileno(), u.pw_uid, u.pw_gid); json.dump(rec, fh)   # 경로가 아니라 열린 파일(fd)에 chown
+    cancel_seal(user)
+    os.rename(tmp, os.path.join(STORE, h + ".json"))
+    link = f"https://@@DOMAIN@@/start/{token}"
+    if machine: print(link)
+    else:
+        sid = f"@@PFX@@-onboarding-seal-{user}-{int(now)}"   # 수동 재발급: 새 링크의 만료 시각에 맞춰 봉인을 다시 예약(고유 이름)
+        sr = subprocess.run(["systemd-run", "--quiet", f"--on-active={hours * 3600 + 60}s", f"--unit={sid}", SEAL, user], capture_output=True)
+        if sr.returncode: print(f"경고: 봉인 예약에 실패했습니다 — 전달 뒤 수동으로 sudo {SEAL} {user}")
+        print(f"성공: {user} 의 1회 열람 링크를 만들었습니다(유효 {hours}시간 · 한 번 열면 폐기 · 이 화면 밖에서는 다시 볼 수 없음)")
+        print(f"  {link}")
+        print("  링크를 열면 확인 화면이 먼저 나오고, «열기» 를 눌러야 초기 비밀번호·Paseo QR 이 한 번 보입니다.")
+    print(f"link={h[:8]} user={user} 만료={time.strftime('%F %T', time.localtime(rec['exp']))}", file=sys.stderr if machine else sys.stdout)
+
+def status(user, env):
+    rows = [(r["user"], r["h"][:8], int(r["exp"] - time.time())) for _, r in records(user)]
+    if not rows: print("링크 없음" + (f"({user})" if user else "")); return
+    for u, h, left in rows: print(f"{u}  link={h}  " + (f"남은 시간 {left // 3600}시간 {left % 3600 // 60}분" if left > 0 else "만료(곧 정리됨)"))
+
+def check(env):
+    port = env.get("ONBOARD_LINK_PORT", "8431") or "8431"; bad = 0
+    try: pwd.getpwnam(LINK_USER); print(f"성공: 서비스 계정 {LINK_USER}")
+    except KeyError: print(f"실패: 서비스 계정 {LINK_USER} 없음"); bad = 1
+    if subprocess.run(["systemctl", "is-active", "--quiet", "@@PFX@@-link.service"]).returncode == 0: print("성공: @@PFX@@-link.service 동작 중")
+    else: print("실패: @@PFX@@-link.service 가 동작하지 않습니다(journalctl -u @@PFX@@-link)"); bad = 1
+    probe = "/start/" + secrets.token_urlsafe(32)
+    try: urllib.request.urlopen(f"http://127.0.0.1:{port}{probe}", timeout=5)
+    except urllib.error.HTTPError as e:
+        hs = {k.lower(): v for k, v in e.headers.items()}
+        if e.code == 404 and hs.get("cache-control") == "no-store" and hs.get("referrer-policy") == "no-referrer": print("성공: 서비스 응답·보안 헤더 확인")
+        else: print(f"실패: 예상 밖 응답 {e.code}"); bad = 1
+    except Exception as e: print(f"실패: 서비스에 연결할 수 없습니다({type(e).__name__})"); bad = 1
+    sys.exit(bad)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", nargs="?", choices=["issue", "revoke", "status"]); ap.add_argument("user", nargs="?")
+    ap.add_argument("--ttl-hours"); ap.add_argument("--check", action="store_true")
+    ap.add_argument("--machine", action="store_true", help="발급 때 링크 URL 한 줄만 출력(다른 도구가 쓴다)")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    if os.geteuid() != 0: die("root 로 실행하세요(sudo)")
+    env = read_env(SITE)
+    if a.check: return check(env)
+    if not a.action: ap.error("issue · revoke · status 중 하나가 필요합니다")
+    if a.action == "status": return status(a.user, env)
+    if not a.user: ap.error("회원 ID 가 필요합니다")
+    if not USER_RE.fullmatch(a.user): die("회원 ID 형식이 올바르지 않습니다")
+    if a.action == "issue": return issue(a.user, env, a.ttl_hours, a.machine)
+    n = revoke(a.user)
+    if not a.quiet: print(f"성공: {a.user} 의 링크 {n}개를 폐기했습니다")
+
+if __name__ == "__main__":
+    main()

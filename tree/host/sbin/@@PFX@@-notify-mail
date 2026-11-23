@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # @@PFX@@-notify-mail (root) — 회원 등록 안내 메일을 SMTP 로 직접 보낸다(n8n 불필요, 파이썬 표준 라이브러리만).
 #   @@PFX@@-notify-mail send --user <ID> --email <주소> --password-file <파일>   등록 안내(초기 비밀번호는 파일에서만 읽는다)
+#   @@PFX@@-notify-mail send --user <ID> --email <주소> --link-file <파일>    비밀번호·QR 대신 1회 열람 링크만 보낸다(MAIL_LINK_ONLY=1). 링크는 명령줄(ps 에 보임)이 아니라 0600 파일로 받는다
 #   @@PFX@@-notify-mail --check                                          SMTP 연결·인증만 시험(메일은 보내지 않음)
 #   @@PFX@@-notify-mail --test <주소>                                    시험 메일 1통
 # 설정: /etc/@@PFX@@/secrets/smtp.env (0600) — SMTP_HOST SMTP_PORT SMTP_SECURITY(starttls|ssl|none) SMTP_USER SMTP_PASSWORD MAIL_FROM [SMTP_VERIFY=0]
@@ -11,8 +12,8 @@ from email.message import EmailMessage
 CONF = "/etc/@@PFX@@/secrets/smtp.env"
 SITE = "/etc/@@PFX@@/site.env"
 ONBOARD = "/srv/@@PFX@@/onboarding"
-USER_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
-ADDR_RE = re.compile(r"^[^\s@<>,;\"']+@[^\s@<>,;\"']+\.[^\s@<>,;\"']+$")
+USER_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+ADDR_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")   # 사용 전 fullmatch. 괄호·주석·따옴표·비ASCII 는 허용하지 않는다
 
 def read_env(path):
     out = {}
@@ -40,7 +41,7 @@ def load_conf():
         if not c.get(k): die(f"{CONF} 에 {k} 가 없습니다")
     c.setdefault("SMTP_PORT", "587"); c.setdefault("SMTP_SECURITY", "starttls")
     if c["SMTP_SECURITY"] not in ("starttls", "ssl", "none"): die("SMTP_SECURITY 는 starttls · ssl · none 중 하나입니다")
-    if not ADDR_RE.match(c["MAIL_FROM"]): die("MAIL_FROM 형식이 올바르지 않습니다")
+    if not ADDR_RE.fullmatch(c["MAIL_FROM"]): die("MAIL_FROM 형식이 올바르지 않습니다")
     return c
 
 def connect(c):
@@ -54,16 +55,28 @@ def connect(c):
     if c.get("SMTP_USER"): s.login(c["SMTP_USER"], c.get("SMTP_PASSWORD", ""))
     return s
 
-def deliver(c, msg):
+def deliver(c, msg, extra=()):
     pw = c.get("SMTP_PASSWORD", "")
     try:
         with connect(c) as s: s.send_message(msg)
     except Exception as e:   # 비밀번호가 들어갈 수 있는 모든 문자열에서 가린다
-        die(f"{type(e).__name__}: {e}", (pw,))
+        die(f"{type(e).__name__}: {e}", (pw,) + tuple(extra))
 
 def site_ssh():
     port = read_env(SITE).get("SSH_PORT", "22")
     return "ssh <ID>@@@SSH_HOST@@" + ("" if port == "22" else f" -p {port}")
+
+def link_message(c, user, email, link):
+    m = EmailMessage()
+    m["Subject"] = "[@@BRAND@@] 개발환경 계정이 만들어졌습니다"; m["From"] = c["MAIL_FROM"]; m["To"] = email
+    m.set_content(
+        f"안녕하세요, {user} 님.\n\n@@BRAND@@ 개발환경 계정이 만들어졌습니다. 초기 비밀번호와 접속 정보는 아래 링크에서 «한 번만» 볼 수 있습니다.\n\n"
+        f"{link}\n\n"
+        "- 링크를 열면 확인 화면이 나오고, «열기» 를 눌러야 내용이 보입니다. 한 번 열면 링크는 사라집니다.\n"
+        "- 기간이 지나면 열리지 않습니다. 열리지 않으면 관리자에게 새 링크를 요청하세요.\n"
+        "- 이 메일을 다른 사람에게 전달하지 마세요.\n\n"
+        "이 메일은 자동으로 발송되었습니다.\n")
+    return m
 
 def member_message(c, user, email, password):
     m = EmailMessage()
@@ -86,7 +99,7 @@ def member_message(c, user, email, password):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", nargs="?", choices=["send"]); ap.add_argument("--user"); ap.add_argument("--email"); ap.add_argument("--password-file")
+    ap.add_argument("action", nargs="?", choices=["send"]); ap.add_argument("--user"); ap.add_argument("--email"); ap.add_argument("--password-file"); ap.add_argument("--link-file")
     ap.add_argument("--check", action="store_true"); ap.add_argument("--test", metavar="주소")
     a = ap.parse_args()
     if os.geteuid() != 0: die("root 로 실행하세요(sudo)")
@@ -97,14 +110,19 @@ def main():
         except Exception as e: die(f"{type(e).__name__}: {e}", (pw,))
         print(f"성공: SMTP 연결·인증 확인({c['SMTP_HOST']}:{c['SMTP_PORT']}, {c['SMTP_SECURITY']})"); return
     if a.test:
-        if not ADDR_RE.match(a.test): die("받는 주소 형식이 올바르지 않습니다")
+        if not ADDR_RE.fullmatch(a.test): die("받는 주소 형식이 올바르지 않습니다")
         m = EmailMessage(); m["Subject"] = "[@@BRAND@@] 메일 발송 시험"; m["From"] = c["MAIL_FROM"]; m["To"] = a.test
         m.set_content("@@BRAND@@ 서버의 메일 발송 설정이 정상입니다. (자동 시험 메일)\n")
         deliver(c, m); print(f"성공: 시험 메일을 보냈습니다 → {a.test}"); return
     if a.action != "send": ap.error("send 또는 --check · --test 중 하나가 필요합니다")
-    if not (a.user and a.email and a.password_file): ap.error("send 에는 --user --email --password-file 이 모두 필요합니다")
-    if not USER_RE.match(a.user): die("회원 ID 형식이 올바르지 않습니다")
-    if not ADDR_RE.match(a.email): die("받는 주소 형식이 올바르지 않습니다")
+    if not (a.user and a.email and (a.password_file or a.link_file)): ap.error("send 에는 --user --email 과 --password-file(또는 --link-file)이 필요합니다")
+    if not USER_RE.fullmatch(a.user): die("회원 ID 형식이 올바르지 않습니다")
+    if not ADDR_RE.fullmatch(a.email): die("받는 주소 형식이 올바르지 않습니다")
+    if a.link_file:
+        try: link = open(a.link_file, encoding="utf-8").read().strip()
+        except OSError as e: die(f"링크 파일을 읽을 수 없습니다: {e.strerror}")
+        if not re.fullmatch(r"https://\S+", link): die("링크 형식이 올바르지 않습니다")
+        deliver(c, link_message(c, a.user, a.email, link), (link,)); print(f"성공: 링크 안내 메일을 보냈습니다 → {a.email}"); return
     try: password = open(a.password_file, encoding="utf-8").read().rstrip("\r\n")
     except OSError as e: die(f"초기 비밀번호 파일을 읽을 수 없습니다: {e.strerror}")
     if not password: die("초기 비밀번호 파일이 비어 있습니다")

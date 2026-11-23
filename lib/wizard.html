@@ -58,11 +58,23 @@ pre.cmd{background:var(--log);color:var(--logink);padding:10px 12px;border-radiu
       <label style="font-weight:400"><input type="checkbox" id="GOLDEN_OFFICE" checked> 사무 문서 도구 포함(LibreOffice·한글 글꼴, 약 +570MB — pptx·docx·xlsx 변환·확인)</label>
       <label for="N8N_WORKFLOWS">n8n 워크플로 템플릿 (n8n 설치 시)</label>
       <select id="N8N_WORKFLOWS"><option value="none">가져오지 않음(기본)</option><option value="generic">범용 템플릿 가져오기 — 회원 온보딩 메일·운영 알림(비활성 상태로)</option></select>
+      <label style="margin-top:18px">회원 안내 전달 방식 — 추가 채널 <span class="hint" style="font-weight:400">(회원 등록 때 초기 비밀번호·Paseo QR 을 어떻게 전달할지. 기본은 화면 표시이며, 어떤 채널이 실패해도 회원 등록은 끝나고 화면에 표시됩니다)</span></label>
+      <label style="font-weight:400"><input type="checkbox" id="c-link"> 1회 열람 링크 — 링크를 열면 비밀번호·QR 이 «한 번만» 보입니다(공개 도메인 443 필요)</label>
+      <div id="c-link-box" class="hide"><label for="c-ttl">링크 유효 시간(시간, 1~168)</label><input type="text" id="c-ttl" value="24">
+        <label style="font-weight:400" id="c-linkonly-l"><input type="checkbox" id="c-linkonly"> 메일을 켰다면, 메일에 비밀번호 대신 링크만 보냄</label></div>
+      <label style="font-weight:400"><input type="checkbox" id="c-webhook"> webhook 알림 — 회원 ID·«계정이 만들어짐»(+링크)만 보냅니다. 비밀번호·QR 은 보내지 않습니다</label>
+      <div id="c-webhook-box" class="hide"><label style="font-weight:400"><input type="checkbox" id="c-winc"> 알림에 1회 열람 링크도 포함(채널 구성원 전원이 링크를 열 수 있으니 비공개·소수 채널에서만 — 1회 열람 링크 사용 시)</label>
+        <label for="c-wfmt">형식</label><select id="c-wfmt"><option value="generic">일반(JSON)</option><option value="slack">Slack</option><option value="discord">Discord</option><option value="telegram">Telegram</option></select>
+        <div id="c-wurl"><label for="c-wurlv">webhook 주소(https://…)</label><input type="password" id="c-wurlv" autocomplete="off"></div>
+        <div id="c-wtg" class="hide"><label for="c-wtok">텔레그램 봇 토큰</label><input type="password" id="c-wtok" autocomplete="off"><label for="c-wchat">chat id</label><input type="text" id="c-wchat" autocomplete="off"></div>
+        <div class="hint">주소·토큰은 서버의 비밀 폴더(root 전용)에만 저장되고 설정 파일에는 쓰지 않습니다.</div></div>
+      <label style="font-weight:400"><input type="checkbox" id="c-print"> 출력용 안내문 — 대면 전달용 한 장(회원 ID·초기 비밀번호·접속 방법·QR)을 만듭니다</label>
+      <label style="font-weight:400"><input type="checkbox" id="c-n8n"> n8n 워크플로로 메일 보내기(n8n 이 같이 설치됨 — 위의 SMTP 직접 발송과는 같이 쓸 수 없음)</label>
     </details></div>
   <div class="card"><h2>2. 설치할 서비스</h2><div class="mods" id="mods"></div><p class="hint">필수 항목은 항상 설치됩니다.</p></div>
   <div class="card hide" id="mailcard"><h2>3. 메일 자동 발송 설정</h2>
     <p class="hint">회원을 등록하면 초기 비밀번호와 Paseo QR 을 메일로 보냅니다. 비밀번호는 서버의 비밀 폴더에만 저장되고 설정 파일에는 쓰지 않습니다.</p>
-    <label for="m-MODE">발송 방식</label><select id="m-MODE"><option value="smtp">SMTP 로 직접 보냄 (n8n 불필요)</option><option value="n8n">n8n 워크플로로 보냄 (n8n 이 같이 설치되고, 설치 뒤 n8n 화면에서 SMTP 자격증명을 고릅니다)</option></select>
+    <label for="m-MODE">발송 방식</label><select id="m-MODE"><option value="smtp">SMTP 로 직접 보냄 (n8n 불필요 — n8n 으로 보내려면 «고급 설정»)</option></select>
     <div id="m-smtp"><label for="m-HOST">SMTP 서버 주소</label><input type="text" id="m-HOST" placeholder="smtp.example.org">
     <label for="m-PORT">포트</label><input type="text" id="m-PORT" value="587">
     <label for="m-SEC">암호화</label><select id="m-SEC"><option value="starttls">STARTTLS (587)</option><option value="ssl">SSL/TLS (465)</option><option value="none">없음(내부 릴레이)</option></select>
@@ -91,7 +103,10 @@ const HINT={PFX:'명령·폴더·이미지 이름에 붙는 짧은 이름(소문
 let init=null,stageIdx={};
 async function api(p,b){const r=await fetch(p,b?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}:{});return r.json()}
 function form(){const values={};init.questions.forEach(q=>values[q.key]=$('#f-'+q.key).value.trim());values.TLS_MODE=$('#TLS_MODE').value;values.N8N_WORKFLOWS=$('#N8N_WORKFLOWS').value;values.WORKSPACE_OTHERS=$('#WORKSPACE_OTHERS').value;values.SHARED_DEFAULT=$('#SHARED_DEFAULT').value;values.GOLDEN_VOICE=$('#GOLDEN_VOICE').checked?'1':'0';values.GOLDEN_OFFICE=$('#GOLDEN_OFFICE').checked?'1':'0';
-  if($('#mods input[value=mail]').checked){values.MAIL_MODE=$('#m-MODE').value;if(values.MAIL_MODE==='smtp'){values.MAIL_SMTP_HOST=$('#m-HOST').value.trim();values.MAIL_SMTP_PORT=$('#m-PORT').value.trim();values.MAIL_SMTP_SECURITY=$('#m-SEC').value;values.MAIL_SMTP_USER=$('#m-USER').value.trim();values.MAIL_SMTP_PASSWORD=$('#m-PW').value;values.MAIL_FROM=$('#m-FROM').value.trim()}}
+  const ch=[],mailOn=$('#mods input[value=mail]').checked;if(mailOn)ch.push('smtp');if($('#c-n8n').checked)ch.push('n8n');if($('#c-link').checked)ch.push('link');if($('#c-webhook').checked)ch.push('webhook');if($('#c-print').checked)ch.push('print');ch.push('screen');values.ONBOARD_CHANNELS=ch.join(' ');
+  if($('#c-link').checked){values.ONBOARD_LINK_TTL_HOURS=$('#c-ttl').value.trim();if(mailOn&&$('#c-linkonly').checked)values.MAIL_LINK_ONLY='1'}
+  if($('#c-webhook').checked){const f=values.ONBOARD_WEBHOOK_FORMAT=$('#c-wfmt').value;if($('#c-winc').checked)values.ONBOARD_WEBHOOK_INCLUDE_LINK='1';if(f==='telegram'){values.ONBOARD_WEBHOOK_TELEGRAM_BOT_TOKEN=$('#c-wtok').value.trim();values.ONBOARD_WEBHOOK_TELEGRAM_CHAT_ID=$('#c-wchat').value.trim()}else values.ONBOARD_WEBHOOK_URL=$('#c-wurlv').value.trim()}
+  if(mailOn){values.MAIL_MODE=$('#m-MODE').value;if(values.MAIL_MODE==='smtp'){values.MAIL_SMTP_HOST=$('#m-HOST').value.trim();values.MAIL_SMTP_PORT=$('#m-PORT').value.trim();values.MAIL_SMTP_SECURITY=$('#m-SEC').value;values.MAIL_SMTP_USER=$('#m-USER').value.trim();values.MAIL_SMTP_PASSWORD=$('#m-PW').value;values.MAIL_FROM=$('#m-FROM').value.trim()}}
   const modules=[...document.querySelectorAll('#mods input')].filter(i=>i.checked).map(i=>i.value);return{values,modules}}
 (async()=>{init=await api('/api/init');
   $('#qs').innerHTML=init.questions.map(q=>`<label for="f-${q.key}">${esc(q.label)}</label><input type="text" id="f-${q.key}" value="${esc(q.default)}">${HINT[q.key]?`<div class="hint">${esc(HINT[q.key])}</div>`:''}`).join('');
@@ -100,6 +115,8 @@ function form(){const values={};init.questions.forEach(q=>values[q.key]=$('#f-'+
   $('#f-PFX').addEventListener('input',()=>{if(!touched.BRAND){const v=$('#f-PFX').value;$('#f-BRAND').value=v?v.charAt(0).toUpperCase()+v.slice(1):''}});
   $('#f-DOMAIN').addEventListener('input',()=>{if(!touched.ADMIN_EMAIL)$('#f-ADMIN_EMAIL').value='admin@'+$('#f-DOMAIN').value.trim()});
   $('#m-MODE').addEventListener('change',()=>$('#m-smtp').classList.toggle('hide',$('#m-MODE').value!=='smtp'));
+  const tg=(id,box)=>$(id).addEventListener('change',()=>$(box).classList.toggle('hide',!$(id).checked));tg('#c-link','#c-link-box');tg('#c-webhook','#c-webhook-box');
+  $('#c-wfmt').addEventListener('change',()=>{const t=$('#c-wfmt').value==='telegram';$('#c-wtg').classList.toggle('hide',!t);$('#c-wurl').classList.toggle('hide',t)});
   const mailBox=$('#mods input[value=mail]');if(mailBox)mailBox.addEventListener('change',()=>$('#mailcard').classList.toggle('hide',!mailBox.checked));
   if(init.state==='running'){go(true)}})();
 $('#btn-plan').onclick=async()=>{$('#err').textContent='';const f=form();f.modules=[...new Set([...init.modules.filter(m=>m.required).map(m=>m.name),...f.modules])];

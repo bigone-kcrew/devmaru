@@ -9,6 +9,7 @@
 | 하는 일 | 대표 명령 |
 |---|---|
 | [회원 추가 · 삭제 · 상태](#1-회원-관리) | `<접두어>-member-add` · `member-remove` · `member-status` |
+| [회원 안내 전달 채널](ONBOARDING.md) | `<접두어>-onboard-deliver --check` · `<접두어>-member-link` |
 | [회원 DB](#2-회원-db) | `<접두어>-member-db-setup` |
 | [웹 공개 관리](#3-웹-공개-관리) | `<접두어>-site-caddy` |
 | [업데이트](#4-업데이트) | `<접두어>-update` · `member-update-all` · `service-update` |
@@ -31,7 +32,7 @@ sudo <접두어>-member-add alice --email alice@example.org
 한 번에 다음이 만들어집니다.
 
 - 리눅스 계정 · 회원 전용 폴더(`/srv/<접두어>/users/alice`) · 개발 컨테이너(`dev-alice`)
-- 초기 비밀번호(6자리) — 첫 로그인에서 바꾸도록 설정됩니다
+- 초기 비밀번호(12자, 헷갈리는 문자 제외) — 첫 로그인에서 바꾸도록 설정됩니다. 첫 로그인 전까지는 SSH 비밀번호 인증이 열려 있어 짧은 비밀번호는 추측 위험이 있으므로 12자로 했습니다(복사·붙여넣기로 전달하는 것이 기본)
 - Paseo 페어링 QR · 링크, 온보딩 안내 파일
 - 회원 전용 PostgreSQL DB와 접속 정보(`~/.pgpass`)
 - `alice.<도메인>` 웹 공개 블록(Caddy)
@@ -44,6 +45,8 @@ sudo <접두어>-member-add alice --email alice@example.org
 > 메일 자동 발송을 설정했다면 회원에게 메일로 갑니다.
 >
 > 설정하지 않았다면 등록이 끝날 때 **화면에 한 번 표시**됩니다. 회원에게 안전한 방법(메신저 금지)으로 전달하세요.
+>
+> **전달 채널**(`ONBOARD_CHANNELS`)로 메일 · **1회 열람 링크** · webhook 알림 · 출력용 안내문도 고를 수 있습니다. 링크 재발급은 `sudo <접두어>-member-link issue <ID>`(봉인했거나 비밀번호가 이미 바뀐 회원은 거부). 자세한 내용은 [회원 안내 전달 가이드](ONBOARDING.md).
 >
 > 전달이 끝나면 임시 파일을 정리합니다.
 
