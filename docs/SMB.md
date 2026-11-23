@@ -9,7 +9,7 @@
 > **먼저 알아 둘 것**
 >
 > - 이 모듈은 리눅스 **커널 QUIC 모듈을 설치 서버에서 직접 빌드**(DKMS)합니다.
-> - 설치기는 DKMS 빌드와 Samba 서비스 구성까지 시험했습니다. 그러나 **실제 Windows 11 클라이언트로 QUIC 접속하는 시험은 하지 못했습니다.** 연결 명령은 운영 서버에서 확인된 방법을 그대로 적었습니다.
+> - 설치기는 DKMS 빌드와 Samba 서비스 구성까지 시험했습니다. 서버 쪽은 임시 Samba 서버와 Linux 클라이언트로 QUIC 접속·인증·읽기/쓰기까지 시험했고, **Windows 11 PC 1대에서 연결과 재부팅 뒤 자동 재연결을 확인했습니다.** 다른 PC·Windows 빌드는 확인하지 못했습니다.
 > - **Secure Boot 가 켜진 서버**에서는 DKMS 서명 키를 한 번 등록해야 합니다(아래 «Secure Boot» 절).
 
 ---
@@ -61,13 +61,15 @@
 
 ## Windows 11 에서 연결하기
 
-PowerShell 에서 계정 정보를 준비합니다. 비밀번호는 **SSH 비밀번호와 같습니다.**
+일반(비관리자) PowerShell 에서 합니다. 비밀번호는 **SSH 비밀번호와 같습니다.**
+
+**1. 비밀번호를 한 번 저장합니다.** 입력창이 뜨고, 저장해 두면 **재부팅해도 다시 묻지 않습니다.**
 
 ```powershell
-$cred = Get-Credential -UserName '<ID>'
+cmdkey /add:smb.<도메인> /user:<ID> /pass
 ```
 
-내 개인 폴더를 `X:` 로 연결합니다.
+**2. 내 개인 폴더를 연결합니다.** 이미 쓰는 드라이브 문자라면 다른 문자(예: `L:`)로 바꾸세요.
 
 ```powershell
 New-SmbMapping `
@@ -75,11 +77,10 @@ New-SmbMapping `
   -RemotePath '\\smb.<도메인>\<ID>' `
   -TransportType QUIC `
   -QuicPort 1443 `
-  -Credential $cred `
   -Persistent $true
 ```
 
-공용 폴더를 `Y:` 로 연결합니다.
+**3. (선택) 공용 폴더를 연결합니다.**
 
 ```powershell
 New-SmbMapping `
@@ -87,13 +88,19 @@ New-SmbMapping `
   -RemotePath '\\smb.<도메인>\shared' `
   -TransportType QUIC `
   -QuicPort 1443 `
-  -Credential $cred `
   -Persistent $true
 ```
 
 연결 끊기: `Remove-SmbMapping -LocalPath 'X:' -Force`
 
-> 명령은 성공했는데 탐색기 «내 PC» 에 안 보이면 탐색기를 다시 시작하세요: `taskkill /f /im explorer.exe` → `start explorer.exe`
+> **확인한 범위:** 외부 Windows 11 PC 1대에서 위 순서로 연결하고, 재부팅한 뒤 비밀번호 입력 없이 다시 연결되는 것까지 확인했습니다. 다른 PC 에서 문제가 있으면 오류 문구와 함께 알려 주세요.
+
+- **재부팅 직후 «연결 끊김»(탐색기 빨간 X)** 으로 보일 수 있습니다. 드라이브를 한 번 열면 다시 연결됩니다(`Get-SmbMapping` 으로 상태 확인).
+- **비밀번호를 바꾼 뒤**에는 PC 에 저장된 값이 낡아 연결이 실패합니다. 1번 `cmdkey` 명령을 다시 실행하세요.
+- **명령에 `-SaveCredentials` 를 넣지 마세요.** `-Persistent $true` 와 함께 쓰면 «매개 변수가 틀립니다» 가 납니다. 비밀번호 저장은 1번의 `cmdkey` 로 합니다. `-Credential` 을 직접 넘기는 방식은 연결은 되지만 비밀번호가 저장되지 않아 재부팅 뒤 다시 묻습니다.
+- **«로컬 장치 이름에 저장된 다른 네트워크 리소스에 대한 연결이 있습니다»** — 이미 쓰는 드라이브 문자입니다. 다른 문자로 바꾸세요.
+- **«네트워크 경로를 찾지 못했습니다»** — 한 번 나왔다가 다시 하면 되는 경우가 있었습니다(원인 미확인). 계속 나오면 UDP 1443 이 막힌 망인지 확인하세요.
+- 명령은 성공했는데 탐색기 «내 PC» 에 안 보이면 탐색기를 다시 시작하세요: `taskkill /f /im explorer.exe` → `start explorer.exe`
 
 ### 자체 서명 인증서를 쓰는 경우 (`TLS_MODE=internal`)
 

@@ -8,6 +8,18 @@
 
 ---
 
+## 1.4.2 — 2026-11-24 — SMB 안내 문서: 재부팅해도 유지되는 Windows 연결
+
+> 코드 변경 없이 [SMB 가이드](docs/SMB.md) 의 Windows 연결 방법만 고쳤습니다.
+
+### 🔧 바뀐 것
+
+- Windows 11 연결 절차를 **`cmdkey` 로 비밀번호를 한 번 저장한 뒤 `New-SmbMapping -Persistent $true`**(`-Credential` 없이)로 바꿨습니다. 이전 예(`-Credential $cred -Persistent $true`)는 연결은 되지만 비밀번호가 저장되지 않아 재부팅 때마다 다시 물었습니다.
+- 알려진 오류와 대처를 적었습니다: `-SaveCredentials` 를 `-Persistent` 와 함께 쓰면 «매개 변수가 틀립니다» · 이미 쓰는 드라이브 문자 · 재부팅 직후 «연결 끊김» 표시 · 비밀번호를 바꾼 뒤 `cmdkey` 재등록.
+- 확인한 범위를 적었습니다: 외부 Windows 11 PC 1대에서 연결과 재부팅 뒤 자동 재연결, 서버 쪽은 임시 Samba 서버와 Linux 클라이언트로 QUIC 접속·인증·읽기/쓰기. 다른 PC·Windows 빌드는 확인하지 못했습니다.
+
+---
+
 ## 1.4.1 — 2026-11-23 — `onboarding-seal` 명령이 PATH 에 없던 문제
 
 ### 🐛 고친 것
