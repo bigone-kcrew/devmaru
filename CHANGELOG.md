@@ -8,12 +8,22 @@
 
 ---
 
+## 1.4.6 — 2026-11-26 — tmux 트루컬러 해제 방법 정정
+
+> 코드·설정 변경 없이 1.4.5 변경 내역의 안내 한 줄을 바로잡았습니다.
+
+### 🐛 고친 것
+
+- 1.4.5 변경 내역이 «색이 어긋나면 `/etc/tmux.conf` 의 두 줄을 지우면 된다» 고 안내했지만, `/etc/tmux.conf` 는 이미지에 들어 있는 파일이라 멤버가 바꿀 수 없고 이미지를 교체하면 되돌아옵니다. **올바른 방법:** 멤버가 홈의 `~/.tmux.conf` 에 `set -s -u terminal-features` 한 줄을 적으면 이미지가 선언한 RGB 항목(과 tmux 기본 기능 목록의 추가분)이 취소되어, 이전처럼 클라이언트가 `COLORTERM=truecolor` 를 넘길 때만 트루컬러가 켜집니다. tmux 는 `/etc/tmux.conf` 다음에 `~/.tmux.conf` 를 읽으며(이미지에서 시험으로 확인), 적은 뒤에는 tmux 를 새로 열거나 `tmux source-file ~/.tmux.conf` 를 실행하세요. 이미지 자체를 바꾸려는 운영자는 `/opt/<접두어>/images/dev/tmux.conf` 의 `terminal-features` 두 줄을 지우고 이미지를 다시 만듭니다.
+
+---
+
 ## 1.4.5 — 2026-11-26 — tmux 트루컬러(24비트 색)
 
 ### ✨ 새로 생긴 것
 
 - **개발환경 이미지의 tmux 가 24비트 색(트루컬러)을 항상 씁니다.** 이전에는 접속하는 터미널이 `COLORTERM=truecolor` 를 넘길 때만 켜져서, 그것을 넘기지 않는 클라이언트(앱 터미널·일부 SSH 클라이언트)에서는 256색까지만 보였습니다. 이제 `/etc/tmux.conf` 가 `xterm*`(xterm-256color 등)과 `tmux*`(tmux 안의 tmux) 터미널에 RGB 기능을 선언하고 `default-terminal` 을 `tmux-256color` 로 명시합니다.
-- 확인: tmux 3.6(Ubuntu 패키지 3.6a)에서 `COLORTERM` 없이 `TERM=xterm-256color` 로 접속해도 클라이언트 기능에 RGB 가 잡히는 것을 확인했습니다(`TERM=screen-256color`·`linux` 는 RGB 를 선언하지 않습니다). 24비트 색을 지원하지 않는 터미널에서는 색이 어긋날 수 있고, 그 경우 `/etc/tmux.conf` 의 `terminal-features` 두 줄을 지우면 됩니다.
+- 확인: tmux 3.6(Ubuntu 패키지 3.6a)에서 `COLORTERM` 없이 `TERM=xterm-256color` 로 접속해도 클라이언트 기능에 RGB 가 잡히는 것을 확인했습니다(`TERM=screen-256color`·`linux` 는 RGB 를 선언하지 않습니다). 24비트 색을 지원하지 않는 터미널에서는 색이 어긋날 수 있고, 그 경우 멤버가 홈의 `~/.tmux.conf` 에 `set -s -u terminal-features` 한 줄을 적으면 됩니다(1.4.6 에서 정정 — 아래 참고).
 - 이미 만들어 둔 이미지에는 적용되지 않습니다 — **이미지를 다시 만드는 릴리스(`golden`)부터** 적용됩니다.
 
 ---
