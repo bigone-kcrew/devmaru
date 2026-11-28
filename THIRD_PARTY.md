@@ -67,6 +67,7 @@
 | [MarkItDown](https://github.com/microsoft/markitdown) | PyPI 버전 고정 | 각 라이선스 | 문서 → Markdown |
 | [Crawl4AI](https://github.com/unclecode/crawl4ai) | Docker 이미지 태그 | 각 라이선스 | 웹 수집 |
 | [public-apis-4Kr](https://github.com/yybmion/public-apis-4Kr) | 설치 때 최신 목록 | 각 라이선스 | 공개 API 목록 |
+| [Pretendard](https://github.com/orioncactus/pretendard) | 글꼴 파일(부분 집합) 포함 | SIL OFL 1.1 | 웹 관리 화면 글꼴(`<접두어>-ui` 폴더에 라이선스 사본 동봉 — 웹 관리 화면·회원 안내 페이지가 함께 씀) |
 
 ---
 

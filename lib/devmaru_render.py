@@ -3,7 +3,7 @@ import os, re, shutil, subprocess, sys
 
 PFX_RE = re.compile(r"[a-z][a-z0-9]{1,11}")
 RESERVED = {"root", "admin", "sudo", "docker", "ubuntu", "dev", "user", "users", "system", "caddy", "ssh", "web", "app", "api", "db", "n8n", "mcp", "bin", "etc", "opt", "srv", "var", "tmp", "home", "snap", "lib", "usr"}
-HOST_LABELS = "FILES N8N API MCP SKILLS STATUS UPTIME COCKPIT SSH SMB".split()
+HOST_LABELS = "FILES N8N API MCP SKILLS STATUS UPTIME COCKPIT SSH SMB ADMIN".split()
 TOK = re.compile(r"@@([A-Z0-9_]+)@@")
 
 def check_prefix(p):

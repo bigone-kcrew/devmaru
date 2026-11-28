@@ -15,6 +15,11 @@ fi
 
 USERNAME="$1"
 
+if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
+  echo "ERROR: invalid username: $USERNAME"
+  exit 1
+fi
+
 CONTAINER_NAME="dev-${USERNAME}"
 USER_HOME="/home/${USERNAME}"
 ONBOARDING_DIR="/srv/@@PFX@@/onboarding/${USERNAME}"

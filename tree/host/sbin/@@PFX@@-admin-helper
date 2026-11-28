@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+# @@PFX@@-admin-helper — 웹 관리 화면의 root 도우미(T3). 표준 라이브러리만. systemd 유닛이 `python3 -I` 로 부른다.
+# 무엇을: 유닉스 소켓으로 «한 줄 JSON 요청 → 한 줄 JSON 응답» 을 받는다(연결 하나에 요청 하나). 인증(PAM+TOTP)·세션·step-up·
+#         로그인 실패 제한·감사를 이 프로세스가 맡고, 웹은 판단 없이 중계만 한다(설계서 §A.1 B안). 프로토콜: design/admin-helper-protocol.md
+# 보안 가정(root 로 도는 데몬):
+#  - 환경변수로 동작을 바꾸지 않는다(읽지 않는다). 모든 경로·허용 uid 는 명령행 인자(유닛 파일이 고정).
+#  - 연결마다 SO_PEERCRED 로 상대 uid 를 확인하고, 허용 uid 가 아니면 읽지도 응답하지도 않고 끊는다.
+#  - 비밀번호·TOTP 코드·복구 코드·세션 ID 전체는 로그·감사·오류·stdout/stderr 어디에도 쓰지 않는다(세션은 해시 앞 8자 sid8 만).
+#  - 불러오는 모듈·실행하는 도구는 «소유자 = 실행 사용자, 그룹·기타 쓰기 금지, 심볼릭 링크 아님» 일 때만 쓴다.
+#  - 시계는 모듈 안의 clock() 하나뿐이다(시험이 같은 프로세스에서 바꿀 수 있고, 명령행으로는 바꿀 수 없다).
+#  - --pam-module / --allow-test-hooks 는 시험 전용이다. 운영 유닛에 넣지 말 것(root 데몬이 임의 모듈을 import 하게 된다).
+import sys; sys.dont_write_bytecode = True
+import argparse, fcntl, grp, hashlib, importlib.util, ipaddress, json, os, re, secrets, select, signal, socket, stat, struct, subprocess, threading, time
+from dataclasses import dataclass, field
+from typing import Callable
+
+MAX_MSG = 65536                       # 요청 한 줄 상한(바이트, 개행 제외)
+MAX_RESULT = 1 << 20                  # 외부 도구 출력 상한
+IDLE_SECS, ABS_SECS, MAX_SESSIONS = 30 * 60, 8 * 3600, 3      # 설계서 §B.3
+STEPUP_TTL, STEPUP_MAX_FAILS = 120, 3
+IP_LIMIT, IP_WINDOW, IP_LOCK = 5, 900, 900                    # §B.4 (IP 축: 15분 5회 → 15분 차단) — 설계서는 5회, 창·잠금 시간은 설계서 값
+ACCT_LIMIT, ACCT_WINDOW, ACCT_LOCK = 20, 3600, 1800           # §B.4 (계정 축: 1시간 20회 → 30분 잠금)
+JOB_LOG_MAX, JOB_SECRET_MAX = 64 * 1024, 4096     # job 진행 로그(메모리) 상한 / fd 3 비밀 상한
+JOB_SECRET_TTL, JOB_KEEP, JOB_KEEP_SECS, JOB_TIMEOUT = 600, 20, 3600, 1200   # 비밀 10분 · 끝난 job 20개·1시간 · 실행 20분 제한
+MLIST_TTL = 60                        # member.list 캐시(초) — 도구 파일이 바뀌거나 회원 등록이 끝나면 즉시 버린다
+AUDIT_BUDGET = 60                     # 인증 전 거부 기록은 분당 이 수까지(디스크 채우기 방지)
+
+JOB_RE = re.compile(r"[A-Za-z0-9_-]{22}")
+OP_RE = re.compile(r"[a-z][a-z0-9_.]{0,47}")
+SID_RE = re.compile(r"[A-Za-z0-9_-]{43}")          # token_urlsafe(32) 의 길이
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+CODE_RE = re.compile(r"[0-9]{6}|[A-Za-z0-9-]{12,16}")   # TOTP 6자리 또는 복구 코드(xxxx-xxxx-xxxx)
+TOTP_RE = re.compile(r"[0-9]{6}")
+VIAS = ("public", "lan", "local")
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+JOB_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")      # job 로그에서 지울 제어문자(개행·탭 제외)
+TOOL_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+
+MSGS = {
+    "bad_request": "요청 형식이 올바르지 않습니다", "auth_failed": "인증 실패", "blocked": "로그인 시도가 너무 많습니다. 잠시 후 다시 시도하세요",
+    "no_session": "로그인이 필요합니다", "stepup_required": "추가 인증(TOTP)이 필요합니다", "stepup_failed": "추가 인증에 실패했습니다",
+    "unknown_op": "알 수 없는 작업입니다", "tool_missing": "도구를 찾을 수 없습니다", "tool_failed": "도구 실행에 실패했습니다",
+    "busy": "다른 작업이 실행 중입니다", "busy_conn": "연결이 너무 많습니다", "totp_not_enrolled": "TOTP 가 등록되지 않았습니다",
+    "internal_error": "내부 오류",
+    "bad_id": "회원 ID 는 영문 소문자로 시작하고 소문자·숫자만 써서 2~32자여야 합니다", "reserved_id": "예약된 ID 라서 회원 ID 로 쓸 수 없습니다",
+    "bad_email": "이메일 주소 형식이 올바르지 않습니다", "not_found": "작업을 찾을 수 없습니다",
+    "no_secret": "표시할 비밀이 없습니다(이미 확인했거나 10분이 지났습니다)",
+    "no_member": "해당 회원을 찾을 수 없습니다", "link_failed": "안내 링크를 만들지 못했습니다",
+}
+
+def clock():
+    return time.time()
+
+def mono():
+    return time.monotonic()
+
+class OpError(Exception):
+    def __init__(self, code, **extra):
+        super().__init__(code); self.code, self.extra = code, extra
+
+def dumps(o):
+    return json.dumps(o, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+def err_body(code, **extra):
+    return dict({"ok": False, "error": code, "msg": MSGS[code]}, **extra)
+
+# ── 신뢰 검사: 불러오기·실행 전에 파일·폴더가 안전한지 ──
+def _owner_ok(st):
+    return st.st_uid == (0 if os.geteuid() == 0 else os.geteuid()) and not (st.st_mode & 0o022)
+
+def trusted_file(path, need_exec=False):
+    st = os.lstat(path)       # 없으면 FileNotFoundError
+    if not stat.S_ISREG(st.st_mode) or not _owner_ok(st) or (need_exec and not st.st_mode & 0o100):
+        raise PermissionError("신뢰할 수 없는 파일")
+    d = os.lstat(os.path.dirname(os.path.abspath(path)))
+    if not stat.S_ISDIR(d.st_mode) or not _owner_ok(d): raise PermissionError("신뢰할 수 없는 폴더")
+
+def load_module(name, path):
+    trusted_file(path)
+    spec = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    return m
+
+# ── 요청 검증 ──
+def _nodup(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d: raise ValueError("duplicate key")
+        d[k] = v
+    return d
+
+def _bad_const(_): raise ValueError("bad constant")
+
+def parse_line(line):
+    """바이트 한 줄 → dict. 형식 위반은 OpError(bad_request). UTF-8 은 엄격하게."""
+    try:
+        obj = json.loads(line.decode("utf-8"), object_pairs_hook=_nodup, parse_constant=_bad_const)
+    except (UnicodeDecodeError, ValueError, RecursionError, MemoryError):
+        raise OpError("bad_request")
+    if type(obj) is not dict: raise OpError("bad_request")
+    return obj
+
+@dataclass
+class Arg:
+    type: type = str
+    rx: object = None          # 컴파일된 정규식(fullmatch 로만 쓴다)
+    required: bool = True
+    secret: bool = False       # 비밀: 제어문자 검사 완화(비밀번호), 감사에 남기지 않음
+
+def check_args(schema, args):
+    if type(args) is not dict or len(args) > 16: raise OpError("bad_request")
+    if set(args) - set(schema): raise OpError("bad_request")
+    clean = {}
+    for k, spec in schema.items():
+        if k not in args:
+            if spec.required: raise OpError("bad_request")
+            continue
+        v = args[k]
+        if type(v) is not spec.type: raise OpError("bad_request")
+        if spec.type is str:
+            try: v.encode("utf-8")          # 외톨이 대리쌍 거부
+            except UnicodeEncodeError: raise OpError("bad_request")
+            if len(v) > 1024 or "\x00" in v or (not spec.secret and CTRL_RE.search(v)): raise OpError("bad_request")
+            if spec.rx is not None and not spec.rx.fullmatch(v): raise OpError("bad_request")
+        elif spec.type is int and not -(2**31) <= v < 2**31: raise OpError("bad_request")
+        clean[k] = v
+    return clean
+
+# ── 로그인 실패 제한 ──
+class Limiter:
+    """키별 실패 시각 목록 + 진행 중 시도 수. 진행 중 시도도 한도에 넣어 동시에 쏜 요청이 한도를 넘지 못하게 한다."""
+    def __init__(self, limit, window, lock, clear_on_ok):
+        self.limit, self.window, self.lock, self.clear_on_ok, self.d = limit, window, lock, clear_on_ok, {}
+    def _e(self, k, now):
+        if len(self.d) > 10000:   # ponytail: 메모리 상한 — 잠금·진행 중이 아닌 항목을 모두 버린다(활성 공격자의 실패 이력은 잠깐 잊힘)
+            self.d = {a: b for a, b in self.d.items() if b["until"] > now or b["n"]}
+        e = self.d.setdefault(k, {"f": [], "until": 0, "n": 0})
+        e["f"] = [t for t in e["f"] if now - t < self.window]
+        return e
+    def admit(self, k, now):
+        """0 이면 통과(진행 중 +1). 아니면 기다릴 초."""
+        e = self._e(k, now)
+        if e["until"] > now: return int(e["until"] - now) + 1
+        if len(e["f"]) + e["n"] >= self.limit: return 1
+        e["n"] += 1; return 0
+    def release(self, k): self.d[k]["n"] -= 1
+    def done(self, k, now, ok):
+        """결과 반영. 새로 잠겼으면 True."""
+        e = self._e(k, now); e["n"] = max(0, e["n"] - 1)
+        if ok:
+            if self.clear_on_ok: e["f"] = []
+            return False
+        e["f"].append(now)
+        if len(e["f"]) >= self.limit: e["until"], e["f"] = now + self.lock, []; return True
+        return False
+
+# ── op 표 ──
+@dataclass
+class OpSpec:
+    handler: Callable
+    args: dict = field(default_factory=dict)
+    session: bool = True       # 세션 필요
+    stepup: bool = False       # 새 TOTP 코드(step-up 표식) 필요 — 실행 때 소비된다
+    heavy: bool = False        # «무거운» op: 한 번에 하나(다른 것이 돌면 busy)
+    event: object = "op"       # 일반 감사 이벤트 이름. None 이면 핸들러가 직접 기록(내장 op)
+
+OPS = {}   # 이후 작업(T6~T17)이 여기에 항목을 추가한다. 이름 → OpSpec
+
+class Core:
+    def __init__(self, cfg, common, pam_auth):
+        self.cfg, self.common, self.pam = cfg, common, pam_auth
+        self.lock = threading.RLock()          # 세션·실패 카운터·TOTP 파일 갱신
+        self.heavy = threading.Lock()
+        self.sessions = {}                     # sha256(sid) → 세션
+        self.ip_lim = Limiter(IP_LIMIT, IP_WINDOW, IP_LOCK, True)
+        self.acct_lim = Limiter(ACCT_LIMIT, ACCT_WINDOW, ACCT_LOCK, False)
+        self.budget = [0, 0]                   # [분 번호, 이번 분 기록 수]
+        self.ops = dict(OPS)
+        self.mlock, self.mcache = threading.Lock(), None       # member.list 캐시: (도구 파일 지문, 만료 mono 시각, 정리된 데이터)
+        self.jobs, self.running, self.queue = {}, None, []      # job(메모리만): id → dict · 실행 중 id · 대기 id(최대 1)
+
+    # 감사 ───────────────────────────────────────────
+    def audit(self, ev, critical=False, throttle=False):
+        """critical 이면 기록 실패 때 예외(기록 없이는 행동하지 않는다). 아니면 실패해도 진행(stderr 에 고정 문구만)."""
+        if throttle:
+            m = int(mono() // 60)
+            with self.lock:
+                if self.budget[0] != m: self.budget = [m, 0]
+                self.budget[1] += 1
+                if self.budget[1] > AUDIT_BUDGET + 1: return
+                if self.budget[1] == AUDIT_BUDGET + 1: ev = {"event": "audit_throttled"}
+        try: self.common.audit_write(self.cfg.audit_log, ev, mode=0o640)
+        except Exception:
+            print("감사 기록 실패", file=sys.stderr, flush=True)
+            if critical: raise
+
+    # 세션 ───────────────────────────────────────────
+    @staticmethod
+    def _h(sid): return hashlib.sha256(sid.encode("ascii")).hexdigest()
+
+    def _fp(self):
+        """현재 TOTP 비밀의 지문. 재등록(totp-reset)하면 바뀌어 기존 세션이 모두 죽는다. 읽을 수 없으면 None."""
+        try: return hashlib.sha256(self.common.load_totp_file(self.cfg.totp_file)["secret"].encode()).hexdigest()[:16]
+        except Exception: return None
+
+    def _drop(self, h, reason):
+        s = self.sessions.pop(h, None)
+        if s: self.audit({"event": "session_end", "user": s["user"], "sid8": s["sid8"], "src_ip": s["src_ip"], "via": s["via"], "reason": reason})
+
+    def session_get(self, sid, via, now):
+        if not isinstance(sid, str) or not SID_RE.fullmatch(sid): return None
+        h = self._h(sid)
+        with self.lock:
+            s = self.sessions.get(h)
+            if s is None: return None
+            fp = self._fp()
+            why = ("abs" if now - s["created"] >= ABS_SECS else "idle" if now - s["last"] >= IDLE_SECS else
+                   "via" if s["via"] != via else "totp_reset" if fp is None or fp != s["fp"] else None)
+            if why: self._drop(h, why); return None
+            s["last"] = now
+            return s
+
+    def session_new(self, user, src_ip, via, now, fp):
+        sid = secrets.token_urlsafe(32); h = self._h(sid)
+        with self.lock:
+            while len(self.sessions) >= MAX_SESSIONS: self._drop(min(self.sessions, key=lambda k: self.sessions[k]["created"]), "evicted")
+            self.sessions[h] = {"user": user, "src_ip": src_ip, "via": via, "created": now, "last": now, "fp": fp, "sid8": h[:8], "stepup": 0, "su_fails": 0}
+        return sid, self.sessions[h]
+
+    # 요청 처리 ──────────────────────────────────────
+    def handle(self, obj):
+        """검증된 JSON 객체 → 응답 dict. 예외는 모두 오류 응답으로 바꾼다."""
+        ctx = None
+        try:
+            ctx = self._ctx(obj)
+            spec = self.ops.get(ctx["op"])
+            if spec is not None and not spec.session:
+                return {"ok": True, "result": spec.handler(self, ctx, check_args(spec.args, ctx["args"]))}
+            sess = self.session_get(ctx["sid"], ctx["via"], clock())
+            if sess is None: raise OpError("no_session")
+            ctx["sess"], ctx["sid8"] = sess, sess["sid8"]
+            if spec is None: raise OpError("unknown_op")
+            args = check_args(spec.args, ctx["args"])
+            return {"ok": True, "result": self._run(spec, ctx, args)}
+        except OpError as e:
+            if e.code in ("no_session", "unknown_op", "bad_request"):
+                self.audit({"event": "op_denied", "op": (ctx or {}).get("op"), "src_ip": (ctx or {}).get("src_ip"), "via": (ctx or {}).get("via"),
+                            "sid8": (ctx or {}).get("sid8"), "reason": e.code}, throttle=True)
+            elif e.code in ("stepup_required", "busy"):
+                self.audit({"event": "op_denied", "op": ctx["op"], "sid8": ctx.get("sid8"), "src_ip": ctx["src_ip"], "via": ctx["via"], "user": self.cfg.admin_user, "reason": e.code})
+            return err_body(e.code, **e.extra)
+        except Exception as e:     # 상세(메시지)는 비밀이 섞일 수 있어 형식 이름만 남긴다
+            self.audit({"event": "internal_error", "op": (ctx or {}).get("op"), "reason": type(e).__name__}, throttle=True)
+            return err_body("internal_error")
+
+    def _ctx(self, o):
+        if set(o) - {"op", "sid", "args", "src_ip", "via"} or not {"op", "src_ip", "via"} <= set(o): raise OpError("bad_request")
+        op, ip, via = o["op"], o["src_ip"], o["via"]
+        if not (type(op) is str and OP_RE.fullmatch(op) and type(via) is str and via in VIAS and type(ip) is str and len(ip) <= 45 and "%" not in ip): raise OpError("bad_request")
+        try: ip = ipaddress.ip_address(ip).compressed
+        except ValueError: raise OpError("bad_request")
+        sid = o.get("sid")
+        if "sid" in o and type(sid) is not str: raise OpError("bad_request")
+        args = o.get("args", {})
+        if type(args) is not dict: raise OpError("bad_request")
+        return {"op": op, "sid": sid, "args": args, "src_ip": ip, "via": via, "sess": None, "sid8": None}
+
+    def _run(self, spec, ctx, args):
+        got_heavy = False
+        try:
+            if spec.heavy:
+                if not self.heavy.acquire(blocking=False): raise OpError("busy")
+                got_heavy = True
+            if spec.stepup:
+                with self.lock:
+                    if ctx["sess"]["stepup"] <= clock(): raise OpError("stepup_required")
+                    ctx["sess"]["stepup"] = 0      # 한 번 쓰면 소비
+            t0 = mono()
+            try: result = spec.handler(self, ctx, args)
+            except OpError as e:
+                if spec.event: self._op_audit(spec, ctx, args, "fail", t0, e.code)
+                raise
+            if spec.event: self._op_audit(spec, ctx, args, "ok", t0, None)
+            return result
+        finally:
+            if got_heavy: self.heavy.release()
+
+    def _op_audit(self, spec, ctx, args, result, t0, reason):
+        a = {k: v for k, v in args.items() if not spec.args[k].secret and type(v) in (str, int, bool)}
+        self.audit({"event": spec.event, "user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"],
+                    "op": ctx["op"], "args": a, "result": result, "reason": reason, "dur": mono() - t0}, critical=True)
+
+    # 인증 ───────────────────────────────────────────
+    def _check_code(self, tot, code, now):
+        """-> (ok, 새 TOTP 파일 내용 or None). 6자리면 TOTP, 아니면 복구 코드."""
+        c = self.common
+        if TOTP_RE.fullmatch(code):
+            ok, step = c.totp_verify(tot["secret"], code, now, int(tot.get("last_step", 0)))
+            return ok, (dict(tot, last_step=step) if ok else None)
+        i = c.verify_recovery(code, tot["recovery"])
+        return (True, dict(tot, recovery=[h for j, h in enumerate(tot["recovery"]) if j != i])) if i is not None else (False, None)
+
+    def _save_tot(self, tot):
+        self.common.dump_totp_file(self.cfg.totp_file, tot["secret"], tot["recovery"], tot.get("last_step", 0))
+
+    def op_login(self, ctx, a):
+        t0, now, ip, user = mono(), clock(), ctx["src_ip"], a["user"]
+        who = self.cfg.admin_user if user == self.cfg.admin_user else "-"    # 임의 입력(비밀번호를 사용자 칸에 쓴 경우 등)은 기록하지 않는다
+        base = {"user": who, "src_ip": ip, "via": ctx["via"]}
+        try: self.common.load_totp_file(self.cfg.totp_file)
+        except FileNotFoundError: raise OpError("totp_not_enrolled")
+        with self.lock:
+            wait = self.ip_lim.admit(ip, now)
+            if not wait:
+                wait = self.acct_lim.admit("account", now)
+                if wait: self.ip_lim.release(ip)
+        if wait:
+            raise OpError("blocked", retry_after=wait)      # PAM 을 부르지 않는다
+        ok = False; sid = None
+        try:
+            pam_ok = user == self.cfg.admin_user and self.pam(user, a["password"], self.cfg.pam_service) is True
+            with self.lock:
+                tot = self.common.load_totp_file(self.cfg.totp_file)
+                code_ok, new = self._check_code(tot, a["code"], now)     # PAM 결과와 무관하게 항상 검사(시간·응답 차이 줄임)
+                if pam_ok and code_ok:
+                    self._save_tot(new)
+                    old = self.sessions.get(self._h(ctx["sid"])) if isinstance(ctx["sid"], str) and SID_RE.fullmatch(ctx["sid"]) else None
+                    if old: self._drop(self._h(ctx["sid"]), "relogin")
+                    sid, s = self.session_new(user, ip, ctx["via"], now, hashlib.sha256(tot["secret"].encode()).hexdigest()[:16])
+                    ok = True
+        except Exception as e:
+            self.audit(dict(base, event="internal_error", op="login", reason=type(e).__name__))
+            raise OpError("internal_error")
+        finally:
+            with self.lock:
+                l1 = self.ip_lim.done(ip, now, ok); l2 = self.acct_lim.done("account", now, ok)
+            if l1: self.audit(dict(base, event="lockout", reason="ip"))
+            if l2: self.audit(dict(base, event="lockout", reason="account"))
+        if not ok:
+            self.audit(dict(base, event="login_fail", reason="auth"))
+            time.sleep(max(0.0, self.cfg.fail_delay - (mono() - t0)))          # 고정 지연
+            raise OpError("auth_failed")
+        try: self.audit(dict(base, event="login_ok", sid8=s["sid8"], dur=mono() - t0), critical=True)
+        except Exception:
+            with self.lock: self.sessions.pop(self._h(sid), None)      # 기록 없이는 세션을 내주지 않는다
+            raise OpError("internal_error")
+        return {"sid": sid, "idle_timeout": IDLE_SECS, "abs_timeout": ABS_SECS}
+
+    def op_logout(self, ctx, a):
+        self.audit({"event": "logout", "user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"]})
+        with self.lock: self.sessions.pop(self._h(ctx["sid"]), None)
+        return {}
+
+    def op_check(self, ctx, a):
+        s, now = ctx["sess"], clock()
+        return {"user": s["user"], "via": s["via"], "idle_remaining": IDLE_SECS,      # 방금 이 요청으로 유휴 시계가 새로 시작됐다
+                "abs_remaining": max(0, int(ABS_SECS - (now - s["created"]))), "stepup_remaining": max(0, int(s["stepup"] - now))}
+
+    def op_stepup(self, ctx, a):
+        s, now = ctx["sess"], clock()
+        base = {"user": s["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"]}
+        with self.lock:
+            tot = self.common.load_totp_file(self.cfg.totp_file)
+            ok, new = self._check_code(tot, a["code"], now)     # step-up 에 복구 코드는 쓸 수 없다(스키마가 6자리만 받음)
+            if ok:
+                self._save_tot(new); s["stepup"], s["su_fails"] = now + STEPUP_TTL, 0
+                self.audit(dict(base, event="stepup_ok"), critical=True)
+                return {"stepup_ttl": STEPUP_TTL}
+            s["su_fails"] += 1
+            ended = s["su_fails"] >= STEPUP_MAX_FAILS
+            self.audit(dict(base, event="stepup_fail", reason="code"))
+            if ended: self._drop(self._h(ctx["sid"]), "stepup_fails")
+        raise OpError("stepup_failed", session_ended=ended)
+
+    # member.list ─────────────────────────────────────
+    def _clean_members(self, d):
+        """이메일은 형식을 검증해 그대로 통과, 그 밖의 모든 문자열은 mask() 를 거친다. 형식이 틀리면 거부."""
+        c = self.common
+        def walk(v, key=None):
+            if isinstance(v, dict): return {k: walk(x, k) for k, x in v.items()}
+            if isinstance(v, list): return [walk(x) for x in v]
+            if key == "email" and v is not None:
+                if type(v) is not str or not c.valid_email(v): raise ValueError("email")
+                return v
+            return c.mask(v) if type(v) is str else v
+        return walk(d)
+
+    def _tool_ok(self, p):
+        try: trusted_file(p, need_exec=True)
+        except FileNotFoundError: raise OpError("tool_missing")
+        except PermissionError: raise OpError("tool_failed")      # 쓰기 가능한 도구는 root 로 실행하지 않는다
+
+    def _tool(self, p, args, timeout=60):
+        """고정 argv(shell=False·고정 환경·stdin=/dev/null) 외부 도구 -> (rc, stdout, stderr 문자열). 출력 상한 초과·시간 초과·실행 실패는 tool_failed."""
+        self._tool_ok(p)
+        try: r = subprocess.run([p] + list(args), shell=False, env=TOOL_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", timeout=timeout)
+        except (OSError, subprocess.SubprocessError): raise OpError("tool_failed")
+        if len(r.stdout) + len(r.stderr) > MAX_RESULT: raise OpError("tool_failed")
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+    def _text(self, s, n=600):
+        """도구 출력을 사람이 읽을 짧은 문구로: 마스킹·제어문자 제거·길이 제한."""
+        return JOB_CTRL_RE.sub("", self.common.mask(s.strip()))[:n]
+
+    def _members(self):
+        """member-list 결과(정리됨). 60초 캐시 — 도구 파일(inode·mtime·크기)이 바뀌면 버린다. 실패는 캐시하지 않고 옛 값도 내지 않는다."""
+        p = self.cfg.member_list; self._tool_ok(p)
+        st = os.stat(p); key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        with self.mlock:
+            c = self.mcache
+            if c is not None and c[0] == key and mono() < c[1]: return c[2]
+            self.mcache = None
+            try:
+                r = subprocess.run([p], shell=False, env=TOOL_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/", timeout=30)
+                if r.returncode != 0 or len(r.stdout) > MAX_RESULT: raise OpError("tool_failed")
+                data = self._clean_members(json.loads(r.stdout.decode("utf-8")))
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                raise OpError("tool_failed")
+            self.mcache = (key, mono() + MLIST_TTL, data)
+            return data
+
+    def op_member_list(self, ctx, a):
+        return {"data": self._members()}
+
+    def _member(self, id_):
+        """존재하는 회원(member-list 에 있는 ID)만 통과. 형식이 틀리면 bad_id, 없으면 no_member."""
+        if not self.common.valid_user_id(id_): raise OpError("bad_id")
+        d = self._members(); rows = d.get("members") if isinstance(d, dict) else None
+        for m in rows if isinstance(rows, list) else []:
+            if isinstance(m, dict) and m.get("id") == id_: return m
+        raise OpError("no_member")
+
+    def op_member_detail(self, ctx, a):
+        return {"member": self._member(a["id"])}
+
+    def op_member_tool(self, ctx, a, path, args, text):
+        """회원 한 명에게 도구 한 번(링크 상태·폐기·봉인·페어링 갱신). text=True 면 마스킹한 출력 문구를 돌려준다(페어링은 출력을 내보내지 않는다 — URL 은 영구 자격증명)."""
+        id_ = a["id"]; self._member(id_)
+        rc, out, err = self._tool(path, [x.replace("{id}", id_) for x in args])
+        if rc != 0: raise OpError("tool_failed", **({"detail": self._text(out + "\n" + err)} if text else {}))
+        return {"text": self._text(out)} if text else {"done": True}
+
+    def op_link_issue(self, ctx, a):
+        """안내 링크 발급: 출력 전체(stdout)가 비밀 — 메모리 job 에 두고 job.secret 으로 «한 번만» 보여 준다. 감사·로그에는 «issued» 만."""
+        id_ = a["id"]; self._member(id_)
+        who = {"user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"], "op": "member.link.issue", "args": {"id": id_}}
+        t0 = mono(); rc, out, err = self._tool(self.cfg.member_link, ["issue", id_, "--machine"])
+        link = out.strip().splitlines()[0].strip() if out.strip() else ""
+        if rc == 0 and not (1 <= len(link) <= 256 and link.isprintable() and link.startswith("https://")): rc = -1
+        if rc != 0:
+            self.audit(dict(who, event="op", result="fail", reason="refused", dur=mono() - t0), critical=True)
+            raise OpError("link_failed", detail=self._text(err) if rc > 0 else "")
+        with self.lock:
+            self.jobs_gc(); jid = secrets.token_urlsafe(16)
+            self.audit(dict(who, event="job_end", job=jid, rc=0, result="issued", dur=mono() - t0), critical=True)
+            self.jobs[jid] = {"id": jid, "id_": id_, "email": None, "state": "done", "log": ["안내 링크를 발급했습니다. 링크는 한 번만 표시됩니다.\n"], "size": 0, "cut": False, "buf": b"",
+                              "rc": 0, "why": None, "secret": link, "finished": clock(), "user": ctx["sess"]["user"], "kind": "link", "t0": t0}
+        return {"job": jid}
+
+    # member.add job ───────────────────────────────────
+    def _maint_busy(self):
+        """정비 락(<pfx>-maintenance 와 같은 파일·같은 방식)이 잡혀 있으면 True. 파일이 없으면 idle, 열 수 없으면 닫힘(busy)."""
+        try: fd = os.open(self.cfg.maint_lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError: return False
+        except OSError: return True
+        try: fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB); return False
+        except OSError: return True
+        finally: os.close(fd)
+
+    def jobs_gc(self):
+        now = clock()
+        with self.lock:
+            for j in self.jobs.values():
+                if j["secret"] is not None and now - j["finished"] > JOB_SECRET_TTL: j["secret"] = None
+            done = sorted((j for j in self.jobs.values() if j["finished"] is not None), key=lambda j: j["finished"])
+            for j in done[:max(0, len(done) - JOB_KEEP)] + [j for j in done if now - j["finished"] > JOB_KEEP_SECS]: self.jobs.pop(j["id"], None)
+
+    def op_member_add(self, ctx, a):
+        c, id_, email = self.common, a["id"], a["email"]
+        if not c.valid_web_id(id_): raise OpError("bad_id")
+        try: trusted_file(self.cfg.reserved_ids); reserved = c.load_reserved(self.cfg.reserved_ids)    # 목록이 없으면 닫힘
+        except Exception: raise OpError("tool_missing")
+        if c.is_reserved(id_, reserved, ""): raise OpError("reserved_id")      # 포털 라벨은 member-add 자신이 다시 검사한다
+        if not c.valid_email(email) or email.startswith("-"): raise OpError("bad_email")      # 옵션처럼 보이는 값 거부
+        try: trusted_file(self.cfg.member_add, need_exec=True)
+        except FileNotFoundError: raise OpError("tool_missing")
+        except PermissionError: raise OpError("tool_failed")
+        with self.lock:
+            self.jobs_gc()
+            if self.running is not None and self.queue: raise OpError("busy", why="queue")
+            if self._maint_busy(): raise OpError("busy", why="maint")
+            jid = secrets.token_urlsafe(16)
+            self.audit({"event": "job_start", "op": "member.add", "job": jid, "user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"], "args": {"id": id_}}, critical=True)
+            j = {"id": jid, "id_": id_, "email": email, "state": "queued", "log": [], "size": 0, "cut": False, "buf": b"", "rc": None, "why": None,
+                 "secret": None, "finished": None, "user": ctx["sess"]["user"], "kind": "add"}
+            self.jobs[jid] = j
+            queued = self.running is not None
+            if queued: self.queue.append(jid)
+            else: self._start(j)
+        return {"job": jid, "queued": queued}
+
+    def _start(self, j):      # self.lock 을 잡고 부른다
+        self.running, j["state"], j["t0"] = j["id"], "running", mono()
+        threading.Thread(target=self._run_job, args=(j,), daemon=True).start()
+
+    def _log(self, j, data):
+        j["buf"] += data
+        *lines, j["buf"] = j["buf"].split(b"\n")
+        if len(j["buf"]) > 4096: lines.append(j["buf"]); j["buf"] = b""
+        for ln in lines:
+            t = JOB_CTRL_RE.sub("", self.common.mask(ln[:4096].decode("utf-8", "replace"))) + "\n"
+            with self.lock:
+                if j["size"] + len(t) > JOB_LOG_MAX:
+                    if not j["cut"]: j["cut"] = True; j["log"].append("…(로그가 길어 이후는 생략)\n")
+                    continue
+                j["log"].append(t); j["size"] += len(t)
+
+    def _run_job(self, j):
+        rc = why = None; sec = bytearray()
+        try:
+            if self._maint_busy(): why = "maint"          # 대기하다 시작할 때도 정비 락을 다시 본다
+            else: rc, why = self._spawn(j, sec)
+        except Exception as e: why = "error"; self.audit({"event": "internal_error", "op": "member.add", "job": j["id"], "reason": type(e).__name__})
+        text = sec.decode("utf-8", "replace").strip().splitlines()[0].strip() if sec.strip() else ""
+        ok = rc == 0 and why is None
+        if not (1 <= len(text) <= 256 and text.isprintable()): text = ""
+        with self.lock:
+            if text and len(text) >= 6: j["log"] = [x.replace(text, "[MASKED]") for x in j["log"]]
+            j["rc"], j["why"], j["finished"] = rc, (why or (None if ok else "exit")), clock()
+            j["secret"] = text if ok and text else None
+            j["state"] = "done" if ok else "failed"
+            self.audit({"event": "job_end", "op": "member.add", "job": j["id"], "user": j["user"], "rc": rc, "dur": mono() - j["t0"],
+                        "result": ("issued" if j["secret"] else "ok") if ok else "fail", "reason": None if ok and j["secret"] else j["why"] if not ok else "nosecret"})
+            j["email"] = None
+            self.mcache = None      # 새 회원이 목록에 바로 보이게
+            self.running = None
+            if self.queue:
+                nj = self.jobs.get(self.queue.pop(0))
+                if nj: self._start(nj)
+
+    def _spawn(self, j, sec):
+        """-> (rc, why). 비밀은 fd 3 별도 파이프로만 받아 sec(메모리)에 둔다. shell=False 와 같은 효과의 posix_spawn(고정 환경·고정 argv)."""
+        hi = lambda fd: (lambda n: (os.close(fd), n)[1])(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 10))     # 0~3 번과 겹치지 않게 큰 번호로
+        r_out, w_out = map(hi, os.pipe()); r_sec, w_sec = map(hi, os.pipe()); dn = hi(os.open(os.devnull, os.O_RDONLY))
+        D = os.POSIX_SPAWN_DUP2
+        try:
+            pid = os.posix_spawn(self.cfg.member_add, [self.cfg.member_add, j["id_"], "--email", j["email"]], TOOL_ENV,
+                                 file_actions=[(D, dn, 0), (D, w_out, 1), (D, w_out, 2), (D, w_sec, 3)], setpgroup=0)
+        finally:
+            for fd in (w_out, w_sec, dn): os.close(fd)
+        rc, why, opened, end = None, None, {r_out, r_sec}, mono() + JOB_TIMEOUT
+        try:
+            for fd in opened: os.set_blocking(fd, False)
+            while True:
+                if rc is None:
+                    p, st = os.waitpid(pid, os.WNOHANG)
+                    if p: rc = os.waitstatus_to_exitcode(st)
+                    elif mono() > end:
+                        try: os.killpg(pid, signal.SIGKILL)
+                        except OSError: pass
+                        os.waitpid(pid, 0); rc, why = -9, "timeout"
+                ready = select.select(list(opened), [], [], 0.2)[0] if opened else (time.sleep(0.1), [])[1]
+                for fd in ready:
+                    try: data = os.read(fd, 65536)
+                    except BlockingIOError: continue
+                    if not data: opened.discard(fd)
+                    elif fd == r_sec: sec += data[:max(0, JOB_SECRET_MAX - len(sec))]
+                    else: self._log(j, data)
+                if rc is not None and not ready: break
+        finally:
+            for fd in (r_out, r_sec): os.close(fd)
+        if j["buf"]: self._log(j, b"\n")
+        return rc, why
+
+    def op_job_status(self, ctx, a):
+        self.jobs_gc()
+        with self.lock:
+            j = self.jobs.get(a["job"])
+            if j is None: raise OpError("not_found")
+            return {"state": j["state"], "log": "".join(j["log"]), "rc": j["rc"], "why": j["why"], "secret_ready": j["secret"] is not None, "kind": j["kind"]}
+
+    def op_job_secret(self, ctx, a):
+        """비밀을 «한 번만» 돌려주고 즉시 지운다. 기록(감사)이 먼저 — 기록 실패면 비밀을 꺼내지 않는다."""
+        self.jobs_gc()
+        with self.lock:
+            j = self.jobs.get(a["job"])
+            if j is None: raise OpError("not_found")
+            if j["secret"] is None: raise OpError("no_secret")
+            self.audit({"event": "op", "op": "job.secret", "job": j["id"], "user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"], "result": "ok"}, critical=True)
+            s, j["secret"] = j["secret"], None
+            return {"secret": s, "kind": j["kind"]}
+
+def register_builtin(ops):
+    ops["login"] = OpSpec(lambda c, x, a: c.op_login(x, a), {"user": Arg(str, USER_RE), "password": Arg(str, secret=True), "code": Arg(str, CODE_RE)}, session=False, event=None)
+    ops["logout"] = OpSpec(lambda c, x, a: c.op_logout(x, a), event=None)
+    ops["session.check"] = OpSpec(lambda c, x, a: c.op_check(x, a), event=None)
+    ops["stepup"] = OpSpec(lambda c, x, a: c.op_stepup(x, a), {"code": Arg(str, TOTP_RE)}, event=None)
+    ops["member.list"] = OpSpec(lambda c, x, a: c.op_member_list(x, a), event="view")
+    # 비밀 아닌 값만 감사에 남기므로 email 은 secret=True(감사 제외). 형식 검사는 핸들러가 admin_common 규칙으로 한다. step-up 없음(설계서 §E)
+    ops["member.add"] = OpSpec(lambda c, x, a: c.op_member_add(x, a), {"id": Arg(str), "email": Arg(str, secret=True)})
+    ops["member.detail"] = OpSpec(lambda c, x, a: c.op_member_detail(x, a), {"id": Arg(str)}, event="view")
+    # 안내 링크·봉인·페어링: 설계서 §E 표에서 step-up «아니오». 필요하면 OpSpec(stepup=True) 한 줄(웹은 stepup_required 안내를 이미 보여 준다)
+    ops["member.link.status"] = OpSpec(lambda c, x, a: c.op_member_tool(x, a, c.cfg.member_link, ["status", "{id}"], True), {"id": Arg(str)}, event="view")
+    ops["member.link.revoke"] = OpSpec(lambda c, x, a: c.op_member_tool(x, a, c.cfg.member_link, ["revoke", "{id}"], True), {"id": Arg(str)})
+    ops["member.link.issue"] = OpSpec(lambda c, x, a: c.op_link_issue(x, a), {"id": Arg(str)}, event=None)
+    ops["member.seal"] = OpSpec(lambda c, x, a: c.op_member_tool(x, a, c.cfg.onboarding_seal, ["{id}"], True), {"id": Arg(str)})
+    ops["member.pair.refresh"] = OpSpec(lambda c, x, a: c.op_member_tool(x, a, c.cfg.pair_create, ["{id}"], False), {"id": Arg(str)})
+    ops["job.status"] = OpSpec(lambda c, x, a: c.op_job_status(x, a), {"job": Arg(str, JOB_RE)}, event="view")
+    ops["job.secret"] = OpSpec(lambda c, x, a: c.op_job_secret(x, a), {"job": Arg(str, JOB_RE)}, event=None)
+
+register_builtin(OPS)
+
+# ── 시험 전용 op(--allow-test-hooks 일 때만 등록) ──
+def register_test_hooks(ops):
+    ops["test.stepup"] = OpSpec(lambda core, ctx, a: {"done": True}, stepup=True)
+    ops["test.heavy"] = OpSpec(lambda core, ctx, a: (time.sleep(a["secs"]), {"done": True})[1], {"secs": Arg(int)}, heavy=True)
+
+# ── 서버 ──
+def peer_uid(conn):
+    return struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[1]
+
+def read_line(conn, deadline_secs):
+    """한 줄을 읽는다. 총 시간이 deadline 을 넘으면 None(끊음). 상한 초과는 OpError."""
+    end, buf = mono() + deadline_secs, bytearray()
+    while b"\n" not in buf:
+        if len(buf) > MAX_MSG: raise OpError("bad_request")
+        left = end - mono()
+        if left <= 0: return None
+        conn.settimeout(left)
+        try: chunk = conn.recv(4096)
+        except (socket.timeout, OSError): return None
+        if not chunk: return None
+        buf += chunk
+    line = bytes(buf.split(b"\n", 1)[0])
+    if len(line) > MAX_MSG: raise OpError("bad_request")
+    return line
+
+def reply(conn, body):
+    try:
+        conn.settimeout(5); conn.sendall(dumps(body).encode("ascii") + b"\n")
+    except OSError: pass
+
+def serve_conn(core, conn, sem):
+    try:
+        try:
+            line = read_line(conn, core.cfg.deadline)
+            if line is None: return
+            body = core.handle(parse_line(line))
+        except OpError as e: body = err_body(e.code)
+        except Exception as e:
+            core.audit({"event": "internal_error", "reason": type(e).__name__}, throttle=True); body = err_body("internal_error")
+        reply(conn, body)
+    finally:
+        sem.release()
+        try: conn.close()
+        except OSError: pass
+
+def bind_socket(cfg):
+    p = cfg.socket
+    try: st = os.lstat(p)
+    except FileNotFoundError: st = None
+    if st is not None:
+        if not stat.S_ISSOCK(st.st_mode): sys.exit("소켓 경로에 소켓이 아닌 파일이 있습니다")
+        probe = socket.socket(socket.AF_UNIX); probe.settimeout(2)
+        try: probe.connect(p); sys.exit("다른 도우미가 이미 실행 중입니다")
+        except (ConnectionRefusedError, FileNotFoundError): os.unlink(p)      # 아무도 듣지 않는 낡은 소켓
+        except OSError: sys.exit("기존 소켓 상태를 확인할 수 없습니다")
+        finally: probe.close()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o177)
+    try: srv.bind(p)
+    finally: os.umask(old)
+    if cfg.socket_group: os.chown(p, -1, grp.getgrnam(cfg.socket_group).gr_gid)
+    os.chmod(p, cfg.socket_mode)
+    srv.listen(64); srv.settimeout(0.5)
+    return srv, os.lstat(p).st_ino
+
+def prepare_audit(cfg):
+    fd = os.open(cfg.audit_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o640)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode): sys.exit("감사 로그가 일반 파일이 아닙니다")
+        os.fchmod(fd, 0o640)           # UMask=0077 이어도 0640
+        if cfg.audit_group: os.fchown(fd, -1, grp.getgrnam(cfg.audit_group).gr_gid)
+    finally: os.close(fd)
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(prog="@@PFX@@-admin-helper")
+    ap.add_argument("--socket", default="/run/@@PFX@@-admin/helper.sock")
+    ap.add_argument("--socket-mode", default="660", help="8진수(기타 권한 불가)")
+    ap.add_argument("--socket-group")
+    ap.add_argument("--allow-uid", type=int, required=True, help="연결을 허용할 유일한 uid(웹 서비스 계정)")
+    ap.add_argument("--admin-user", required=True)
+    ap.add_argument("--audit-log", default="/var/log/@@PFX@@/admin-audit.log")
+    ap.add_argument("--audit-group")
+    ap.add_argument("--totp-file", default="/etc/@@PFX@@/secrets/admin-totp")
+    ap.add_argument("--libexec", default="/usr/local/libexec/@@PFX@@-admin")
+    ap.add_argument("--member-list", default="/usr/local/sbin/@@PFX@@-member-list")
+    ap.add_argument("--member-add", default="/opt/@@PFX@@/scripts/@@PFX@@-member-add", help="심볼릭 링크(/usr/local/bin)는 신뢰 검사에서 거부되므로 실제 파일 경로")
+    ap.add_argument("--member-link", default="/usr/local/sbin/@@PFX@@-member-link")
+    ap.add_argument("--onboarding-seal", default="/opt/@@PFX@@/scripts/@@PFX@@-onboarding-seal")
+    ap.add_argument("--pair-create", default="/opt/@@PFX@@/scripts/@@PFX@@-paseo-pair-create")
+    ap.add_argument("--reserved-ids", help="예약 ID 목록 파일(없으면 member.add 는 닫힘)")
+    ap.add_argument("--maint-lock", default="/run/@@PFX@@-maintenance.lock")
+    ap.add_argument("--pam-service", default="@@PFX@@-admin")
+    ap.add_argument("--max-conn", type=int, default=32)
+    ap.add_argument("--deadline", type=float, default=10.0, help="요청 한 줄을 읽는 총 시간(초)")
+    ap.add_argument("--fail-delay", type=float, default=1.0, help="로그인 실패 응답의 고정 지연(초)")
+    ap.add_argument("--allow-test-hooks", action="store_true", help="시험 전용 — 운영 유닛에 넣지 말 것")
+    ap.add_argument("--pam-module", help="시험 전용(--allow-test-hooks 필요): authenticate(user,password,service) 를 가진 모듈 경로")
+    a = ap.parse_args(argv)
+    try: a.socket_mode = int(a.socket_mode, 8)
+    except ValueError: ap.error("--socket-mode 는 8진수")
+    if a.socket_mode & 0o7007 or not a.socket_mode & 0o600: ap.error("--socket-mode: 기타·특수 권한 불가, 소유자 읽기·쓰기 필요")
+    if a.pam_module and not a.allow_test_hooks: ap.error("--pam-module 은 --allow-test-hooks 와 함께만 쓸 수 있습니다")
+    if not USER_RE.fullmatch(a.admin_user) or not re.fullmatch(r"[a-z0-9-]{1,40}", a.pam_service): ap.error("--admin-user/--pam-service 형식")
+    if not 1 <= a.max_conn <= 256 or not 0.1 <= a.deadline <= 60 or not 0 <= a.fail_delay <= 5: ap.error("--max-conn/--deadline/--fail-delay 범위")
+    return a
+
+def build_core(cfg):
+    common = load_module("admin_common", os.path.join(cfg.libexec, "admin_common.py"))
+    pam = load_module("admin_pam_t", cfg.pam_module) if cfg.pam_module else load_module("admin_pam", os.path.join(cfg.libexec, "admin_pam.py"))
+    core = Core(cfg, common, pam.authenticate)
+    if cfg.allow_test_hooks: register_test_hooks(core.ops)
+    return core
+
+def main(argv):
+    os.chdir("/")        # job 하위 프로세스의 작업 폴더(posix_spawn 은 cwd 를 못 바꾼다)
+    cfg = parse_args(argv)
+    core = build_core(cfg)
+    prepare_audit(cfg)
+    srv, ino = bind_socket(cfg)
+    stop = threading.Event()
+    for s in (signal.SIGTERM, signal.SIGINT): signal.signal(s, lambda *_: stop.set())
+    sem = threading.BoundedSemaphore(cfg.max_conn)
+    print("관리 도우미 시작", flush=True)
+    try:
+        while not stop.is_set():
+            try: conn, _ = srv.accept()
+            except socket.timeout: core.jobs_gc(); continue      # 비밀 10분 만료는 요청이 없어도 지운다
+            except OSError: break
+            try:
+                uid = peer_uid(conn)
+            except OSError: conn.close(); continue
+            if uid != cfg.allow_uid:      # 응답하지 않고 끊는다
+                conn.close(); core.audit({"event": "peer_denied", "reason": "uid"}, throttle=True); continue
+            if not sem.acquire(blocking=False):
+                reply(conn, err_body("busy_conn")); conn.close(); continue
+            threading.Thread(target=serve_conn, args=(core, conn, sem), daemon=True).start()
+    finally:
+        srv.close()
+        try:
+            if os.lstat(cfg.socket).st_ino == ino: os.unlink(cfg.socket)
+        except OSError: pass
+        print("관리 도우미 종료", flush=True)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

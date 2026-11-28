@@ -37,7 +37,8 @@ if [ "${SKIP_DNS:-0}" = 1 ]; then warn "DNS 점검 건너뜀(--skip-dns)"
 else
   my=$(curl -s -m 8 https://api.ipify.org || true)
   [ -n "$my" ] && echo "  > 이 서버의 공인 IP: $my"
-  for h in "$DOMAIN" "$PORTAL_HOST"; do
+  hosts="$DOMAIN $PORTAL_HOST"; case " ${DEVMARU_MODULES:-} " in *" admin "*) hosts="$hosts ${ADMIN_HOST:-admin.$DOMAIN}";; esac
+  for h in $hosts; do
     ip=$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}')
     if [ -z "$ip" ]; then warn "DNS: $h 이름이 아직 풀리지 않습니다 — A 레코드를 만드세요(인증서 발급에 필요)"
     elif [ -n "$my" ] && [ "$ip" != "$my" ]; then warn "DNS: $h → $ip (이 서버 공인 IP $my 와 다름)"

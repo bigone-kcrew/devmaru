@@ -38,7 +38,7 @@ for i, l in enumerate(lines):
         res["image"] = lines[i + 1].strip(); res["image_id"] = lines[i + 2].strip()
 summ = {}
 for l in lines:
-    s = re.match(r"^\s+(members|ready|busy|missing|current|outdated):\s+(\d+)\s*$", l)
+    s = re.match(r"^\s+(members|ready|busy|missing|current|outdated|suspended):\s+(\d+)\s*$", l)
     if s: summ[s.group(1)] = int(s.group(2))
 res["summary"] = summ
 if os.environ.get("WITH_MEMBERS") == "1":
@@ -129,6 +129,7 @@ is_excluded_user() {
 
 declare -a MEMBERS=()
 declare -a OUTDATED_USERS=()
+SUSPENDED=0   # 정지 회원(건너뜀) 수
 
 TOTAL=0
 READY=0
@@ -167,6 +168,13 @@ for user_path in "$USER_ROOT_BASE"/*; do
   USERNAME="$(basename "$user_path")"
 
   if is_excluded_user "$USERNAME"; then
+    continue
+  fi
+
+  if [[ -e "/opt/@@PFX@@/config/members/${USERNAME}.suspended" ]]; then
+    SUSPENDED=$((SUSPENDED + 1))
+    printf '%-18s %-18s %-7s %-9s %-10s %s\n' \
+      "$USERNAME" "dev-$USERNAME" "-" "SUSPENDED" "-" "SKIP"
     continue
   fi
 
@@ -257,6 +265,7 @@ echo "  busy:      $BUSY"
 echo "  missing:   $MISSING"
 echo "  current:   $CURRENT"
 echo "  outdated:  $OUTDATED"
+echo "  suspended: $SUSPENDED"
 echo
 
 if (( BUSY > 0 )); then

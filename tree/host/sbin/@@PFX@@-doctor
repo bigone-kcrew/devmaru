@@ -74,6 +74,22 @@ if has smb; then
     else ss -ltn 2>/dev/null | grep -q ":$n " && pass "TCP $n 리슨" || wrn "TCP $n 이 열려 있지 않습니다"; fi
   done
 fi
+if has admin; then   # 웹 관리 화면: 웹은 127.0.0.1 에만 · 소켓·TOTP 파일 권한 · 웹 계정은 권한 그룹 밖 · 도우미 동작
+  AP=$(sed -n 's/^ADMIN_WEB_PORT=//p' "$SITE" | tr -d "'\"" | head -1); AP=${AP:-8433}; WU=$PFX-admin-web
+  systemctl is-active --quiet $PFX-admin-helper && pass "웹 관리 도우미 동작" || fail "웹 관리 도우미 중지됨(journalctl -u $PFX-admin-helper)"
+  systemctl is-active --quiet $WU && pass "웹 관리 화면 동작" || fail "웹 관리 화면 중지됨(journalctl -u $WU)"
+  l=$(ss -ltn 2>/dev/null | awk -v p=":$AP" '$4 ~ p"$" {print $4}')
+  if [ -z "$l" ]; then wrn "웹 관리 화면 포트 $AP 가 열려 있지 않습니다"; elif [ "$(printf '%s\n' "$l" | grep -vc '^127\.0\.0\.1:')" = 0 ]; then pass "웹 관리 화면은 127.0.0.1:$AP 에만 바인딩"; else fail "웹 관리 화면이 127.0.0.1 밖에서도 열려 있음($l)"; fi
+  sd=/run/$PFX-admin
+  [ "$(stat -c '%a %U:%G' "$sd" 2>/dev/null)" = "750 root:$WU" ] && pass "소켓 폴더 $sd 권한(750 root:$WU)" || fail "소켓 폴더 $sd 권한이 750 root:$WU 가 아님"
+  [ -S "$sd/helper.sock" ] && { [ "$(stat -c '%a %U:%G' "$sd/helper.sock")" = "660 root:$WU" ] && pass "소켓 권한(660 root:$WU)" || fail "소켓 권한이 660 root:$WU 가 아님"; } || wrn "소켓 $sd/helper.sock 이 없습니다"
+  tf=/etc/$PFX/secrets/admin-totp
+  if [ -e "$tf" ]; then [ "$(stat -c '%a %U' "$tf")" = "600 root" ] && pass "TOTP 파일 권한(600 root)" || fail "TOTP 파일 권한·소유자 이상($tf 는 600 root 여야 함)"
+  else wrn "TOTP 등록 필요 — sudo $PFX-admin-setup totp-enroll (그때까지 웹 로그인 불가)"; fi
+  g=$(id -nG "$WU" 2>/dev/null | tr ' ' '\n' | grep -xE 'docker|sudo|adm|root' | tr '\n' ' ')
+  id "$WU" >/dev/null 2>&1 && { [ -z "$g" ] && pass "웹 계정 $WU 는 docker·sudo·adm 그룹이 아님" || fail "웹 계정 $WU 가 권한 그룹에 속함($g)"; } || fail "웹 계정 $WU 없음"
+  [ "$(passwd -S "$ADMIN_USER" 2>/dev/null | awk '{print $2}')" = P ] && pass "관리자 계정 비밀번호 설정됨" || wrn "관리자 계정($ADMIN_USER)의 리눅스 비밀번호 상태가 P 가 아님 — 웹 로그인 불가"
+fi
 if [ -x "/usr/local/sbin/$PFX-access" ]; then
   "/usr/local/sbin/$PFX-access" status >/dev/null 2>&1 && pass "접근 정책 일치(workspace 읽기 ${WORKSPACE_OTHERS:-none} · 공유 ${SHARED_DEFAULT:-rw})" || wrn "접근 정책이 실제 권한과 어긋남 — sudo $PFX-access status · apply --all (회원 컨테이너의 /members 마운트가 어긋난 것이면 sudo $PFX-member-update-all, 작업 중인 회원이 있으면 --check 로 확인)"
 fi

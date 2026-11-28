@@ -17,3 +17,4 @@ mail|host|||0|0||회원 등록 안내 메일 자동 발송(SMTP 직접 — n8n �
 smb|host|||0|0|files|SMB over QUIC(Samba + 커널 QUIC 모듈 DKMS 빌드 — Windows 11 24H2+ 네트워크 드라이브)
 backup|host|||0|0||restic 백업 저장소(DR 스냅샷·포터블 킷) 준비
 agent|host|||0|0||AI 에이전트 전용 계정(SSH 키 전용 · 읽기성 명령만 sudo · 감사 로그)
+admin|host|||0|0||웹 관리 화면(admin.<도메인> · 리눅스 비밀번호 + TOTP · 비특권 웹 + root 도우미)

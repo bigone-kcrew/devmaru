@@ -252,6 +252,26 @@ sudo <접두어>-member-add alice --email alice@example.org     # 첫 회원 등
 >
 > `ssh 회원@서버 '명령'` 도 호스트가 아니라 개발환경 안에서 실행됩니다(sshd ForceCommand). 포트 전달(-L)은 기본으로 막혀 있습니다.
 
+### 웹 관리 화면 (선택 모듈 `admin`)
+
+`admin` 모듈을 켜면 브라우저에서 서버를 관리하는 화면이 생깁니다. 처음 한 번 아래 세 단계를 하세요. 비밀 값은 설치기가 출력하지 않습니다.
+
+1. **TOTP 등록**: 서버 터미널에서 `sudo <접두어>-admin-setup totp-enroll`. 터미널에 QR(`qrencode` 가 있을 때)·otpauth 주소·복구 코드가 **한 번만** 표시되니 인증 앱에 등록하고 복구 코드는 따로 보관하세요. 출력을 파일·파이프로 보내면 거부됩니다.
+2. **접속**: 아래 표의 방식 중 하나로 엽니다.
+3. **로그인**: 관리자 계정(`ADMIN_USER`)의 리눅스 비밀번호 + 인증 앱의 6자리 코드.
+
+| 접속 방식 | 주소 | 필요한 것 |
+|---|---|---|
+| 공개 도메인 | `https://admin.<도메인>/` | DNS A 레코드 · 접속하는 쪽 대역이 `ADMIN_WEB_CIDRS` 에 있음 |
+| 사설 IP | `https://<ADMIN_LAN_ADDR>/` | 사설 대역이 `ADMIN_CIDRS`(방화벽)와 `ADMIN_WEB_CIDRS` 에 모두 있음 · 자체 인증서라 브라우저 경고가 정상이니 지문을 확인한 뒤 수락 |
+| SSH 터널 | `ssh -L <ADMIN_LOCAL_PORT>:127.0.0.1:<ADMIN_LOCAL_PORT> <관리자>@<서버>` 후 `https://localhost:<ADMIN_LOCAL_PORT>/` | SSH 접속만 되면 됨 · 자체 인증서 경고 정상 |
+
+- **`ADMIN_CIDRS` 와 `ADMIN_WEB_CIDRS`**: `ADMIN_CIDRS` 는 방화벽·관리 화면 전체가 쓰는 허용 대역이고, `ADMIN_WEB_CIDRS` 는 웹 관리 화면만의 허용 대역입니다(비워 두면 `ADMIN_CIDRS` 와 같음). 사설 IP 로 열려면 두 곳 모두에 사설 대역이 있어야 합니다([방화벽](FIREWALL.md)).
+- **평문 HTTP 는 지원하지 않습니다.** 항상 HTTPS 입니다.
+- **로그인을 여러 번 틀리면 잠깁니다**(IP·계정 기준). `sudo <접두어>-admin-setup unlock --restart` 로 풀면 열려 있던 웹 세션도 모두 끊깁니다.
+- **인증 앱을 잃었다면** 복구 코드로 로그인한 뒤, 또는 서버 터미널에서 `sudo <접두어>-admin-setup totp-reset` 으로 다시 등록합니다(기존 인증 앱·복구 코드는 모두 무효가 됩니다).
+- 감사 로그는 `/var/log/<접두어>/admin-audit.log`(root:adm, 0640)에 쌓이고 주 1회 회전해 8주 보관합니다.
+
 ### Paseo 로 접속하기 (터미널 없이)
 
 회원을 등록하면 온보딩 폴더(`/srv/<접두어>/onboarding/<ID>`)에 다음 파일이 만들어집니다.

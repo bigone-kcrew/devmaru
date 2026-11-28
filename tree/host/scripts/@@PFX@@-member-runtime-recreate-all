@@ -81,6 +81,7 @@ is_excluded_user() {
 }
 
 declare -a MEMBERS=()
+SUSPENDED=0   # 정지 회원(건너뜀) 수
 
 TOTAL=0
 READY=0
@@ -114,6 +115,13 @@ for user_path in "$USER_ROOT_BASE"/*; do
   USERNAME="$(basename "$user_path")"
 
   if is_excluded_user "$USERNAME"; then
+    continue
+  fi
+
+  if [[ -e "/opt/@@PFX@@/config/members/${USERNAME}.suspended" ]]; then
+    SUSPENDED=$((SUSPENDED + 1))
+    printf '%-18s %-18s %-7s %-9s %s\n' \
+      "$USERNAME" "dev-$USERNAME" "-" "SUSPENDED" "SKIP"
     continue
   fi
 
@@ -185,6 +193,7 @@ echo "  members: $TOTAL"
 echo "  ready:   $READY"
 echo "  busy:    $BUSY"
 echo "  missing: $MISSING"
+echo "  suspended: $SUSPENDED"
 echo
 
 if (( BUSY > 0 )); then

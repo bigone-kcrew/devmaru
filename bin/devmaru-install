@@ -26,19 +26,20 @@ QUESTIONS = [  # (키, 설명, 기본값 함수)
     ("ADMIN_CIDRS", "관리 화면(/ops·Cockpit) 접속 허용 대역(공백 구분)", lambda v: default_cidrs()),
     ("TZ", "시간대", lambda v: default_tz()),
 ]
-OPTIONAL_VARS = {"N8N_WORKFLOWS": "none", "WORKSPACE_OTHERS": "none", "SHARED_DEFAULT": "rw", "GOLDEN_VOICE": "0", "GOLDEN_OFFICE": "1", "TLS_MODE": "acme", "SSH_PORT": "22", "SMB_TRANSPORTS": "quic:1443"}   # 설정 파일에서만 바꾸는 옵션(음성 모델 포함·사무 문서 도구 제외·인증서 방식 internal)
-OPTIONAL = ["n8n", "files", "kordoc", "markitdown", "crawl4ai", "ollama", "uptime-kuma", "cockpit", "backup", "mail", "smb", "agent"]
+OPTIONAL_VARS = {"N8N_WORKFLOWS": "none", "WORKSPACE_OTHERS": "none", "SHARED_DEFAULT": "rw", "GOLDEN_VOICE": "0", "GOLDEN_OFFICE": "1", "TLS_MODE": "acme", "SSH_PORT": "22", "SMB_TRANSPORTS": "quic:1443", "ADMIN_WEB_PORT": "8433", "ADMIN_LOCAL_PORT": "8444", "ADMIN_LAN_ADDR": "", "ADMIN_RETENTION_DAYS": "7", "ADMIN_ARCHIVE_KEEP_DAYS": "30"}   # 설정 파일에서만 바꾸는 옵션(음성 모델 포함·사무 문서 도구 제외·인증서 방식 internal)
+OPTIONAL = ["n8n", "files", "kordoc", "markitdown", "crawl4ai", "ollama", "uptime-kuma", "cockpit", "backup", "mail", "smb", "agent", "admin"]
 DEPS = {"smb": ["files"]}   # 선택하면 같이 켜지는 모듈(mail 은 n8n 불필요 — MAIL_MODE=n8n 일 때만 n8n 이 같이 켜진다)
 MAIL_KEYS = ["MAIL_MODE", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY", "MAIL_SMTP_USER", "MAIL_FROM", "MAIL_SMTP_VERIFY", "MAIL_TEST_SEND", "MAIL_LINK_ONLY"]   # 비밀 아님(site.env 에 기록). 비밀번호는 /etc/<접두어>/secrets/
 ETC = "/etc"   # 시험이 바꿀 수 있게 상수로 둔다
 ONBOARD_CHANNELS = ["screen", "smtp", "n8n", "link", "webhook", "print"]   # 회원 안내 전달 채널(docs/ONBOARDING.md)
 WEBHOOK_FORMATS = ["generic", "slack", "discord", "telegram"]
 ONBOARD_KEYS = ["ONBOARD_CHANNELS", "ONBOARD_LINK_TTL_HOURS", "ONBOARD_LINK_PORT", "ONBOARD_WEBHOOK_FORMAT", "ONBOARD_WEBHOOK_URL_FILE", "ONBOARD_WEBHOOK_TELEGRAM_FILE", "ONBOARD_WEBHOOK_ALLOW_HTTP", "ONBOARD_WEBHOOK_INCLUDE_LINK"]   # 비밀 아님(경로만). 주소·토큰은 /etc/<접두어>/secrets/
+ADMIN_KEYS = ["ADMIN_WEB_PORT", "ADMIN_LOCAL_PORT", "ADMIN_LAN_ADDR", "ADMIN_WEB_CIDRS", "ADMIN_RETENTION_DAYS", "ADMIN_ARCHIVE_KEEP_DAYS"]   # 웹 관리 화면(admin 모듈) 설정 — 비밀 아님
 DEFAULT_OPTIONAL = "n8n files kordoc markitdown crawl4ai backup"
 CORE = ["postgres", "caddy", "golden", "portal"]
 
 STAGE_TITLES = {"00": "사전 점검", "10": "패키지 설치", "20": "파일 배포·네트워크", "30": "설정·비밀 생성", "40": "서비스 기동", "45": "파일 서비스 연동", "47": "API 카탈로그", "48": "n8n 워크플로 템플릿",
-                "50": "웹 서버(Caddy) 설정", "52": "메일 자동 발송 연동", "53": "회원 안내 전달 채널", "55": "Cockpit 설정", "56": "SMB(QUIC) 설정", "58": "AI 에이전트 계정", "60": "Golden 이미지 빌드", "65": "관리형 MCP 의존성", "70": "포털 배치", "80": "백업 준비", "85": "주기 작업 켜기", "90": "최종 점검"}
+                "50": "웹 서버(Caddy) 설정", "52": "메일 자동 발송 연동", "53": "회원 안내 전달 채널", "54": "웹 관리 화면", "55": "Cockpit 설정", "56": "SMB(QUIC) 설정", "58": "AI 에이전트 계정", "60": "Golden 이미지 빌드", "65": "관리형 MCP 의존성", "70": "포털 배치", "80": "백업 준비", "85": "주기 작업 켜기", "90": "최종 점검"}
 def title(s): return STAGE_TITLES.get(s[:2], s)
 
 def default_cidrs():
@@ -73,6 +74,19 @@ def validate(v):
     if not re.fullmatch(r"[A-Za-z0-9가-힣 ._-]{1,40}", v.get("BRAND", "")): return "서비스 이름은 한글·영문·숫자·공백·._- 40자 이하로 입력하세요"
     if v.get("WORKSPACE_OTHERS", "none") not in ("none", "read"): return "WORKSPACE_OTHERS 는 none 또는 read 입니다"
     if v.get("SHARED_DEFAULT", "rw") not in ("rw", "ro"): return "SHARED_DEFAULT 는 rw 또는 ro 입니다"
+    return check_admin(v)
+
+def check_admin(v):
+    """웹 관리 화면 설정 검증(값은 admin 모듈이 꺼져 있어도 형식만 본다)."""
+    for k in ("ADMIN_WEB_PORT", "ADMIN_LOCAL_PORT"):
+        x = v.get(k, "")
+        if x and not (x.isdigit() and 1024 <= int(x) <= 65535): return f"{k} 는 1024~65535 입니다"
+    if v.get("ADMIN_WEB_PORT") and v.get("ADMIN_WEB_PORT") == v.get("ADMIN_LOCAL_PORT"): return "ADMIN_WEB_PORT 와 ADMIN_LOCAL_PORT 는 달라야 합니다"
+    if v.get("ADMIN_LAN_ADDR") and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}:\d{2,5}", v["ADMIN_LAN_ADDR"]): return "ADMIN_LAN_ADDR 는 <사설IP>:<포트> 형식입니다(예: 192.168.0.10:8443) — 비워 두면 사설 IP 접속을 만들지 않습니다"
+    for k in ("ADMIN_RETENTION_DAYS", "ADMIN_ARCHIVE_KEEP_DAYS"):
+        x = v.get(k, "")
+        if x and not (x.isdigit() and 1 <= int(x) <= 3650): return f"{k} 는 1~3650(일) 정수입니다"
+    if v.get("ADMIN_WEB_CIDRS") and not re.fullmatch(r"[0-9a-fA-F:./ ]+", v["ADMIN_WEB_CIDRS"]): return "ADMIN_WEB_CIDRS 는 공백으로 구분한 대역 목록입니다"
     return None
 
 def pick_gid(pfx):
@@ -114,6 +128,9 @@ def checklist(v):
         mm = v.get("MAIL_MODE", "smtp")
         L.append(("메일", f"회원 등록 안내 메일을 SMTP 로 자동 발송합니다 — 설정은 /etc/{pfx}/secrets/smtp.env(root 만) · 시험 sudo {pfx}-notify-mail --test <주소> · 발송에 실패하면 회원 등록 화면에 초기 비밀번호가 표시됩니다 (docs/MAIL.md)" if mm == "smtp"
                   else f"MAIL_MODE={mm} — SMTP 직접 발송은 꺼져 있습니다. 켜려면 docs/MAIL.md"))
+    if "admin" in mods:
+        lp = v.get("ADMIN_LOCAL_PORT", "8444")
+        L.append(("웹 관리 화면", f"① sudo {pfx}-admin-setup totp-enroll 로 TOTP 등록(터미널 QR·복구 코드는 한 번만 표시) ② https://{h('ADMIN')}/ 접속(SSH 터널이면 https://localhost:{lp}/, 사설 IP 를 쓰면 인증서 경고가 정상이니 지문을 확인) ③ 로그인은 {v['ADMIN_USER']} 의 리눅스 비밀번호 + 인증 앱 코드 (docs/INSTALL.md)"))
     ch = v.get("ONBOARD_CHANNELS", "screen")
     L.append(("회원 안내 전달", f"전달 채널: {ch} — 회원 등록 때 순서대로 시도하고 모두 실패해도 화면에 표시됩니다. 점검 sudo {pfx}-onboard-deliver --check" + (f" · 1회 열람 링크 https://{dom}/start/<토큰> (유효 {v.get('ONBOARD_LINK_TTL_HOURS', '24')}시간, DNS·443 필요, 관리 명령 sudo {pfx}-member-link)" if "link" in ch.split() else "") + " (docs/ONBOARDING.md)"))
     if "smb" in mods:
@@ -147,6 +164,7 @@ def finalize(v, skip_golden=False, interactive=False):
         if not v.get("WORKSPACE_OTHERS"): v["WORKSPACE_OTHERS"] = "read" if ask("다른 회원이 내 workspace 를 읽게 할까요? (y/n, 쓰기는 항상 불가)", "n").lower().startswith("y") else "none"
         if not v.get("SHARED_DEFAULT"): v["SHARED_DEFAULT"] = "ro" if ask("공유 프로젝트를 읽기 전용으로 할까요? (y=읽기만, n=회원 전원 읽기·쓰기)", "n").lower().startswith("y") else "rw"
     for k, d in OPTIONAL_VARS.items(): v.setdefault(k, d)
+    if not v.get("ADMIN_WEB_CIDRS"): v["ADMIN_WEB_CIDRS"] = v["ADMIN_CIDRS"]   # 기본은 관리 화면 허용 대역과 같다(사설망 대역은 여기 따로 넣는다)
     if v["N8N_WORKFLOWS"] not in ("none", "generic"): raise PlanError("N8N_WORKFLOWS 는 none 또는 generic 이어야 합니다")
     err = validate(v)
     if err: raise PlanError(err)
@@ -248,7 +266,7 @@ def write_site(v, site):
     os.makedirs(os.path.dirname(site), exist_ok=True)
     with open(site, "w") as f:
         f.write(f"# {v['BRAND']} 설치 설정 — devmaru-install 이 만들었다. 비밀은 여기 없다.\n")
-        for k in [q[0] for q in QUESTIONS] + ["GID", "MODULES", "N8N_WORKFLOWS", "WORKSPACE_OTHERS", "SHARED_DEFAULT", "TLS_MODE", "GOLDEN_VOICE", "GOLDEN_OFFICE", "SSH_PORT", "SMB_TRANSPORTS", "AGENT_EXPIRES"] + MAIL_KEYS + ONBOARD_KEYS:
+        for k in [q[0] for q in QUESTIONS] + ["GID", "MODULES", "N8N_WORKFLOWS", "WORKSPACE_OTHERS", "SHARED_DEFAULT", "TLS_MODE", "GOLDEN_VOICE", "GOLDEN_OFFICE", "SSH_PORT", "SMB_TRANSPORTS", "AGENT_EXPIRES"] + MAIL_KEYS + ONBOARD_KEYS + ADMIN_KEYS:
             if k in v: f.write(f"{k}={shlex.quote(str(v[k]))}\n")
     os.chmod(site, 0o644)
 
@@ -344,6 +362,7 @@ MODULE_INFO = {
     "markitdown": ("MarkItDown 문서 변환", False), "crawl4ai": ("Crawl4AI 웹 수집", False), "ollama": ("Ollama 임베딩", False),
     "uptime-kuma": ("Uptime Kuma 상태 감시", False), "cockpit": ("Cockpit 관리 콘솔", False), "backup": ("restic 백업 저장소 준비", False),
     "mail": ("메일 자동 발송(SMTP 직접 — n8n 불필요, 회원 등록 때 초기 비밀번호·Paseo QR)", False), "smb": ("SMB over QUIC 네트워크 드라이브(files 필요)", False),
+    "admin": ("웹 관리 화면(admin.<도메인> · 리눅스 비밀번호 + TOTP, 설치 뒤 sudo <접두어>-admin-setup totp-enroll)", False),
     "agent": ("AI 에이전트 전용 계정(SSH 키 전용·읽기성 명령만 sudo·감사 로그)", False)}
 
 class Run:

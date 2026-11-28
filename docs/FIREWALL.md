@@ -31,6 +31,10 @@ sudo <접두어>-firewall status
 3. 적용 뒤 **다른 터미널에서 새 SSH 접속**이 되는지 확인하고 `confirm` 을 실행합니다.
 4. 복구 수단: 콘솔(VM 콘솔·`lxc exec` 등)에서 `<접두어>-firewall rollback` 또는 `ufw disable`.
 
+## 웹 관리 화면의 사설 IP 포트
+
+웹 관리 화면(`admin` 모듈)을 사설 IP(`ADMIN_LAN_ADDR`)로 열려면 방화벽도 그 포트를 열어야 하는데, 이 도구는 `ADMIN_CIDRS` 대역에만 관리 포트를 허용합니다. 따라서 **사설 대역이 `ADMIN_CIDRS` 에도 있어야** 하고(웹 쪽 허용 목록 `ADMIN_WEB_CIDRS` 에도 있어야 함), 바꾼 뒤에는 `apply` 를 다시 실행하세요.
+
 ## 한계·주의
 - 이미 켜져 있는 ufw 규칙은 `apply` 때 위 규칙으로 **교체**됩니다(롤백하면 복원). `plan` 이 켜짐 여부를 알려 줍니다.
 - 롤백 타이머는 임시(transient)라서 `confirm` 전에 서버가 재부팅되면 롤백되지 않고 새 규칙이 남습니다(SSH 는 열려 있음).

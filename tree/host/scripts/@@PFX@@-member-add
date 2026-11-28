@@ -23,10 +23,32 @@ if [[ ! "$USERNAME" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]; then
   exit 1
 fi
 
+# 예약 ID(서비스 호스트 이름·예약어)는 회원 ID 로 쓸 수 없다 — 목록: $SCRIPT_DIR/@@PFX@@-reserved-ids
+RESERVED_IDS_FILE="${SCRIPT_DIR}/@@PFX@@-reserved-ids"
+if [[ ! -r "$RESERVED_IDS_FILE" ]]; then
+  echo "ERROR: 예약 ID 목록을 읽을 수 없습니다: $RESERVED_IDS_FILE"
+  exit 1
+fi
+_PORTAL_LABEL="@@PORTAL_HOST@@"; _PORTAL_LABEL="${_PORTAL_LABEL%%.*}"
+if [[ "$USERNAME" == "$_PORTAL_LABEL" ]] || grep -qxF -- "$USERNAME" "$RESERVED_IDS_FILE"; then
+  echo "ERROR: 예약된 ID 라서 회원 ID 로 쓸 수 없습니다: $USERNAME"
+  exit 1
+fi
+
 if [[ ! "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
   echo "ERROR: invalid email address"
   exit 1
 fi
+
+# 이메일 중복 검사(사용자 요청: 이미 등록한 이메일은 막는다)
+for _mf in "$MEMBER_META_BASE"/*.json; do
+  [[ -f "$_mf" ]] || continue
+  _other="$(jq -r '.email // empty' "$_mf" 2>/dev/null || true)"
+  if [[ -n "$_other" && "${_other,,}" == "${EMAIL,,}" && "$(basename "$_mf" .json)" != "$USERNAME" ]]; then
+    echo "ERROR: 이미 등록된 이메일입니다(회원 $(basename "$_mf" .json)) — 다른 이메일을 쓰세요"
+    exit 1
+  fi
+done
 
 mkdir -p "$LOG_BASE"
 mkdir -p "$MEMBER_META_BASE"
@@ -46,7 +68,7 @@ touch "$LOG_FILE"
 chown root:@@PFX@@ "$LOG_FILE"
 chmod 640 "$LOG_FILE"
 
-exec 3>&1
+{ true >&3; } 2>/dev/null || exec 3>&1
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 SECRET_DIR="/run/@@PFX@@/member-secrets"

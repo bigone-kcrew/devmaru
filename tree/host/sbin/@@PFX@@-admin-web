@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+# @@PFX@@-admin-web — 웹 관리 화면(T4 뼈대). 파이썬 표준 라이브러리만, 127.0.0.1 에서만 듣고 비특권 계정으로 돈다. 공개는 Caddy 가 한다.
+# 구조(설계서 §A.1 B안): 인증·세션·step-up 은 root 도우미(@@PFX@@-admin-helper)가 판단한다. 이 프로그램은 화면과 중계만 하고,
+# 세션이 유효한지 스스로 판단하지 않는다(쿠키 값을 도우미에 보내 그 답을 따른다). 비밀번호·코드·세션 ID 는 로그·오류 화면에 남기지 않는다.
+import argparse, hashlib, hmac, html, ipaddress, json, re, secrets, socket, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+BRAND = "@@BRAND@@"
+SID_COOKIE = "__Host-@@PFX@@adm"     # 세션 ID(도우미가 발급)
+PRE_COOKIE = "__Host-@@PFX@@lc"      # 로그인 전 CSRF 용 임의 값
+SID_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+JOB_ID = re.compile(r"[A-Za-z0-9_-]{22}")
+JOB_PATH = re.compile(r"/jobs/([A-Za-z0-9_-]{22})(|/status|/secret)")
+PRE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+VIA = ("public", "lan", "local")
+MAX_BODY, MAX_CONN, MAX_REPLY = 4096, 32, 8 * 1024 * 1024
+HELPER_WAIT = 135        # 도우미 응답 대기(프로토콜 §1: 130초 이상)
+KEY = secrets.token_bytes(32)   # CSRF 토큰 서명키(재시작하면 열려 있던 폼만 무효)
+CFG = {"socket": "/run/@@PFX@@-admin/helper.sock", "hosts": (), "deadline": 15.0}
+
+def log(msg):
+    print(msg, flush=True)   # journald 로 간다. 요청 줄·본문·쿠키·도우미 응답은 싣지 않는다(고정 문구와 ip 만)
+
+# ── 도우미 호출 ──
+class HelperDown(Exception): pass
+
+def helper(op, ip, via, sid=None, args=None):
+    o = {"op": op, "src_ip": ip, "via": via}
+    if sid: o["sid"] = sid
+    if args is not None: o["args"] = args
+    s = socket.socket(socket.AF_UNIX); s.settimeout(HELPER_WAIT)
+    try:
+        s.connect(CFG["socket"]); s.sendall(json.dumps(o).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf and len(buf) <= MAX_REPLY:
+            c = s.recv(65536)
+            if not c: break
+            buf += c
+        r = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+        if not isinstance(r, dict) or not isinstance(r.get("ok"), bool): raise ValueError
+        return r
+    except (OSError, ValueError):
+        raise HelperDown()
+    finally:
+        s.close()
+
+# ── CSRF: 세션 ID(또는 로그인 전 임의 쿠키)에 묶인 서명. 서버는 세션 상태를 갖지 않는다 ──
+def csrf_for(cookie_value): return hmac.new(KEY, cookie_value.encode(), hashlib.sha256).hexdigest()[:40]
+def csrf_ok(cookie_value, given): return bool(cookie_value) and hmac.compare_digest(csrf_for(cookie_value).encode(), given.encode("utf-8", "replace"))
+
+# ── 화면 ──
+CSS = """\
+@font-face{font-family:Pretendard;src:url(/static/pretendard.woff2) format("woff2");font-weight:100 900;font-display:swap}
+:root{--background:0 0% 100%;--foreground:240 10% 3.9%;--card:0 0% 100%;--muted:240 4.8% 95.9%;--muted-foreground:240 3.8% 46.1%;--accent:240 4.8% 95.9%;--border:240 5.9% 90%;--input:240 5.9% 90%;--primary:240 5.9% 10%;--primary-foreground:0 0% 98%;--secondary:240 4.8% 95.9%;--destructive:0 72% 45%;--ring:240 5.9% 10%;--radius:.5rem;--ok:142 60% 30%;--warn:32 95% 38%;--term-bg:240 10% 7%;--term-fg:142 71% 58%;--term-dim:142 20% 42%;--term-ok:142 80% 72%;--term-warn:38 92% 60%;--term-err:0 85% 68%;--term-prompt:142 71% 68%;color-scheme:light}
+:root[data-theme=dark]{--background:240 10% 3.9%;--foreground:0 0% 98%;--card:240 10% 6%;--muted:240 3.7% 15.9%;--muted-foreground:240 5% 64.9%;--accent:240 3.7% 15.9%;--border:240 3.7% 15.9%;--input:240 3.7% 15.9%;--primary:0 0% 98%;--primary-foreground:240 5.9% 10%;--secondary:240 3.7% 15.9%;--destructive:0 62.8% 58%;--ring:240 4.9% 83.9%;--ok:142 55% 55%;--warn:38 92% 60%;--term-bg:240 10% 2.5%;color-scheme:dark}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--background:240 10% 3.9%;--foreground:0 0% 98%;--card:240 10% 6%;--muted:240 3.7% 15.9%;--muted-foreground:240 5% 64.9%;--accent:240 3.7% 15.9%;--border:240 3.7% 15.9%;--input:240 3.7% 15.9%;--primary:0 0% 98%;--primary-foreground:240 5.9% 10%;--secondary:240 3.7% 15.9%;--destructive:0 62.8% 58%;--ring:240 4.9% 83.9%;--ok:142 55% 55%;--warn:38 92% 60%;--term-bg:240 10% 2.5%;color-scheme:dark}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scrollbar-gutter:stable}
+body{margin:0;min-height:100vh;background:hsl(var(--background));color:hsl(var(--foreground));font:15px/1.65 Pretendard,system-ui,-apple-system,"Noto Sans KR","Malgun Gothic",sans-serif;letter-spacing:-.011em;-webkit-font-smoothing:antialiased;word-break:keep-all;overflow-wrap:anywhere}
+code,pre,.mono{font-family:ui-monospace,"JetBrains Mono","D2Coding",SFMono-Regular,Menlo,Consolas,monospace}
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.6rem 1rem;border-bottom:1px solid hsl(var(--border));background:hsl(var(--background)/.85);backdrop-filter:saturate(1.4) blur(10px);-webkit-backdrop-filter:saturate(1.4) blur(10px)}
+.brand{display:flex;align-items:center;gap:.55rem;font-weight:700;letter-spacing:-.02em}
+.brand i{width:.7rem;height:.7rem;border-radius:3px;background:hsl(var(--primary));box-shadow:.35rem .35rem 0 -.1rem hsl(var(--muted-foreground)/.5)}
+header nav{display:flex;align-items:center;gap:.25rem;flex-wrap:wrap}
+header nav a{display:inline-flex;align-items:center;height:2.25rem;padding:0 .75rem;border-radius:calc(var(--radius) - 2px);color:hsl(var(--muted-foreground));text-decoration:none;font-weight:500;font-size:.9rem;transition:background-color .15s,color .15s}
+header nav a:hover,header nav a[aria-current=page]{background:hsl(var(--accent));color:hsl(var(--foreground))}
+a{color:inherit;text-underline-offset:3px}
+main{max-width:66rem;margin:0 auto;padding:1.75rem 1rem 3rem}
+h1{font-size:1.6rem;line-height:1.25;font-weight:700;letter-spacing:-.03em;margin:0 0 1.1rem}
+h2{font-size:1.05rem;font-weight:650;margin:1.8rem 0 .6rem;letter-spacing:-.02em}
+.card{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 4px);padding:1.6rem;max-width:26rem;margin:3.5rem auto;box-shadow:0 1px 2px hsl(240 10% 4%/.05),0 8px 24px -12px hsl(240 10% 4%/.12)}
+.card h1{font-size:1.35rem;margin-bottom:.4rem}
+label{display:block;font-weight:500;font-size:.875rem;margin:1rem 0 .4rem}
+input{width:100%;height:2.5rem;font:inherit;font-size:.9rem;padding:0 .75rem;color:inherit;background:transparent;border:1px solid hsl(var(--input));border-radius:calc(var(--radius) - 2px);box-shadow:0 1px 2px hsl(240 10% 4%/.04);transition:border-color .15s,box-shadow .15s}
+input:hover{border-color:hsl(var(--muted-foreground)/.6)}
+input:focus-visible{outline:0;border-color:hsl(var(--ring));box-shadow:0 0 0 3px hsl(var(--ring)/.18)}
+button{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;height:2.5rem;font:inherit;font-size:.9rem;font-weight:550;padding:0 1.1rem;cursor:pointer;white-space:nowrap;color:hsl(var(--primary-foreground));background:hsl(var(--primary));border:1px solid transparent;border-radius:calc(var(--radius) - 2px);box-shadow:0 1px 2px hsl(240 10% 4%/.12);transition:background-color .15s,box-shadow .15s,transform .08s,opacity .15s}
+button:hover{background:hsl(var(--primary)/.9)}
+button:active{transform:translateY(1px) scale(.985);box-shadow:none}
+button:focus-visible{outline:0;box-shadow:0 0 0 2px hsl(var(--background)),0 0 0 4px hsl(var(--ring))}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+button.ghost{color:hsl(var(--foreground));background:transparent;border-color:hsl(var(--input));box-shadow:0 1px 2px hsl(240 10% 4%/.04)}
+button.ghost:hover{background:hsl(var(--accent))}
+button.secondary{color:hsl(var(--foreground));background:hsl(var(--secondary))}button.secondary:hover{background:hsl(var(--secondary)/.7)}
+button.destructive{color:#fff;background:hsl(var(--destructive))}button.destructive:hover{background:hsl(var(--destructive)/.9)}
+button.icon{width:2.25rem;height:2.25rem;padding:0;color:hsl(var(--muted-foreground));background:transparent;border-color:transparent;box-shadow:none}button.icon:hover{background:hsl(var(--accent));color:hsl(var(--foreground))}
+button.icon svg{width:1.1rem;height:1.1rem}
+.sun{display:none}:root[data-theme=dark] .sun{display:block}:root[data-theme=dark] .moon{display:none}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]) .sun{display:block}:root:not([data-theme=light]) .moon{display:none}}
+header nav button{height:2.25rem;padding:0 .8rem}
+form.inline{display:inline}form.narrow{max-width:26rem;padding:1.4rem;background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 4px);box-shadow:0 1px 2px hsl(240 10% 4%/.05)}form.narrow label:first-of-type{margin-top:0}.mt{margin-top:1rem}.card button[type=submit]{width:100%;margin-top:1.3rem}
+.msg{padding:.7rem .9rem;border-radius:calc(var(--radius) - 2px);background:hsl(var(--muted));border:1px solid hsl(var(--border));margin:0 0 1rem;font-size:.9rem}
+.msg.err{border-color:hsl(var(--destructive)/.5);background:hsl(var(--destructive)/.07);color:hsl(var(--destructive))}
+.hint{color:hsl(var(--muted-foreground));font-size:.85rem;margin:.4rem 0 0}
+.scroll{overflow-x:auto;border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);background:hsl(var(--card))}
+table{border-collapse:collapse;width:100%;min-width:34rem;font-size:.9rem}
+th,td{text-align:left;padding:.7rem 1rem;border-bottom:1px solid hsl(var(--border));white-space:nowrap}
+th{font-weight:550;font-size:.8rem;color:hsl(var(--muted-foreground));background:hsl(var(--muted)/.5)}
+tbody tr{transition:background-color .12s}tbody tr:hover{background:hsl(var(--muted)/.5)}tr:last-child td{border-bottom:0}
+td a{font-weight:600;text-decoration:none}td a:hover{text-decoration:underline}
+.badge{display:inline-flex;align-items:center;gap:.35rem;padding:.1rem .6rem;border:1px solid hsl(var(--border));border-radius:999px;font-size:.78rem;font-weight:500;line-height:1.5;color:hsl(var(--muted-foreground))}
+.badge:before{content:"";width:.4rem;height:.4rem;border-radius:50%;background:currentColor;opacity:.8}
+.badge.ok{color:hsl(var(--ok));border-color:hsl(var(--ok)/.35);background:hsl(var(--ok)/.08)}.badge.warn{color:hsl(var(--warn));border-color:hsl(var(--warn)/.4);background:hsl(var(--warn)/.09)}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:0;margin:0 0 1rem;border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);background:hsl(var(--card));overflow:hidden}
+dl.kv dt,dl.kv dd{margin:0;padding:.65rem 1rem;border-bottom:1px solid hsl(var(--border))}dl.kv dt{color:hsl(var(--muted-foreground));font-size:.85rem;background:hsl(var(--muted)/.4)}dl.kv dd{word-break:break-all}
+dl.kv dt:nth-last-of-type(1),dl.kv dd:nth-last-of-type(1){border-bottom:0}
+.actions{display:flex;flex-wrap:wrap;gap:.6rem}
+.term{border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);overflow:hidden;background:hsl(var(--term-bg));box-shadow:0 8px 24px -14px hsl(240 10% 4%/.35)}
+.term-bar{display:flex;align-items:center;gap:.4rem;padding:.5rem .8rem;border-bottom:1px solid hsl(0 0% 100%/.08);background:hsl(0 0% 100%/.04);font:.75rem ui-monospace,monospace;color:hsl(var(--term-dim))}
+.term-bar i{width:.65rem;height:.65rem;border-radius:50%;background:hsl(0 0% 100%/.18)}.term-bar i:nth-child(1){background:#ff5f57}.term-bar i:nth-child(2){background:#febc2e}.term-bar i:nth-child(3){background:#28c840}
+.term-bar span{margin-left:.5rem}
+.term-cmd{padding:.7rem 1rem 0;font:.85rem/1.6 ui-monospace,monospace;color:hsl(var(--term-fg))}.term-cmd b{color:hsl(var(--term-prompt));font-weight:700;margin-right:.55rem}
+.log{margin:0;padding:.5rem 1rem 1rem;background:transparent;color:hsl(var(--term-fg));overflow:auto;max-height:26rem;white-space:pre-wrap;word-break:break-word;font-size:.82rem;line-height:1.65}
+.log .ln{display:block}.log .ok{color:hsl(var(--term-ok));font-weight:600}.log .warn{color:hsl(var(--term-warn))}.log .err{color:hsl(var(--term-err))}.log .step{color:hsl(var(--term-prompt));font-weight:600}.log .dim{color:hsl(var(--term-dim))}
+.log.cursor .ln:last-child:after{content:"";display:inline-block;width:.55em;height:1.05em;margin-left:.25rem;vertical-align:text-bottom;background:hsl(var(--term-fg));animation:blink 1.1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.secret{display:block;font-size:1.15rem;padding:.9rem 1.1rem;color:hsl(var(--term-fg));background:hsl(var(--term-bg));border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);user-select:all;word-break:break-all}
+.secret:before{content:"$ ";color:hsl(var(--term-prompt))}
+@media (max-width:34rem){header{flex-direction:column;align-items:flex-start;gap:.3rem}.card{margin:1.5rem auto;padding:1.25rem}h1{font-size:1.4rem}dl.kv{grid-template-columns:1fr}dl.kv dt{border-bottom:0;padding-bottom:0}dl.kv dd{padding-top:.15rem}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+"""
+JS = r"""
+(function(){var r=document.documentElement;function cur(){return r.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}
+document.querySelectorAll('[data-theme-toggle]').forEach(function(b){b.addEventListener('click',function(){var n=cur()==='dark'?'light':'dark';r.setAttribute('data-theme',n);try{localStorage.setItem('adm-theme',n)}catch(e){}})})})();
+document.querySelectorAll('header nav a').forEach(function(a){if(a.getAttribute('href')===location.pathname)a.setAttribute('aria-current','page')});
+function paint(el,text){while(el.firstChild)el.removeChild(el.firstChild);text.split('\n').forEach(function(l,i,all){if(i===all.length-1&&l==='')return;var s=document.createElement('span');var c='ln';if(/^\[\d+\/\d+\]/.test(l))c+=' step';else if(/^(OK|성공)/.test(l))c+=' ok';else if(/^(경고|WARN)/.test(l))c+=' warn';else if(/^(실패|FAIL|오류|ERROR)/.test(l))c+=' err';else if(/^(=+|-+)$/.test(l.trim()))c+=' dim';s.className=c;s.textContent=l===''?' ':l;el.appendChild(s)})}
+document.querySelectorAll('pre.log').forEach(function(p){paint(p,p.textContent)});
+document.querySelectorAll('[data-copy]').forEach(function(b){b.addEventListener('click',function(){var t=document.getElementById(b.dataset.copy).textContent;if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){b.textContent='복사됨'},function(){b.textContent='복사 실패 - 직접 선택하세요'})}else{b.textContent='이 브라우저는 복사를 지원하지 않습니다 - 직접 선택하세요'}})});
+document.querySelectorAll('[data-job]').forEach(function(box){var log=document.getElementById('joblog');var stop=setInterval(function(){fetch(box.dataset.job,{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():{state:'x'}}).then(function(j){if(j.state==='queued'||j.state==='running'){if(log&&typeof j.log==='string')paint(log,j.log)}else{clearInterval(stop);location.reload()}}).catch(function(){})},2000)});
+document.querySelectorAll('input[data-focus]').forEach(function(e){e.focus()});
+document.querySelectorAll('input[inputmode=numeric]').forEach(function(e){e.addEventListener('input',function(){e.value=e.value.replace(/[^0-9a-zA-Z-]/g,'')})});
+"""
+THEME_JS = """\
+try{var t=localStorage.getItem('adm-theme');if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t)}catch(e){}
+"""
+E = lambda v: html.escape(str(v), quote=True)
+FONT_PATH = "/usr/local/libexec/@@PFX@@-ui/Pretendard.woff2"
+def _font():
+    try:
+        with open(FONT_PATH, "rb") as f: return f.read()
+    except OSError: return b""
+STATIC = {"/static/admin.css": (CSS.encode(), "text/css; charset=utf-8"), "/static/admin.js": (JS.encode(), "application/javascript; charset=utf-8"),
+          "/static/theme.js": (THEME_JS.encode(), "application/javascript; charset=utf-8"), "/static/pretendard.woff2": (_font(), "font/woff2")}
+def term(label, inner, cmd=None, live=False):
+    """터미널 느낌의 블록: 윈도 막대 + 프롬프트 줄 + 출력(inner 는 이미 이스케이프된 <pre>)."""
+    c = f'<div class="term-cmd"><b>$</b>{E(cmd)}</div>' if cmd else ""
+    return f'<div class="term"><div class="term-bar"><i></i><i></i><i></i><span>{E(label)}</span></div>{c}{inner}</div>'
+
+THEME_BTN = ('<button type="button" class="icon" data-theme-toggle aria-label="라이트/다크 전환" title="라이트/다크 전환">'
+             '<svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>'
+             '<svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg></button>')
+
+def page(title, body, nav=""):
+    return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<meta name="robots" content="noindex,nofollow"><title>{E(title)} · {E(BRAND)}</title><script src="/static/theme.js"></script><link rel="stylesheet" href="/static/admin.css">'
+            f'<script src="/static/admin.js" defer></script></head><body><header><span class="brand"><i></i>{E(BRAND)} 관리</span><nav>{nav}{THEME_BTN}</nav></header>'
+            f'<main>{body}</main></body></html>').encode()
+
+def msg(text, err=False): return f'<p class="msg{" err" if err else ""}" role="alert">{E(text)}</p>'
+
+def login_body(token, note=""):
+    return (f'<div class="card"><h1>관리자 로그인</h1>{note}<form method="post" action="/login" autocomplete="off">'
+            f'<input type="hidden" name="csrf" value="{E(token)}">'
+            '<label for="u">사용자</label><input id="u" name="user" required maxlength="32" autocomplete="username" data-focus>'
+            '<label for="p">비밀번호</label><input id="p" name="password" type="password" required maxlength="1024" autocomplete="current-password">'
+            '<label for="c">인증 코드</label><input id="c" name="code" required maxlength="14" inputmode="numeric" autocomplete="one-time-code">'
+            '<p class="hint">인증 앱의 6자리 코드 또는 복구 코드(xxxx-xxxx-xxxx)</p>'
+            '<button type="submit">로그인</button></form></div>')
+
+def nav_html(token):
+    return ('<a href="/members">회원</a><a href="/members/new">회원 등록</a><a href="/stepup">재확인</a>'
+            f'<form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="{E(token)}"><button class="ghost" type="submit">로그아웃</button></form>')
+
+# member.list 의 JSON 은 member-list 도구가 정한다. 목록에는 이메일을 보이지 않는다(상세에서만) — 열을 이름으로 골라 쓰므로 email 은 애초에 읽지 않는다.
+MID = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+ACTS = {"link-issue": "member.link.issue", "link-revoke": "member.link.revoke", "link-status": "member.link.status", "seal": "member.seal", "pair-refresh": "member.pair.refresh"}
+MEMBER_PATH = re.compile(r"/member/([a-z][a-z0-9_-]{1,31})(|/link-issue|/link-revoke|/link-status|/seal|/pair-refresh)")
+def badge(text, cls=""): return f'<span class="badge {cls}">{E(text)}</span>'
+def state_badge(m):
+    st = m.get("state")
+    if st is None: return badge("확인 실패")
+    return badge("실행", "ok") if st == "running" else badge("없음") if st == "missing" else badge("정지")
+def image_badge(m):
+    v = m.get("image")
+    return badge("CURRENT", "ok") if v == "CURRENT" else badge("OLD(갱신 필요)", "warn") if v == "OLD" else "-"
+def limits_text(v):
+    if not isinstance(v, dict) or not v: return "기본값"
+    return " · ".join(f"{n} {v[k]}" for k, n in (("memory", "메모리"), ("swap", "스왑"), ("cpus", "CPU")) if isinstance(v.get(k), str))
+def susp_badge(m): return badge("일시정지", "warn") if m.get("suspended") is True else "-"
+def num(v): return str(v) if type(v) is int else "-"
+def day(v): return v[:10] if isinstance(v, str) else "-"
+
+def members_body(data):
+    rows = data.get("members") if isinstance(data, dict) else data
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows): return msg("회원 목록 형식을 알 수 없습니다.", True)
+    if not rows: return "<h1>회원</h1><p>등록된 회원이 없습니다.</p>"
+    def idcell(r):
+        v = r.get("id")
+        return f'<a href="/member/{E(v)}">{E(v)}</a>' if isinstance(v, str) and MID.fullmatch(v) else E(v)      # 형식이 틀린 값은 링크로 만들지 않는다
+    head = "".join(f"<th>{h}</th>" for h in ("ID", "생성일", "상태", "컨테이너", "이미지", "tmux", "한도", "정지 표시"))
+    body = "".join(f'<tr><td>{idcell(r)}</td><td>{E(day(r.get("created")))}</td><td>{state_badge(r)}</td><td>{E(r.get("container") or "-")}</td><td>{image_badge(r)}</td>'
+                   f'<td>{E(num(r.get("tmux")))}</td><td>{E(limits_text(r.get("limits")))}</td><td>{susp_badge(r)}</td></tr>' for r in rows)
+    return (f'<h1>회원 ({len(rows)}명)</h1><div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+            '<p class="hint">ID 를 누르면 상세 화면(안내 링크·봉인·페어링)으로 갑니다. 목록은 최대 60초 전 값일 수 있습니다.</p>')
+
+def act_form(token, mid, act, label, ghost=False):
+    cls = ' class="ghost"' if ghost else ""
+    return (f'<form class="inline" method="post" action="/member/{E(mid)}/{act}"><input type="hidden" name="csrf" value="{E(token)}">'
+            f'<button type="submit"{cls}>{E(label)}</button></form>')
+
+def onboarding_badges(m):
+    """온보딩 상태 두 줄(봉인 여부·초기 비밀번호 대기). member-list 가 존재 여부만 알려 준다."""
+    o = m.get("onboarding")
+    if not isinstance(o, dict): return '<span class="badge">알 수 없음</span>', '<span class="badge">알 수 없음</span>'
+    if not o.get("dir"): files = '<span class="badge">온보딩 폴더 없음</span>'
+    elif o.get("sealed"): files = '<span class="badge ok">봉인됨</span> <span class="hint">페어링 파일이 지워졌습니다(README 만 남음)</span>'
+    else: files = f'<span class="badge warn">페어링 파일 {E(num(o.get("files")))}개 남음</span> <span class="hint">전달을 마쳤으면 «봉인»을 누르세요</span>'
+    pw = ('<span class="badge warn">서버에 보관 중</span> <span class="hint">초기 비밀번호 파일이 아직 있습니다(전달 전이거나 링크 재발급용)</span>' if o.get("password_pending")
+          else '<span class="badge ok">없음</span> <span class="hint">서버에 파일이 없습니다(전달을 마쳤거나, 변경·재부팅으로 지워짐)</span>')
+    return files, pw
+
+def detail_body(token, m, note=""):
+    mid = m.get("id", "")
+    kv = [("ID", E(mid)), ("이메일", E(m.get("email") or "-")), ("생성일", E(str(m.get("created") or "-").replace("T", " "))), ("상태", state_badge(m)), ("컨테이너", E(m.get("container") or "-")),
+          ("이미지", image_badge(m)), ("tmux 세션 수", E(num(m.get("tmux")))), ("한도", E(limits_text(m.get("limits")))), ("정지 표시", susp_badge(m)), ("온보딩 파일", onboarding_badges(m)[0]), ("초기 비밀번호", onboarding_badges(m)[1])]
+    dl = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in kv)
+    acts = "".join((act_form(token, mid, "link-issue", "안내 링크 발급"), act_form(token, mid, "link-status", "링크 상태", True), act_form(token, mid, "link-revoke", "링크 폐기", True),
+                    act_form(token, mid, "seal", "봉인", True), act_form(token, mid, "pair-refresh", "페어링 갱신", True)))
+    return (f'<h1>회원 {E(mid)}</h1>{note}<dl class="kv">{dl}</dl><h2>온보딩</h2><div class="actions">{acts}</div>'
+            '<p class="hint">안내 링크: 1회 열람 링크를 새로 만듭니다(이전 링크는 폐기, 링크는 한 번만 표시). 봉인: 온보딩 폴더의 페어링 파일과 링크를 지웁니다. '
+            '페어링 갱신: 같은 페어링 링크를 온보딩 파일로 다시 만듭니다(링크가 무효화되지는 않으며 이 화면에는 표시하지 않습니다).</p>'
+            '<p><a href="/members">회원 목록</a></p>')
+
+def result_body(mid, title, note, pre=""):
+    box = term(title, f'<pre class="log">{E(pre)}</pre>', "@@PFX@@-member-" + {"링크 상태": "link status", "안내 링크 폐기": "link revoke", "봉인": "seal", "페어링 갱신": "pair-create"}.get(title, "link") + " " + mid) if pre else ""
+    return f'<h1>{E(title)}</h1>{note}{box}<p><a href="/member/{E(mid)}">회원 {E(mid)} 로 돌아가기</a></p>'
+
+def stepup_body(token, note=""):
+    return (f'<h1>재확인</h1>{note}<p class="hint">파괴적인 작업 전에 인증 앱의 <b>새 6자리 코드</b>가 필요합니다. 방금 로그인에 쓴 코드는 쓸 수 없으니 다음 코드가 나올 때까지(최대 30초) 기다리세요. 확인은 120초 동안 유효하고 작업 한 번에 소비됩니다.</p>'
+            f'<form method="post" action="/stepup" autocomplete="off" class="narrow"><input type="hidden" name="csrf" value="{E(token)}">'
+            '<label for="c">인증 코드</label><input id="c" name="code" required maxlength="6" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" data-focus>'
+            '<button type="submit" class="mt">확인</button></form>')
+
+ID_RE = re.compile(r"[a-z][a-z0-9]{1,31}")
+def id_reason(v):
+    """등록 폼의 ID 가 규칙 밖일 때 이유(한국어). 사용자가 방금 입력한 값에 대한 설명이라 안전하게 보여 줄 수 있다."""
+    if not v: return "ID 를 입력하세요."
+    if not v.isascii(): return "ID 에는 영문 소문자와 숫자만 쓸 수 있습니다(한글·특수문자 불가)."
+    if "-" in v or "_" in v: return "하이픈(-)과 밑줄(_)은 쓸 수 없습니다. 웹 공개·DB 와 맞지 않아 소문자와 숫자만 허용합니다."
+    if any(c.isupper() for c in v): return "대문자는 쓸 수 없습니다. 소문자로 입력하세요."
+    if not v[0].isalpha(): return "첫 글자는 영문 소문자여야 합니다."
+    if len(v) < 2 or len(v) > 32: return "ID 는 2~32자여야 합니다."
+    return "ID 는 영문 소문자로 시작하고 소문자·숫자만 쓸 수 있습니다(공백·기호 불가)."
+
+def new_body(token, note="", id_="", email=""):
+    return (f'<h1>회원 등록</h1>{note}<form method="post" action="/members/new" autocomplete="off" class="narrow"><input type="hidden" name="csrf" value="{E(token)}">'
+            f'<label for="i">회원 ID</label><input id="i" name="id" required minlength="2" maxlength="32" pattern="[a-z][a-z0-9]{{1,31}}" value="{E(id_)}" data-focus>'
+            '<p class="hint">영문 소문자로 시작, 소문자·숫자만 2~32자(하이픈·밑줄 불가). 입력 검사는 편의 기능이고 서버가 최종 검사합니다.</p>'
+            f'<label for="e">이메일</label><input id="e" name="email" type="email" required maxlength="254" value="{E(email)}">'
+            '<p class="hint">초기 안내가 이 주소로 전달됩니다. 등록에는 수십 초에서 몇 분이 걸립니다.</p>'
+            '<button type="submit" class="mt">등록 시작</button></form>')
+
+def job_body(token, jid, r):
+    st, log = r.get("state"), E(r.get("log", ""))
+    if r.get("kind") == "link":      # 안내 링크 발급 job(이미 끝난 상태로 만들어진다)
+        if r.get("secret_ready"):
+            return (f'<h1>안내 링크 발급 완료</h1><form method="post" action="/jobs/{E(jid)}/secret"><input type="hidden" name="csrf" value="{E(token)}">'
+                    '<p class="msg err">안내 링크는 <b>한 번만</b> 표시됩니다. 표시하면 서버에서 지워지고, 새로고침·뒤로가기로는 다시 볼 수 없습니다. 10분이 지나도 지워집니다.</p>'
+                    '<button type="submit">안내 링크 표시(한 번만)</button></form><p><a href="/members">회원 목록</a></p>')
+        return f'<h1>안내 링크</h1>{msg("표시할 링크가 없습니다(이미 확인했거나 10분이 지났습니다). 다시 볼 수 없으니 필요하면 새로 발급하세요.")}<p><a href="/members">회원 목록</a></p>'
+    logbox = term("member-add", f'<pre id="joblog" class="log{" cursor" if st in ("queued", "running") else ""}">{log}</pre>', "@@PFX@@-member-add <id> --email <mail>")
+    if st in ("queued", "running"):
+        return (f'<h1>회원 등록 진행 중</h1><div data-job="/jobs/{E(jid)}/status"></div>'
+                f'<p class="msg">{"앞선 작업이 끝나기를 기다리는 중입니다." if st == "queued" else "등록 중입니다. 이 화면은 자동으로 갱신됩니다(JavaScript 를 쓸 수 없으면 새로고침하세요)."}</p>{logbox}')
+    if st == "failed":
+        why = {"maint": "정비 작업이 실행 중이라 시작하지 못했습니다. 끝난 뒤 다시 등록하세요.", "timeout": "시간이 너무 오래 걸려 중단했습니다."}.get(r.get("why"), "등록에 실패했습니다. 아래 로그를 확인하세요. 일부 단계가 이미 끝났을 수 있습니다.")
+        if "이미 등록된 이메일" in r.get("log", ""): why = "이미 다른 회원이 쓰는 이메일입니다. 다른 이메일로 등록하세요(아직 아무것도 만들어지지 않았습니다)."
+        return f'<h1>회원 등록 실패</h1>{msg(why, True)}{logbox}<p><a href="/members/new">다시 등록</a></p>'
+    if r.get("secret_ready"):
+        sec = (f'<form method="post" action="/jobs/{E(jid)}/secret"><input type="hidden" name="csrf" value="{E(token)}">'
+               '<p class="msg err">초기 비밀번호는 <b>한 번만</b> 표시됩니다. 표시하면 서버에서 지워지고, 새로고침·뒤로가기로는 다시 볼 수 없습니다. 10분이 지나도 지워집니다.</p>'
+               '<button type="submit">초기 비밀번호 표시(한 번만)</button></form>')
+    else: sec = msg("표시할 초기 비밀번호가 없습니다(이미 확인했거나 10분이 지났습니다). 다시 볼 수 없습니다.")
+    return f'<h1>회원 등록 완료</h1>{sec}<h2>진행 로그</h2>{logbox}<p><a href="/members">회원 목록</a></p>'
+
+def secret_body(secret, kind="add"):
+    if kind == "link":
+        return ('<h1>안내 링크</h1><p class="msg err"><b>다시 볼 수 없습니다.</b> 지금 복사해서 회원에게 안전하게 전달하세요. 링크는 한 번 열면 폐기되고, 새로고침·뒤로가기를 하면 사라진 상태로 보입니다.</p>'
+                f'<p><code id="sec" class="secret">{E(secret)}</code></p><p><button type="button" data-copy="sec">복사</button></p><p><a href="/members">회원 목록</a></p>')
+    return ('<h1>초기 비밀번호</h1><p class="msg err"><b>다시 볼 수 없습니다.</b> 지금 복사해서 안전하게 전달하세요. 새로고침·뒤로가기를 하면 사라진 상태로 보입니다.</p>'
+            f'<p><code id="sec" class="secret">{E(secret)}</code></p><p><button type="button" data-copy="sec">복사</button></p>'
+            '<p><a href="/members">회원 목록</a></p>')
+
+ERR_TEXT = {"bad_request": "입력 형식이 올바르지 않습니다.", "unknown_op": "지원하지 않는 작업입니다.", "tool_missing": "서버에 필요한 도구가 없습니다.",
+            "tool_failed": "도구 실행에 실패했습니다.", "busy": "다른 작업이 실행 중입니다. 잠시 뒤에 다시 하세요.", "busy_conn": "접속이 많습니다. 잠시 뒤에 다시 하세요.",
+            "totp_not_enrolled": "인증 앱(TOTP)이 아직 등록되지 않았습니다. 서버에서 등록을 먼저 해야 합니다.", "internal_error": "내부 오류입니다. 관리자에게 알리세요.",
+            "stepup_required": "재확인이 필요합니다.", "reserved_id": "예약된 ID 라서 회원 ID 로 쓸 수 없습니다. 다른 ID 를 고르세요.", "bad_email": "이메일 주소 형식이 올바르지 않습니다.",
+            "not_found": "작업을 찾을 수 없습니다(끝난 지 오래되었거나 서버가 다시 시작되었습니다).", "no_secret": "표시할 비밀이 없습니다. 이미 확인했거나 10분이 지났습니다. 다시 볼 수 없습니다.",
+            "no_member": "해당 회원을 찾을 수 없습니다.", "bad_id": "회원 ID 형식이 올바르지 않습니다.", "link_failed": "안내 링크를 만들지 못했습니다."}
+def err_text(r):
+    e = r.get("error"); return ERR_TEXT.get(e, "처리하지 못했습니다.")
+
+# ── HTTP ──
+class H(BaseHTTPRequestHandler):
+    timeout = 10          # 소켓 읽기 한 번의 제한. 요청 전체 시간은 아래 타이머가 따로 끊는다
+    server_version = "adm"; sys_version = ""
+
+    def setup(self):
+        super().setup()
+        self._dl = threading.Timer(CFG["deadline"], self._kill); self._dl.daemon = True; self._dl.start()
+    def _kill(self):
+        try: self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+    def finish(self):
+        self._dl.cancel()
+        try: super().finish()
+        except OSError: pass
+    def log_message(self, *a): pass
+
+    # 직접 연결 상대가 127.0.0.1(Caddy)일 때만 전용 헤더를 믿는다. 아니면 헤더는 무시하고 연결 상대 주소를 쓴다. X-Forwarded-* 는 읽지 않는다.
+    def who(self):
+        peer = self.client_address[0]
+        if peer != "127.0.0.1": return peer, "local"
+        ip, via = peer, "local"
+        try:
+            v = ipaddress.ip_address(self.headers.get("X-Admin-Client-IP", "").strip())
+            if "%" not in str(v): ip = str(v)
+        except ValueError: pass
+        w = self.headers.get("X-Admin-Via", "").strip()
+        if w in VIA: via = w
+        return ip, via
+
+    def send(self, code, body=b"", ctype="text/html; charset=utf-8", cookies=(), extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400" if ctype.startswith("font/") else "no-store")
+        if not ctype.startswith("font/"): self.send_header("Pragma", "no-cache")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        for c in cookies: self.send_header("Set-Cookie", c)
+        for k, v in (extra or {}).items(): self.send_header(k, v)
+        self.send_header("Connection", "close"); self.end_headers()
+        if self.command != "HEAD": self.wfile.write(body)
+        self.close_connection = True
+
+    def simple(self, code, title, text, extra=None, cookies=()):
+        self.send(code, page(title, f'<div class="card"><h1>{E(title)}</h1><p>{E(text)}</p></div>'), extra=extra, cookies=cookies)
+    def redirect(self, to, cookies=()): self.send(303, b"", extra={"Location": to}, cookies=cookies)
+
+    def cookie(self, name, rx):
+        vals = []
+        for h in self.headers.get_all("Cookie") or []:
+            for part in h.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == name: vals.append(v)
+        return vals[0] if len(vals) == 1 and rx.fullmatch(vals[0]) else ""   # 같은 이름이 여러 개면 없는 것으로 본다
+
+    def set_cookie(self, name, value, age=None):
+        return f"{name}={value}; Path=/; Secure; HttpOnly; SameSite=Strict" + (f"; Max-Age={age}" if age is not None else "")
+    def clear(self, name): return self.set_cookie(name, "", 0)
+
+    def read_form(self):
+        if self.headers.get("Transfer-Encoding") is not None: return None
+        if len(self.headers.get_all("Content-Length") or []) != 1: return None
+        try: n = int(self.headers["Content-Length"])
+        except ValueError: return None
+        if n < 0 or n > MAX_BODY: return None
+        if self.headers.get_content_type() != "application/x-www-form-urlencoded": return None
+        raw = self.rfile.read(n)
+        if len(raw) != n: return None
+        try: q = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=8)
+        except (ValueError, UnicodeDecodeError): return None
+        if any(len(v) != 1 for v in q.values()): return None
+        return {k: v[0] for k, v in q.items()}
+
+    def origin_ok(self):
+        want = "https://" + self.headers.get("Host", "")
+        o = self.headers.get("Origin")
+        if o is None:
+            r = self.headers.get("Referer")
+            if not r: return False
+            try: u = urlsplit(r); o = f"{u.scheme}://{u.netloc}"
+            except ValueError: return False
+        return o == want
+
+    def route(self):
+        try: self._route()
+        except (OSError, ValueError) as e:
+            log(f"요청 처리 중단 {type(e).__name__}"); self.close_connection = True
+        except Exception as e:
+            log(f"내부 오류 {type(e).__name__}")
+            try: self.simple(500, "오류", "처리하지 못했습니다. 잠시 뒤에 다시 하세요.")
+            except OSError: pass
+
+    def _route(self):
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) != 1: return self.simple(400, "잘못된 요청", "Host 헤더가 올바르지 않습니다.")
+        if hosts[0].lower() not in CFG["hosts"]: return self.simple(421, "허용되지 않는 주소", "이 주소로는 접속할 수 없습니다.")
+        parts = self.requestline.split(); raw = parts[1] if len(parts) == 3 else ""
+        path = raw.split("?", 1)[0]       # 쿼리는 쓰지 않는다. 경로는 원래 요청줄 그대로 정확히 비교한다(//·%2e 변형은 404)
+        post = self.command == "POST"
+        if path in STATIC:
+            if post: return self.other()
+            body, ctype = STATIC[path]
+            return self.send(200, body, ctype)
+        m = JOB_PATH.fullmatch(path)
+        if m:
+            if post and m.group(2) != "/secret" or not post and m.group(2) == "/secret": return self.other()
+            fn = {"": self.job_get, "/status": self.job_json, "/secret": self.job_secret}[m.group(2)]
+            return self.run(fn, post, m.group(1))
+        m = MEMBER_PATH.fullmatch(path)
+        if m:      # 상세는 GET, 버튼(발급·폐기·상태·봉인·페어링)은 POST
+            act = m.group(2)[1:]
+            if post != bool(act): return self.other()
+            return self.run(self.member_act, True, m.group(1), act) if act else self.run(self.member_get, False, m.group(1))
+        table = {"/": (self.root, None), "/login": (self.login_get, self.login_post), "/logout": (None, self.logout_post),
+                 "/members": (self.members, None), "/members/new": (self.new_get, self.new_post), "/stepup": (self.stepup_get, self.stepup_post)}
+        if path not in table: return self.simple(404, "찾을 수 없음", "없는 주소입니다.")
+        fn = table[path][1 if post else 0]
+        if fn is None: return self.other()
+        self.run(fn, post)
+
+    def run(self, fn, post, *extra):
+        ip, via = self.who(); form = None
+        if post:
+            if not self.origin_ok(): self.close_connection = True; return self.simple(403, "거부됨", "요청 출처가 올바르지 않습니다. 화면을 새로 열어 다시 하세요.")
+            form = self.read_form()
+            if form is None: self.close_connection = True; return self.simple(400, "잘못된 요청", "요청 형식이 올바르지 않거나 너무 큽니다.")
+        self._dl.cancel()      # 요청을 다 받았다 — 이후는 도우미 처리 시간(느릴 수 있음)
+        try: fn(ip, via, form, *extra)
+        except HelperDown:
+            log("도우미 연결 실패"); self.simple(503, "일시 중단", "관리 도우미에 연결할 수 없습니다. 서버 관리자에게 알리세요.")
+
+    def other(self):
+        self.simple(405, "허용되지 않는 요청", "GET · POST 만 받습니다.", {"Allow": "GET, POST"})
+
+    # 세션 쿠키가 없거나 도우미가 no_session 이라고 하면 쿠키를 지우고 로그인 화면으로 보낸다
+    def to_login(self): self.redirect("/login", [self.clear(SID_COOKIE)])
+
+    def root(self, ip, via, form): self.redirect("/members")
+
+    def login_get(self, ip, via, form, note=""):
+        pre = self.cookie(PRE_COOKIE, PRE_RE); ck = []
+        if not pre: pre = secrets.token_urlsafe(32); ck = [self.set_cookie(PRE_COOKIE, pre)]
+        self.send(200, page("로그인", login_body(csrf_for(pre), note)), cookies=ck)
+
+    def login_post(self, ip, via, form):
+        pre = self.cookie(PRE_COOKIE, PRE_RE)
+        if not csrf_ok(pre, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 로그인 화면을 새로 열어 다시 하세요.")
+        r = helper("login", ip, via, args={"user": form.get("user", ""), "password": form.get("password", ""), "code": form.get("code", "")})
+        if r["ok"] and isinstance(r.get("result"), dict) and SID_RE.fullmatch(str(r["result"].get("sid", ""))):
+            log(f"로그인 성공 ip={ip} via={via}")
+            return self.redirect("/members", [self.set_cookie(SID_COOKIE, r["result"]["sid"]), self.clear(PRE_COOKIE)])
+        e = r.get("error"); log(f"로그인 실패 ip={ip} via={via} error={e if e in ERR_TEXT or e in ('auth_failed', 'blocked') else '?'}")
+        if e == "auth_failed": note = msg("비밀번호 또는 코드가 틀렸습니다.", True); code = 401
+        elif e == "blocked": note = msg(f"시도가 너무 많습니다. {int(r.get('retry_after', 0)) // 60 + 1}분쯤 뒤에 다시 하세요.", True); code = 429
+        else: note = msg(err_text(r), True); code = 400
+        n = secrets.token_urlsafe(32)   # 실패 화면의 폼은 새 쿠키·새 토큰으로
+        self.send(code, page("로그인", login_body(csrf_for(n), note)), cookies=[self.set_cookie(PRE_COOKIE, n)])
+
+    def logout_post(self, ip, via, form):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        if not csrf_ok(sid, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 새로 열어 다시 하세요.")
+        try: helper("logout", ip, via, sid)
+        except HelperDown: log("도우미 연결 실패")   # 그래도 쿠키는 지운다
+        self.to_login()
+
+    def members(self, ip, via, form):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        r = helper("member.list", ip, via, sid)
+        if not r["ok"]:
+            if r.get("error") == "no_session": return self.to_login()
+            return self.send(502, page("회원", msg(err_text(r), True), nav_html(csrf_for(sid))))
+        self.send(200, page("회원", members_body(r.get("result", {}).get("data")), nav_html(csrf_for(sid))))
+
+    def member_get(self, ip, via, form, mid, note=""):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        r = helper("member.detail", ip, via, sid, {"id": mid}); t = csrf_for(sid)
+        m = r.get("result", {}).get("member") if r["ok"] and isinstance(r.get("result"), dict) else None
+        if not isinstance(m, dict) or m.get("id") != mid:
+            if r.get("error") == "no_session": return self.to_login()
+            return self.send(404 if r.get("error") in ("no_member", "bad_id") else 502, page("회원", msg(err_text(r) if not r["ok"] else "회원 정보 형식을 알 수 없습니다.", True), nav_html(t)))
+        self.send(200, page("회원 " + mid, detail_body(t, m, note), nav_html(t)))
+
+    def member_act(self, ip, via, form, mid, act):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        if not csrf_ok(sid, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 새로 열어 다시 하세요.")
+        r = helper(ACTS[act], ip, via, sid, {"id": mid}); t = csrf_for(sid); res = r.get("result") if r["ok"] and isinstance(r.get("result"), dict) else {}
+        if act == "link-issue" and JOB_ID.fullmatch(str(res.get("job", ""))):
+            log("안내 링크 발급"); return self.redirect("/jobs/" + res["job"])      # 링크는 job.secret 한 번 표시 경로로만 보인다(이 응답·로그에는 없다)
+        title = {"link-issue": "안내 링크 발급", "link-revoke": "안내 링크 폐기", "link-status": "안내 링크 상태", "seal": "봉인", "pair-refresh": "페어링 갱신"}[act]
+        if r["ok"]:
+            log(f"회원 작업 {act}")
+            if act == "pair-refresh": return self.send(200, page(title, result_body(mid, title, msg("온보딩 파일을 갱신했습니다. 페어링 링크는 보안상 이 화면에 표시하지 않습니다(같은 링크가 다시 만들어진 것이며 무효화가 아닙니다)."), ""), nav_html(t)))
+            if act == "link-issue": return self.send(502, page(title, result_body(mid, title, msg("도우미 응답을 해석하지 못했습니다.", True)), nav_html(t)))
+            text = str(res.get("text", ""))
+            return self.send(200, page(title, result_body(mid, title, msg("완료했습니다.") if act != "link-status" else "", text), nav_html(t)))
+        e = r.get("error")
+        if e == "no_session": return self.to_login()
+        note = msg(err_text(r) + (" 재확인 화면에서 코드를 입력한 뒤 다시 하세요." if e == "stepup_required" else ""), True)
+        if e == "stepup_required": note += '<p><a href="/stepup">재확인 화면으로</a></p>'
+        detail = r.get("detail") if isinstance(r.get("detail"), str) else ""
+        if "링크 서비스 계정" in detail: note += msg("이 서버는 1회 열람 링크 서비스를 켜지 않고 설치되었습니다(전달 채널에 link 없음). 켜려면 설치 설정의 ONBOARD_CHANNELS 에 link 를 넣고 53 단계를 다시 실행하세요(docs/ONBOARDING.md). 그때까지는 화면(screen) 전달을 쓰세요.")
+        code = 404 if e in ("no_member", "bad_id") else 409 if e == "busy" else 400 if e in ("link_failed", "stepup_required") else 502
+        self.send(code, page(title, result_body(mid, title, note, detail), nav_html(t)))
+
+    def stepup_get(self, ip, via, form, note=""):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        r = helper("session.check", ip, via, sid)
+        if not r["ok"]: return self.to_login() if r.get("error") == "no_session" else self.send(502, page("재확인", msg(err_text(r), True), nav_html(csrf_for(sid))))
+        t = csrf_for(sid)
+        left = r.get("result", {}).get("stepup_remaining", 0)
+        if isinstance(left, int) and left > 0: note += msg(f"재확인이 유효합니다(남은 {left}초).")
+        self.send(200, page("재확인", stepup_body(t, note), nav_html(t)))
+
+    def stepup_post(self, ip, via, form):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        if not csrf_ok(sid, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 새로 열어 다시 하세요.")
+        r = helper("stepup", ip, via, sid, {"code": form.get("code", "")})
+        if r["ok"]: return self.stepup_get(ip, via, None, msg("재확인되었습니다. 120초 안에 작업을 진행하세요."))
+        e = r.get("error")
+        if e == "no_session" or r.get("session_ended"): return self.to_login()
+        t = csrf_for(sid)
+        note = msg("코드가 틀렸습니다. 방금 쓴 코드는 다시 쓸 수 없습니다. 3번 틀리면 로그아웃됩니다." if e == "stepup_failed" else err_text(r), True)
+        self.send(401 if e == "stepup_failed" else 400, page("재확인", stepup_body(t, note), nav_html(t)))
+
+    def new_get(self, ip, via, form, note="", id_="", email="", code=200):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        t = csrf_for(sid); self.send(code, page("회원 등록", new_body(t, note, id_, email), nav_html(t)))
+
+    def new_post(self, ip, via, form):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        if not csrf_ok(sid, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 새로 열어 다시 하세요.")
+        id_, email = form.get("id", ""), form.get("email", "")
+        if not ID_RE.fullmatch(id_): return self.new_get(ip, via, None, msg(id_reason(id_), True), id_, email, 400)    # 서버가 최종 검사하되, 이유는 웹이 설명한다
+        r = helper("member.add", ip, via, sid, {"id": id_, "email": email})
+        if r["ok"] and isinstance(r.get("result"), dict) and JOB_ID.fullmatch(str(r["result"].get("job", ""))):
+            log(f"회원 등록 시작 ip={ip}"); return self.redirect("/jobs/" + r["result"]["job"])
+        e = r.get("error")
+        if e == "no_session": return self.to_login()
+        if e == "bad_id": text = id_reason(id_)
+        elif e == "busy": text = "정비 작업이 실행 중이라 등록을 시작하지 않았습니다. 끝난 뒤 다시 하세요." if r.get("why") == "maint" else "등록 작업이 이미 실행 중이고 대기 중인 작업도 있습니다. 끝난 뒤 다시 하세요."
+        else: text = err_text(r)
+        t = csrf_for(sid)
+        self.send(409 if e == "busy" else 400 if e in ("bad_id", "reserved_id", "bad_email", "bad_request") else 502, page("회원 등록", new_body(t, msg(text, True), id_, email), nav_html(t)))
+
+    def job_get(self, ip, via, form, jid):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        r = helper("job.status", ip, via, sid, {"job": jid})
+        t = csrf_for(sid)
+        if not r["ok"]:
+            if r.get("error") == "no_session": return self.to_login()
+            return self.send(404 if r.get("error") == "not_found" else 502, page("회원 등록", msg(err_text(r), True), nav_html(t)))
+        self.send(200, page("회원 등록", job_body(t, jid, r.get("result", {})), nav_html(t)))
+
+    def job_json(self, ip, via, form, jid):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.send(401, b'{"state":"x"}', "application/json")
+        r = helper("job.status", ip, via, sid, {"job": jid}); d = r.get("result") if r["ok"] and isinstance(r.get("result"), dict) else {}
+        out = {"state": d.get("state", "x"), "log": d.get("log", "")}
+        self.send(200 if r["ok"] else 401 if r.get("error") == "no_session" else 404, json.dumps(out).encode(), "application/json")
+
+    def job_secret(self, ip, via, form, jid):
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        if not csrf_ok(sid, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 새로 열어 다시 하세요.")
+        r = helper("job.secret", ip, via, sid, {"job": jid}); t = csrf_for(sid)
+        if r["ok"] and isinstance(r.get("result"), dict) and isinstance(r["result"].get("secret"), str):
+            log("비밀 1회 표시"); return self.send(200, page("비밀 표시", secret_body(r["result"]["secret"], r["result"].get("kind")), nav_html(t)))
+        if r.get("error") == "no_session": return self.to_login()
+        self.send(404, page("초기 비밀번호", msg(err_text(r), True), nav_html(t)))
+
+    do_GET = do_POST = route
+    do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = other
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k); self._sem = threading.BoundedSemaphore(MAX_CONN)
+    def process_request(self, request, client_address):
+        if not self._sem.acquire(blocking=False):
+            try: request.settimeout(1); request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 5\r\nConnection: close\r\n\r\n")
+            except OSError: pass
+            self.shutdown_request(request); return
+        super().process_request(request, client_address)
+    def process_request_thread(self, request, client_address):
+        try: super().process_request_thread(request, client_address)
+        finally: self._sem.release()
+    def handle_error(self, request, client_address):
+        log(f"연결 처리 오류 {type(sys.exc_info()[1]).__name__}")   # 기본 구현은 트레이스백을 찍는다
+
+def main():
+    ap = argparse.ArgumentParser(prog="@@PFX@@-admin-web")
+    ap.add_argument("--port", type=int, default=8433)
+    ap.add_argument("--socket", default=CFG["socket"])
+    ap.add_argument("--allow-host", action="append", required=True, help="허용할 Host 값(포트 포함 그대로). 여러 번 지정")
+    ap.add_argument("--deadline", type=float, default=CFG["deadline"], help="요청 하나를 받는 데 허용하는 총 시간(초)")
+    a = ap.parse_args()
+    CFG.update(socket=a.socket, hosts=tuple(h.strip().lower() for h in a.allow_host if h.strip()), deadline=a.deadline)
+    srv = Server(("127.0.0.1", a.port), H)
+    log(f"@@PFX@@-admin-web 시작 127.0.0.1:{srv.server_address[1]}")
+    srv.serve_forever()
+
+if __name__ == "__main__":
+    main()

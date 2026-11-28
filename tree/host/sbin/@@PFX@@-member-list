@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+# @@PFX@@-member-list [--json] (root) — 웹 관리 화면용 회원 목록 JSON(파이썬 표준 라이브러리만). 인자 없이 실행해도 같은 JSON 을 낸다.
+#   {"members":[{"id","email","created","state","container","image","tmux","limits","suspended","onboarding"}...]}
+# 회원 = 접근 정책 도구(@@PFX@@-access-lib.sh)의 acc_members 규칙: 회원 홈 폴더(USER_ROOT_BASE/<ID>) 이면서 `id <ID>` 가 성공하는 이름.
+# 읽는 것: 메타 config/members/<ID>.json(email·created_at) · <ID>.limits · <ID>.suspended · docker 상태(필드 지정 `-f` 만 — 전체 inspect·logs 없음) · tmux «개수».
+# 읽지 않는 것: tmux 세션 이름(개수만 세므로 고정 형식 `-F x` 를 쓴다 — 대화 제목 유출 방지)·환경변수·마운트·라벨. 이메일은 이 도구가 내보낸다(목록 화면이 숨기는 것은 웹 몫).
+# 소스(docker·메타·한도·tmux) 하나가 실패해도 나머지는 내고 그 필드만 null 이다. 회원 홈 폴더 목록 자체를 읽지 못하면 종료 코드 1.
+# 필드: state = docker 상태 문자열(running·exited…) · "missing"(컨테이너 없음) · null(docker 확인 실패) / image = "CURRENT"|"OLD"|null(Golden 포인터와 비교)
+#       onboarding = {"dir": 온보딩 폴더 있음, "files": 남은 페어링 파일 수(0~3), "sealed": 폴더가 있고 페어링 파일이 없음, "password_pending": 초기 비밀번호 파일이 서버에 남아 있음(전달 전이거나 링크 재발급용 — 전달을 마치면 지워진다)} — 존재 여부만 보고 내용은 읽지 않는다.
+#       tmux = 정수(실행 중 컨테이너만) · limits = {"memory","swap","cpus"} 중 유효한 값(파일 없으면 null) · suspended = 불리언.
+import argparse, json, os, re, stat, subprocess, sys
+
+PFX = "@@PFX@@"
+ID_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")      # 도우미(admin_common)의 EMAIL_RE 와 같아야 한다 — 어긋나면 도우미가 목록 전체를 거부한다
+TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+MEM_RE, CPU_RE = re.compile(r"[1-9][0-9]{0,4}[mg]"), re.compile(r"[0-9]{1,3}(\.[0-9]{1,2})?")      # 한도 파일 검증 규칙(dev-container-create 패치와 같음)
+STATE_RE, IMG_RE = re.compile(r"[a-z]{1,16}"), re.compile(r"sha256:[0-9a-f]{64}")
+LIMIT_KEYS = {"DEV_MEMORY_LIMIT": ("memory", MEM_RE), "DEV_MEMORY_SWAP": ("swap", MEM_RE), "DEV_CPU_LIMIT": ("cpus", CPU_RE)}
+ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
+
+def run(argv, timeout=5):
+    try: return subprocess.run(argv, shell=False, env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/", timeout=timeout)
+    except (OSError, subprocess.SubprocessError): return None
+
+def read_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            k, s, v = line.strip().partition("=")
+            if s and re.fullmatch(r"[A-Z_][A-Z0-9_]*", k):
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"": v = v[1:-1]
+                out[k] = v
+    except OSError: pass
+    return out
+
+def read_small(path):
+    """일반 파일(심볼릭 링크 아님)만 64KB 까지. 없거나 이상하면 None."""
+    try: fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError: return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode): return None
+        return os.read(fd, 65536).decode("utf-8", "replace")
+    except OSError: return None
+    finally: os.close(fd)
+
+def meta(mdir, id_):
+    """-> (email, created). 파일이 없거나 형식이 틀리면 해당 값 None."""
+    try: d = json.loads(read_small(os.path.join(mdir, id_ + ".json")) or "")
+    except ValueError: return None, None
+    if not isinstance(d, dict): return None, None
+    e, c = d.get("email"), d.get("created_at")
+    return (e if isinstance(e, str) and EMAIL_RE.fullmatch(e) else None), (c if isinstance(c, str) and TIME_RE.fullmatch(c) else None)
+
+def limits(mdir, id_):
+    p = os.path.join(mdir, id_ + ".limits")
+    if not os.path.lexists(p): return None
+    txt = read_small(p)
+    if txt is None: return None
+    out = {}
+    for line in txt.splitlines():
+        k, s, v = line.rstrip("\r").partition("=")
+        if s and k in LIMIT_KEYS and LIMIT_KEYS[k][1].fullmatch(v): out[LIMIT_KEYS[k][0]] = v
+    return out
+
+PAIR_FILES = ("pairing-url.txt", "pairing.json", "pairing.png")
+def onboarding(odir, sdir, id_):
+    """온보딩 상태 — 존재 여부만 본다(내용·링크·비밀번호는 읽지 않는다)."""
+    d = os.path.join(odir, id_)
+    try: isdir = stat.S_ISDIR(os.lstat(d).st_mode)
+    except OSError: isdir = False
+    n = sum(1 for f in PAIR_FILES if os.path.lexists(os.path.join(d, f))) if isdir else 0
+    return {"dir": isdir, "files": n, "sealed": isdir and n == 0, "password_pending": os.path.lexists(os.path.join(sdir, id_ + ".password"))}
+
+def members(root, idbin):
+    names = []
+    for n in sorted(os.listdir(root)):        # 읽을 수 없으면 예외 → 종료 코드 1
+        if ID_RE.fullmatch(n) and os.path.isdir(os.path.join(root, n)):
+            u, g = run([idbin, "-u", n]), run([idbin, "-g", n])         # acc_members 의 `id <ID>` 성공 조건
+            if all(x is not None and x.returncode == 0 and re.fullmatch(r"[0-9]{1,10}", x.stdout.decode().strip()) for x in (u, g)): names.append((n, int(u.stdout), int(g.stdout)))
+    return names
+
+def main():
+    ap = argparse.ArgumentParser(prog=PFX + "-member-list")
+    ap.add_argument("--json", action="store_true", help="JSON 출력(기본이며 유일한 형식)")
+    ap.add_argument("--users-root"); ap.add_argument("--meta-dir", default=f"/opt/{PFX}/config/members"); ap.add_argument("--env-file", default=f"/opt/{PFX}/config/dev-container.env")
+    ap.add_argument("--onboarding-dir", default=f"/srv/{PFX}/onboarding"); ap.add_argument("--secrets-dir", default=f"/run/{PFX}/member-secrets")
+    ap.add_argument("--docker", default="/usr/bin/docker"); ap.add_argument("--id-bin", default="/usr/bin/id")
+    a = ap.parse_args()
+    env = read_env(a.env_file)
+    root = a.users_root or env.get("USER_ROOT_BASE") or f"/srv/{PFX}/users"
+    try: found = members(root, a.id_bin)
+    except OSError:
+        print("실패: 회원 홈 폴더 목록을 읽을 수 없습니다", file=sys.stderr); return 1
+    dk = a.docker; golden = None
+    if re.fullmatch(r"[A-Za-z0-9._:/@-]{1,200}", env.get("GOLDEN_IMAGE", "")):
+        r = run([dk, "image", "inspect", "-f", "{{.Id}}", env["GOLDEN_IMAGE"]])
+        if r is not None and r.returncode == 0 and IMG_RE.fullmatch(r.stdout.decode().strip()): golden = r.stdout.decode().strip()
+    daemon = []      # docker 가 살아 있는지(컨테이너 없음과 구분) — 처음 필요할 때 한 번만 확인
+    def up():
+        if not daemon: r = run([dk, "version", "-f", "{{.Server.Version}}"]); daemon.append(r is not None and r.returncode == 0)
+        return daemon[0]
+    rows = []
+    for id_, uid, gid in found:
+        name = "dev-" + id_; state = image = tmux = None
+        r = run([dk, "container", "inspect", "-f", "{{.State.Status}} {{.Image}}", name])
+        if r is not None and r.returncode == 0:
+            st, _, img = r.stdout.decode().strip().partition(" ")
+            if STATE_RE.fullmatch(st):
+                state = st
+                if golden and IMG_RE.fullmatch(img): image = "CURRENT" if img == golden else "OLD"
+        elif r is not None and up(): state = "missing"
+        if state == "running":
+            r = run([dk, "exec", name, "setpriv", f"--reuid={uid}", f"--regid={gid}", "--init-groups", "--", "env", f"HOME=/home/{id_}", f"USER={id_}", f"LOGNAME={id_}", "tmux", "list-sessions", "-F", "x"])
+            if r is not None and r.returncode == 0: tmux = sum(1 for ln in r.stdout.decode("utf-8", "replace").splitlines() if ln == "x")
+            elif r is not None and r.returncode == 1: tmux = 0      # tmux 는 서버가 없으면 1 로 끝난다(세션 0개)
+        email, created = meta(a.meta_dir, id_)
+        rows.append({"id": id_, "email": email, "created": created, "state": state, "container": name, "image": image, "tmux": tmux,
+                     "limits": limits(a.meta_dir, id_), "suspended": os.path.lexists(os.path.join(a.meta_dir, id_ + ".suspended")),
+                     "onboarding": onboarding(a.onboarding_dir, a.secrets_dir, id_)})
+    print(json.dumps({"members": rows}, ensure_ascii=True, separators=(",", ":")))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

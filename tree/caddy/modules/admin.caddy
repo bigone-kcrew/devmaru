@@ -1,0 +1,32 @@
+# >>> admin-web
+# 모듈: admin (웹 관리 화면) — 50 단계가 값을 채운다. 앱은 127.0.0.1 에만 듣고 공개는 전부 이 Caddy 를 거친다. 평문 HTTP 블록은 두지 않는다.
+(admin_proxy) {
+	import access_log
+	@denied not remote_ip __ADMIN_WEB_CIDRS__
+	respond @denied "Forbidden" 403
+	request_body {
+		max_size 64KB
+	}
+	reverse_proxy 127.0.0.1:__ADMIN_WEB_PORT__ {
+		header_up -X-Forwarded-For
+		header_up X-Admin-Client-IP {remote_host}
+		header_up X-Admin-Via {args[0]}
+	}
+}
+@@ADMIN_HOST@@ {
+	import admin_proxy public
+}
+# >>> admin-lan
+# 사설 IP(ADMIN_LAN_ADDR 이 있을 때만 생성) — tls internal: 브라우저 경고를 확인하고 수락
+https://__ADMIN_LAN_ADDR__ {
+	tls internal
+	import admin_proxy lan
+}
+# <<< admin-lan
+# 로컬(SSH 터널용) — 127.0.0.1 에만 묶는다
+https://localhost:__ADMIN_LOCAL_PORT__ {
+	bind 127.0.0.1
+	tls internal
+	import admin_proxy local
+}
+# <<< admin-web

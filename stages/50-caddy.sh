@@ -21,7 +21,14 @@ LC=""; [ "${TLS_MODE:-acme}" = internal ] && LC=$'\tlocal_certs\n'
 LC+=$'\tservers {\n\t\ttimeouts {\n\t\t\tread_header 10s\n\t\t}\n\t}\n\tlog {\n\t\tformat filter {\n\t\t\twrap json\n\t\t\tfields {\n\t\t\t\trequest>uri regexp "(?i)(/+start/)[^?]*|\\?.*" "$1"\n\t\t\t}\n\t\t}\n\t}\n'
 { printf '{\n\temail %s\n%s}\n\n' "$ADMIN_EMAIL" "$LC"; cat "$O/caddy/Caddyfile.tmpl"
   has files && cat "$O/caddy/modules/files.caddy"; has cockpit && cat "$O/caddy/modules/cockpit.caddy"
-  has n8n && cat "$O/caddy/modules/n8n.caddy"; has uptime-kuma && cat "$O/caddy/modules/uptime-kuma.caddy"; has smb && cat "$O/caddy/modules/smb-acme.caddy"; true; } > "$T"
+  has n8n && cat "$O/caddy/modules/n8n.caddy"; has uptime-kuma && cat "$O/caddy/modules/uptime-kuma.caddy"; has smb && cat "$O/caddy/modules/smb-acme.caddy"
+  # admin: 값(__ADMIN_*__)을 채우고, 사설 IP 블록은 ADMIN_LAN_ADDR 이 있을 때만 남긴다
+  if has admin; then
+    LANDEL='/^# >>> admin-lan$/,/^# <<< admin-lan$/d'; [ -n "${ADMIN_LAN_ADDR:-}" ] && LANDEL='/^# >>> admin-lan$/d;/^# <<< admin-lan$/d'
+    sed -e "$LANDEL" -e "s|__ADMIN_WEB_CIDRS__|${ADMIN_WEB_CIDRS:-${ADMIN_CIDRS:-127.0.0.1/32}}|g" -e "s|__ADMIN_WEB_PORT__|${ADMIN_WEB_PORT:-8433}|g" \
+      -e "s|__ADMIN_LOCAL_PORT__|${ADMIN_LOCAL_PORT:-8444}|g" -e "s|__ADMIN_LAN_ADDR__|${ADMIN_LAN_ADDR:-}|g" "$O/caddy/modules/admin.caddy"
+  fi
+  true; } > "$T"
 [ -f "$C/Caddyfile" ] && cp -a "$C/Caddyfile" "$C/Caddyfile.bak.$(date +%Y%m%d-%H%M%S)"
 install -m 0644 "$T" "$C/Caddyfile"; rm -f "$T"
 if caddy validate --config "$C/Caddyfile" >/dev/null 2>&1; then echo "성공: caddy validate"
