@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# @@PFX@@-member-lifecycle (root) — 회원 삭제 수명주기: 정지 → 아카이브 → 보관 기간 → 최종 삭제(파이썬 표준 라이브러리만). 웹 관리 도우미·일일 타이머·셸이 같은 도구를 쓴다.
+#   request-delete <ID>                                   정지 + 아카이브 → state=pending_delete, delete_after = 지금 + ADMIN_RETENTION_DAYS(기본 7, 1~365)
+#   cancel <ID>                                           삭제 요청 취소 → 재개(member-suspend resume) → state=active. 아카이브는 지우지 않는다
+#   final-delete <ID> --archive <ARCH> --confirm <ID>     모든 검사 통과 시에만 `member-remove <ID> --force`. 하나라도 실패하면 아무것도 지우지 않는다
+#   status [<ID>] [--json]                                수명주기 상태(--json 은 한 줄 JSON: {"version":1,"retention_days":N,"members":{"<ID>":{state,delete_after,days_left,due,archive,suspend_state,last_error,retention_days,…}}})
+#   tick                                                  일일 타이머용: 기한 1일 전·도래 알림, (ADMIN_AUTO_DELETE=1 일 때만) 자동 삭제, 보관 기간이 지난 아카이브 정리
+# 상태 파일: /var/lib/@@PFX@@/admin/members/<ID>.lifecycle.json (root 0600, 원자 교체) — member-suspend 의 <ID>.json 과는 별개다.
+# 상태: active · suspended(삭제 요청 중 오류, 재시도 가능) · pending_delete · deleting · deleted. 알 수 없는 값·깨진 파일은 «unknown» 으로만 보고하고 아무것도 하지 않는다.
+# 알림에는 «회원 ID 와 날짜» 만 싣는다(초기 비밀번호·링크·아카이브 경로 금지).
+# 종료 코드: 0 성공 · 1 실패(외부 도구 오류 등) · 2 사용법·검사 거부(아무것도 바꾸지 않음) · 75 다른 수명주기 작업 실행 중
+import fcntl, json, math, os, re, subprocess, sys, time
+
+PFX = "@@PFX@@"
+# ── 경로·외부 명령(전부 절대 경로 상수 — 시험은 이 줄들을 바꿔 가짜로 돌린다) ──
+NEED_ROOT_UID = 0
+STATE_DIR, SITE_ENV = "/var/lib/@@PFX@@/admin/members", "/etc/@@PFX@@/site.env"
+ENV_FILE, ARCH_ROOT = "/opt/@@PFX@@/config/dev-container.env", "/srv/@@PFX@@/archives/members"
+SUSPEND, ARCHIVE = "/usr/local/sbin/@@PFX@@-member-suspend", "/usr/local/sbin/@@PFX@@-member-archive"
+REMOVE, MAINTENANCE = "/opt/@@PFX@@/scripts/@@PFX@@-member-remove", "/usr/local/sbin/@@PFX@@-maintenance"
+NOTIFY_MAIL, DELIVER = "/usr/local/sbin/@@PFX@@-notify-mail", "/usr/local/sbin/@@PFX@@-onboard-deliver"
+# ── 설정값 ──
+DAY = 86400
+ID_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+ARCH_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}-[0-9]{8}-[0-9]{6}")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+STATES = ("active", "suspended", "pending_delete", "deleting", "deleted")
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "LANG": "C"}
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg); self.code = code
+
+
+def now_ts(): return int(time.time())      # 현재 시각은 여기서만 읽는다(시험이 이 줄을 고정값으로 바꾼다)
+
+
+def iso(ts): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+def day(ts): return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def run(argv, inp=None, timeout=None):
+    try:
+        r = subprocess.run(argv, shell=False, env=ENV, input=inp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd="/", timeout=timeout)
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired: return 124, "시간 초과"
+    except OSError as e: return 127, e.strerror or "실행 실패"
+
+
+def last_line(out): return ((out.strip().splitlines() or [""])[-1])[:160]
+
+
+def read_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            k, s, v = line.strip().partition("=")
+            if s and re.fullmatch(r"[A-Z_][A-Z0-9_]*", k):
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"": v = v[1:-1]
+                out[k] = v
+    except OSError: pass
+    return out
+
+
+def int_opt(env, key, default, lo, hi):
+    v = env.get(key, "")
+    return int(v) if v.isdigit() and lo <= int(v) <= hi else default      # 범위 밖·형식 오류는 기본값
+
+
+# ---------- 상태 파일 ----------
+def lc_path(id_): return os.path.join(STATE_DIR, id_ + ".lifecycle.json")
+
+
+def load(id_):
+    """(상태 dict | None, 문제 문자열 | None). None,None = 파일 없음. 깨졌거나 알 수 없는 값이면 (None, 이유)."""
+    try: d = json.load(open(lc_path(id_), encoding="utf-8"))
+    except FileNotFoundError: return None, None
+    except (OSError, ValueError): return None, "상태 파일을 읽을 수 없습니다(손상?)"
+    if not isinstance(d, dict) or d.get("id") != id_ or d.get("state") not in STATES: return None, "알 수 없는 상태 파일(상태 값 또는 ID 불일치)"
+    for k in ("delete_after_ts", "deleted_ts"):
+        if k in d and d[k] is not None and not isinstance(d[k], int): return None, f"상태 파일 형식 오류({k})"
+    if not isinstance(d.get("notified", {}), dict): return None, "상태 파일 형식 오류(notified)"
+    d.setdefault("notified", {})
+    return d, None
+
+
+def load_ok(id_):
+    d, bad = load(id_)
+    if bad: raise Fail(f"{bad} — 아무것도 바꾸지 않고 중단합니다(수동 확인 필요)", 2)
+    return d
+
+
+def save(d):
+    d["updated"] = iso(now_ts()); p = lc_path(d["id"]); tmp = f"{p}.{os.getpid()}.tmp"
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1); f.flush(); os.fsync(f.fileno())
+    os.rename(tmp, p)
+
+
+def new(id_): return {"version": 1, "id": id_, "state": "active", "archive": None, "last_error": "", "notified": {}}
+
+
+def is_member(id_):
+    root = read_env(ENV_FILE).get("USER_ROOT_BASE") or "/srv/@@PFX@@/users"
+    return os.path.isdir(os.path.join(root, id_)) and not os.path.islink(os.path.join(root, id_))
+
+
+def suspend_state(id_):
+    rc, out = run([SUSPEND, "status", id_, "--json"], timeout=60)
+    try: return json.loads(out).get("state") if rc == 0 else None
+    except (ValueError, AttributeError): return None
+
+
+def maint_idle():
+    rc, _ = run([MAINTENANCE, "status"], timeout=30)
+    return rc == 0
+
+
+def lock():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(STATE_DIR, "lifecycle.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError: return None
+    return fd      # 프로세스가 끝나면 풀린다
+
+
+def check_id(id_):
+    if not isinstance(id_, str) or not ID_RE.fullmatch(id_): raise Fail("회원 ID 형식이 올바르지 않습니다", 2)
+
+
+# ---------- 명령 ----------
+def cmd_request(id_):
+    check_id(id_)
+    if not is_member(id_): raise Fail("존재하는 회원이 아닙니다", 2)
+    d = load_ok(id_) or new(id_)
+    if d["state"] in ("pending_delete", "deleting", "deleted"): raise Fail(f"이미 삭제 절차가 진행됐습니다(상태 {d['state']})", 2)
+    env = read_env(SITE_ENV); days = int_opt(env, "ADMIN_RETENTION_DAYS", 7, 1, 365)
+    rc, out = run([SUSPEND, "suspend", id_])
+    if rc != 0:
+        d.update(state="suspended", last_error=f"정지 실패: {last_line(out)}"); save(d)
+        raise Fail("정지 실패 — 삭제 요청을 중단했습니다. 같은 명령으로 재시도하거나 cancel 로 되돌리세요: " + last_line(out))
+    d.update(state="suspended", last_error="", archive=None); save(d)
+    rc, out = run([ARCHIVE, "create", id_])
+    m = re.search(r"성공: (\S+) ", out)
+    if rc != 0 or not m or not ARCH_RE.fullmatch(m.group(1)) or m.group(1).rsplit("-", 2)[0] != id_:
+        d["last_error"] = f"아카이브 실패: {last_line(out)}"; save(d)
+        raise Fail("아카이브 실패 — 회원은 정지 상태로 유지됩니다(재시도 가능): " + last_line(out))
+    t = now_ts()
+    d.update(state="pending_delete", archive=m.group(1), requested_at=iso(t), requested_ts=t, retention_days=days, delete_after=iso(t + days * DAY),
+             delete_after_ts=t + days * DAY, last_error="", notified={})
+    save(d)
+    print(f"삭제 예정: {id_} · 아카이브 {m.group(1)} · 삭제 가능일 {day(d['delete_after_ts'])}({days}일 보관)")
+    return 0
+
+
+def cmd_cancel(id_):
+    check_id(id_)
+    d = load_ok(id_)
+    if d is None or d["state"] not in ("pending_delete", "suspended"): raise Fail("삭제 예정(또는 삭제 요청 중 오류) 상태가 아닙니다", 2)
+    rc, out = run([SUSPEND, "resume", id_])
+    if rc != 0:
+        d["last_error"] = f"재개 실패: {last_line(out)}"; save(d)
+        raise Fail("재개 실패 — 상태를 유지했습니다(같은 명령으로 재시도): " + last_line(out))
+    d.update(state="active", last_error="", delete_after=None, delete_after_ts=None, notified={}); save(d)
+    print(f"취소: {id_} 재개 완료(아카이브 {d['archive'] or '없음'} 는 남겨 둡니다)")
+    return 0
+
+
+def refuse_reason(d, id_, arch):
+    """최종 삭제 검사. 거부 이유 문자열 또는 None. 외부 명령은 값싼 검사가 모두 통과한 뒤에만 부른다."""
+    if d is None or d["state"] != "pending_delete": return "삭제 예정(pending_delete) 상태가 아닙니다"
+    if d.get("archive") != arch: return "삭제 예정 아카이브와 --archive 값이 다릅니다"
+    if d.get("delete_after_ts") is None or now_ts() < d["delete_after_ts"]: return f"아직 보관 기간 중입니다(삭제 가능일 {day(d['delete_after_ts']) if d.get('delete_after_ts') else '알 수 없음'})"
+    rc, out = run([ARCHIVE, "verify", arch])
+    if rc != 0: return "아카이브 검증 실패: " + last_line(out)
+    if suspend_state(id_) != "suspended": return "회원이 정지 상태가 아닙니다"
+    if not maint_idle(): return "다른 정비 작업이 실행 중입니다"
+    return None
+
+
+def do_final(id_, arch):
+    d = load_ok(id_)
+    why = refuse_reason(d, id_, arch)
+    if why: raise Fail(why, 2)
+    try:
+        man = json.load(open(os.path.join(ARCH_ROOT, arch, "MANIFEST.json"), encoding="utf-8"))
+        sk = man.get("skipped") or []
+        if sk: print(f"경고: 아카이브에 빠진 항목 {len(sk)}개 — " + "; ".join(str(s)[:80] for s in sk[:5]))
+    except (OSError, ValueError, AttributeError): pass
+    d["state"] = "deleting"; save(d)
+    rc, out = run([REMOVE, id_, "--force"])
+    if rc != 0:
+        d.update(state="pending_delete", last_error=f"member-remove 실패(rc={rc}) — 일부만 지워졌을 수 있습니다(수동 확인): {last_line(out)}"); save(d)
+        raise Fail(d["last_error"])
+    t = now_ts(); d.update(state="deleted", deleted_at=iso(t), deleted_ts=t, last_error="", notified={}); save(d)
+    print(f"삭제 완료: {id_} (아카이브 {arch} 는 남깁니다)")
+    return 0
+
+
+def cmd_final(argv):
+    if len(argv) != 5 or argv[1] != "--archive" or argv[3] != "--confirm": raise Fail("사용: final-delete <ID> --archive <ARCH> --confirm <ID>", 2)
+    id_, arch, conf = argv[0], argv[2], argv[4]
+    check_id(id_)
+    if not isinstance(arch, str) or not ARCH_RE.fullmatch(arch): raise Fail("아카이브 ID 형식이 올바르지 않습니다", 2)
+    if conf != id_: raise Fail("--confirm 값이 회원 ID 와 다릅니다", 2)
+    return do_final(id_, arch)
+
+
+def info(d, id_, bad=None):
+    if bad: return {"id": id_, "state": "unknown", "last_error": bad, "due": False, "delete_after": None, "days_left": None, "archive": None, "suspend_state": None}
+    if d is None: return {"id": id_, "state": "none", "last_error": "", "due": False, "delete_after": None, "days_left": None, "archive": None, "suspend_state": suspend_state(id_) if is_member(id_) else None}
+    t = d.get("delete_after_ts"); pend = d["state"] == "pending_delete" and t is not None
+    return {"id": id_, "state": d["state"], "delete_after": d.get("delete_after") if pend else None,
+            "days_left": max(0, math.ceil((t - now_ts()) / DAY)) if pend else None, "due": bool(pend and now_ts() >= t),
+            "archive": d.get("archive"), "suspend_state": None if d["state"] == "deleted" else suspend_state(id_),
+            "requested_at": d.get("requested_at"), "deleted_at": d.get("deleted_at"), "last_error": d.get("last_error", "")}
+
+
+def cmd_status(argv):
+    as_json = "--json" in argv; a = [x for x in argv if x != "--json"]
+    if len(a) > 1: raise Fail("사용: status [<ID>] [--json]", 2)
+    if a: check_id(a[0]); ids = a
+    else:
+        try: ids = sorted(f[:-len(".lifecycle.json")] for f in os.listdir(STATE_DIR) if f.endswith(".lifecycle.json") and ID_RE.fullmatch(f[:-len(".lifecycle.json")]))
+        except OSError: ids = []
+    rows = []; ret = int_opt(read_env(SITE_ENV), "ADMIN_RETENTION_DAYS", 7, 1, 365)
+    for i in ids:
+        d, bad = load(i); r = info(d, i, bad); r["retention_days"] = ret; rows.append(r)      # 현재 설정값(웹이 삭제 요청 문구에 보여 줌)
+    if as_json: print(json.dumps({"version": 1, "retention_days": ret, "members": {r["id"]: r for r in rows}}, ensure_ascii=False, separators=(",", ":"))); return 0
+    for r in rows:
+        print(f"{r['id']}: {r['state']}" + (f" · 삭제 가능일 {r['delete_after'][:10]}(남은 {r['days_left']}일{', 삭제 가능' if r['due'] else ''})" if r["delete_after"] else "") + (f" · 아카이브 {r['archive']}" if r["archive"] else "") + (f" · 정지 {r['suspend_state']}" if r["suspend_state"] else "") + (f" · 오류: {r['last_error']}" if r["last_error"] else ""))
+    if not rows: print("수명주기 기록 없음")
+    return 0
+
+
+# ---------- 알림 ----------
+def notify(env, text):
+    """설정된 채널(메일·webhook)로 보낸다. 하나라도 성공했거나 보낼 채널이 없으면 True(= 같은 알림을 반복하지 않음), 설정된 채널이 전부 실패하면 False(다음 tick 에 재시도)."""
+    tried = ok = 0
+    to = env.get("ADMIN_EMAIL", "")
+    if env.get("MAIL_MODE") == "smtp" and EMAIL_RE.fullmatch(to) and os.access(NOTIFY_MAIL, os.X_OK):
+        tried += 1; ok += run([NOTIFY_MAIL, "notice", "--email", to], inp=text.encode(), timeout=90)[0] == 0
+    if "webhook" in env.get("ONBOARD_CHANNELS", "").split() and os.access(DELIVER, os.X_OK):
+        tried += 1; ok += run([DELIVER, "notice"], inp=text.encode(), timeout=60)[0] == 0
+    return tried == 0 or ok > 0
+
+
+def cmd_tick():
+    env = read_env(SITE_ENV); auto = env.get("ADMIN_AUTO_DELETE", "0") == "1"; keep = int_opt(env, "ADMIN_ARCHIVE_KEEP_DAYS", 30, 1, 3650)
+    try: ids = sorted(f[:-len(".lifecycle.json")] for f in os.listdir(STATE_DIR) if f.endswith(".lifecycle.json") and ID_RE.fullmatch(f[:-len(".lifecycle.json")]))
+    except OSError: ids = []
+    rc_all = 0
+    for i in ids:
+        d, bad = load(i)
+        if bad: print(f"건너뜀: {i} — {bad}"); continue
+        t = now_ts(); nf = d["notified"]
+        if d["state"] == "pending_delete" and d.get("delete_after_ts") is not None:
+            due_ts = d["delete_after_ts"]
+            if t >= due_ts and not nf.get("due"):
+                if notify(env, f"회원 {i} 의 삭제 가능일({day(due_ts)})이 되었습니다. 웹 관리 화면에서 확인하고 삭제하거나 취소하세요."): nf["due"] = nf["d1"] = t; save(d)
+            elif due_ts - DAY <= t < due_ts and not nf.get("d1"):
+                if notify(env, f"회원 {i} 의 삭제 가능일이 내일({day(due_ts)})입니다. 계속 쓰는 회원이면 웹 관리 화면에서 삭제 요청을 취소하세요."): nf["d1"] = t; save(d)
+            if t >= due_ts:
+                if not auto: print(f"삭제 가능: {i} (자동 삭제 꺼짐 — 관리자가 최종 삭제)")
+                else:
+                    try: do_final(i, d["archive"])
+                    except Fail as e:
+                        print(f"자동 삭제 거부: {i} — {e}"); rc_all = 1 if e.code == 1 else rc_all
+        elif d["state"] == "deleted" and d.get("archive") and not d.get("archive_deleted") and d.get("deleted_ts") is not None:
+            purge_ts = d["deleted_ts"] + keep * DAY
+            if t < purge_ts - DAY: continue
+            if not nf.get("purge1"):      # 삭제는 알림 «뒤» 의 tick 에서만 한다
+                if notify(env, f"삭제된 회원 {i} 의 아카이브가 {day(purge_ts)} 에 삭제됩니다. 필요하면 그 전에 내려받으세요."): nf["purge1"] = t; save(d)
+            elif t >= purge_ts:
+                rc, out = run([ARCHIVE, "delete", d["archive"]])
+                if rc == 0 or "그런 아카이브가 없습니다" in out: d.update(archive_deleted=True, last_error=""); print(f"아카이브 삭제: {i}")
+                else: d["last_error"] = f"아카이브 삭제 실패: {last_line(out)}"; rc_all = 1
+                save(d)
+    return rc_all
+
+
+def main(argv):
+    usage = f"사용: {PFX}-member-lifecycle request-delete <ID> | cancel <ID> | final-delete <ID> --archive <ARCH> --confirm <ID> | status [<ID>] [--json] | tick"
+    if not argv: print(usage, file=sys.stderr); return 2
+    c, a = argv[0], argv[1:]
+    try:
+        if os.geteuid() != NEED_ROOT_UID: raise Fail("root 로 실행해야 합니다", 2)
+        os.umask(0o077)
+        if c == "status": return cmd_status(a)
+        if c not in ("request-delete", "cancel", "final-delete", "tick") or (c in ("request-delete", "cancel") and len(a) != 1) or (c == "tick" and a): raise Fail(usage, 2)
+        if c in ("request-delete", "cancel", "final-delete") and a: check_id(a[0])      # 외부 도구를 부르기 전에 ID 부터 거른다
+        fd = lock()
+        if fd is None:
+            if c == "tick": return 0      # 다른 작업이 있으면 오늘은 건너뛴다(내일 또 돈다)
+            raise Fail("다른 수명주기 작업이 실행 중입니다", 75)
+        if c == "request-delete": return cmd_request(a[0])
+        if c == "cancel": return cmd_cancel(a[0])
+        if c == "final-delete": return cmd_final(a)
+        return cmd_tick()
+    except Fail as e:
+        print(f"실패: {e}", file=sys.stderr); return e.code
+    except OSError as e:
+        print(f"실패: {type(e).__name__}", file=sys.stderr); return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

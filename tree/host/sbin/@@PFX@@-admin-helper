@@ -10,7 +10,7 @@
 #  - 시계는 모듈 안의 clock() 하나뿐이다(시험이 같은 프로세스에서 바꿀 수 있고, 명령행으로는 바꿀 수 없다).
 #  - --pam-module / --allow-test-hooks 는 시험 전용이다. 운영 유닛에 넣지 말 것(root 데몬이 임의 모듈을 import 하게 된다).
 import sys; sys.dont_write_bytecode = True
-import argparse, fcntl, grp, hashlib, importlib.util, ipaddress, json, os, re, secrets, select, signal, socket, stat, struct, subprocess, threading, time
+import argparse, fcntl, grp, hashlib, importlib.util, ipaddress, json, os, re, secrets, select, shutil, signal, socket, stat, struct, subprocess, tempfile, threading, time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -31,6 +31,13 @@ SID_RE = re.compile(r"[A-Za-z0-9_-]{43}")          # token_urlsafe(32) 의 길�
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 CODE_RE = re.compile(r"[0-9]{6}|[A-Za-z0-9-]{12,16}")   # TOTP 6자리 또는 복구 코드(xxxx-xxxx-xxxx)
 TOTP_RE = re.compile(r"[0-9]{6}")
+ARCH_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}-[0-9]{8}-[0-9]{6}")      # member-archive 의 아카이브 이름(설계서 §E)
+FILE_RE = re.compile(r"(?:data|home)\.tar\.zst|db-[A-Za-z0-9_]{1,63}\.dump|meta/(?!\.{1,2}$)(?!.*\.\.)[A-Za-z0-9._-]{1,100}")    # member-archive 의 구성요소 이름(+ '..' 거부)
+DL_TTL, DL_MAX = 3600, 64             # 내려받기 허가 유효 시간(초) · 세션당 허가 수 상한
+LC_STATES, LC_SUSPEND = ("active", "suspended", "pending_delete", "deleted", "unknown"), ("active", "suspended", "partial")
+LC_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9:.+Z-]{0,32})?")
+REASON_MAX = 200
+LC_TTL = 60                           # member.lifecycle 캐시(초). 상태를 바꾸는 작업이 끝나면 즉시 버린다. 파괴적 op 의 사전 검사는 캐시를 쓰지 않는다
 VIAS = ("public", "lan", "local")
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 JOB_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")      # job 로그에서 지울 제어문자(개행·탭 제외)
@@ -46,6 +53,9 @@ MSGS = {
     "bad_email": "이메일 주소 형식이 올바르지 않습니다", "not_found": "작업을 찾을 수 없습니다",
     "no_secret": "표시할 비밀이 없습니다(이미 확인했거나 10분이 지났습니다)",
     "no_member": "해당 회원을 찾을 수 없습니다", "link_failed": "안내 링크를 만들지 못했습니다",
+    "wrong_state": "현재 상태에서는 할 수 없는 작업입니다", "confirm_mismatch": "확인용 회원 ID 가 대상과 같지 않습니다", "arch_mismatch": "아카이브가 이 회원의 것이 아닙니다",
+    "no_archive": "그런 아카이브 또는 구성요소가 없습니다", "no_grant": "내려받기 허가가 없거나 만료되었습니다", "file_bad": "아카이브 파일 상태가 MANIFEST 와 다릅니다",
+    "range_invalid": "요청한 범위를 처리할 수 없습니다",
 }
 
 def clock():
@@ -162,6 +172,7 @@ class OpSpec:
     stepup: bool = False       # 새 TOTP 코드(step-up 표식) 필요 — 실행 때 소비된다
     heavy: bool = False        # «무거운» op: 한 번에 하나(다른 것이 돌면 busy)
     event: object = "op"       # 일반 감사 이벤트 이름. None 이면 핸들러가 직접 기록(내장 op)
+    check: object = None       # check(core, args): step-up 을 소비하기 전의 사전 검사(실제 회원·상태·확인 문구·바쁨). OpError 면 코드가 소비되지 않는다
 
 OPS = {}   # 이후 작업(T6~T17)이 여기에 항목을 추가한다. 이름 → OpSpec
 
@@ -175,7 +186,7 @@ class Core:
         self.acct_lim = Limiter(ACCT_LIMIT, ACCT_WINDOW, ACCT_LOCK, False)
         self.budget = [0, 0]                   # [분 번호, 이번 분 기록 수]
         self.ops = dict(OPS)
-        self.mlock, self.mcache = threading.Lock(), None       # member.list 캐시: (도구 파일 지문, 만료 mono 시각, 정리된 데이터)
+        self.mlock, self.mcache, self.lccache, self.lclock = threading.Lock(), None, None, threading.Lock()       # member.list 캐시: (도구 파일 지문, 만료 mono 시각, 정리된 데이터)
         self.jobs, self.running, self.queue = {}, None, []      # job(메모리만): id → dict · 실행 중 id · 대기 id(최대 1)
 
     # 감사 ───────────────────────────────────────────
@@ -270,6 +281,12 @@ class Core:
             if spec.heavy:
                 if not self.heavy.acquire(blocking=False): raise OpError("busy")
                 got_heavy = True
+            if spec.check:
+                t0 = mono()
+                try: spec.check(self, args)
+                except OpError as e:
+                    if spec.event: self._op_audit(spec, ctx, args, "fail", t0, e.code)
+                    raise
             if spec.stepup:
                 with self.lock:
                     if ctx["sess"]["stepup"] <= clock(): raise OpError("stepup_required")
@@ -453,7 +470,7 @@ class Core:
             self.jobs_gc(); jid = secrets.token_urlsafe(16)
             self.audit(dict(who, event="job_end", job=jid, rc=0, result="issued", dur=mono() - t0), critical=True)
             self.jobs[jid] = {"id": jid, "id_": id_, "email": None, "state": "done", "log": ["안내 링크를 발급했습니다. 링크는 한 번만 표시됩니다.\n"], "size": 0, "cut": False, "buf": b"",
-                              "rc": 0, "why": None, "secret": link, "finished": clock(), "user": ctx["sess"]["user"], "kind": "link", "t0": t0}
+                              "rc": 0, "why": None, "secret": link, "finished": clock(), "user": ctx["sess"]["user"], "kind": "link", "op": "member.link.issue", "t0": t0}
         return {"job": jid}
 
     # member.add job ───────────────────────────────────
@@ -484,18 +501,26 @@ class Core:
         try: trusted_file(self.cfg.member_add, need_exec=True)
         except FileNotFoundError: raise OpError("tool_missing")
         except PermissionError: raise OpError("tool_failed")
-        with self.lock:
-            self.jobs_gc()
-            if self.running is not None and self.queue: raise OpError("busy", why="queue")
-            if self._maint_busy(): raise OpError("busy", why="maint")
-            jid = secrets.token_urlsafe(16)
-            self.audit({"event": "job_start", "op": "member.add", "job": jid, "user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"], "args": {"id": id_}}, critical=True)
-            j = {"id": jid, "id_": id_, "email": email, "state": "queued", "log": [], "size": 0, "cut": False, "buf": b"", "rc": None, "why": None,
-                 "secret": None, "finished": None, "user": ctx["sess"]["user"], "kind": "add"}
-            self.jobs[jid] = j
-            queued = self.running is not None
-            if queued: self.queue.append(jid)
-            else: self._start(j)
+        return self._enqueue(ctx, "member.add", "add", id_, [self.cfg.member_add, id_, "--email", email], {"id": id_}, secret=True)
+
+    def _enqueue(self, ctx, op, kind, id_, argv, aud, secret=False, cleanup=None):
+        """job 한 개를 만든다(동시 1·대기 1·정비 락). argv 는 고정(shell 없음). secret=True 일 때만 fd 3 비밀 파이프를 연결한다(member.add). cleanup=끝나면 지울 임시 폴더."""
+        try:
+            with self.lock:
+                self.jobs_gc()
+                if self.running is not None and self.queue: raise OpError("busy", why="queue")
+                if self._maint_busy(): raise OpError("busy", why="maint")
+                jid = secrets.token_urlsafe(16)
+                self.audit({"event": "job_start", "op": op, "job": jid, "user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"], "args": aud}, critical=True)
+                j = {"id": jid, "id_": id_, "argv": argv, "op": op, "aud": aud, "sec_fd": secret, "cleanup": cleanup, "state": "queued", "log": [], "size": 0, "cut": False, "buf": b"", "rc": None, "why": None,
+                     "secret": None, "finished": None, "user": ctx["sess"]["user"], "kind": kind}
+                self.jobs[jid] = j
+                queued = self.running is not None
+                if queued: self.queue.append(jid)
+                else: self._start(j)
+        except BaseException:
+            if cleanup: shutil.rmtree(cleanup, ignore_errors=True)
+            raise
         return {"job": jid, "queued": queued}
 
     def _start(self, j):      # self.lock 을 잡고 부른다
@@ -518,8 +543,8 @@ class Core:
         rc = why = None; sec = bytearray()
         try:
             if self._maint_busy(): why = "maint"          # 대기하다 시작할 때도 정비 락을 다시 본다
-            else: rc, why = self._spawn(j, sec)
-        except Exception as e: why = "error"; self.audit({"event": "internal_error", "op": "member.add", "job": j["id"], "reason": type(e).__name__})
+            else: self._tool_ok(j["argv"][0]); rc, why = self._spawn(j, sec)
+        except Exception as e: why = "error"; self.audit({"event": "internal_error", "op": j["op"], "job": j["id"], "reason": type(e).__name__})
         text = sec.decode("utf-8", "replace").strip().splitlines()[0].strip() if sec.strip() else ""
         ok = rc == 0 and why is None
         if not (1 <= len(text) <= 256 and text.isprintable()): text = ""
@@ -528,10 +553,11 @@ class Core:
             j["rc"], j["why"], j["finished"] = rc, (why or (None if ok else "exit")), clock()
             j["secret"] = text if ok and text else None
             j["state"] = "done" if ok else "failed"
-            self.audit({"event": "job_end", "op": "member.add", "job": j["id"], "user": j["user"], "rc": rc, "dur": mono() - j["t0"],
-                        "result": ("issued" if j["secret"] else "ok") if ok else "fail", "reason": None if ok and j["secret"] else j["why"] if not ok else "nosecret"})
-            j["email"] = None
-            self.mcache = None      # 새 회원이 목록에 바로 보이게
+            self.audit({"event": "job_end", "op": j["op"], "job": j["id"], "user": j["user"], "rc": rc, "dur": mono() - j["t0"], "args": j["aud"],
+                        "result": ("issued" if j["secret"] else "ok") if ok else "fail", "reason": j["why"] if not ok else "nosecret" if j["sec_fd"] and not j["secret"] else None})
+            j["argv"] = None        # member.add 의 이메일이 담겨 있다
+            if j["cleanup"]: shutil.rmtree(j["cleanup"], ignore_errors=True)       # 정지 사유 임시 파일
+            self.mcache = self.lccache = None      # 새 회원·바뀐 상태가 목록에 바로 보이게
             self.running = None
             if self.queue:
                 nj = self.jobs.get(self.queue.pop(0))
@@ -543,8 +569,8 @@ class Core:
         r_out, w_out = map(hi, os.pipe()); r_sec, w_sec = map(hi, os.pipe()); dn = hi(os.open(os.devnull, os.O_RDONLY))
         D = os.POSIX_SPAWN_DUP2
         try:
-            pid = os.posix_spawn(self.cfg.member_add, [self.cfg.member_add, j["id_"], "--email", j["email"]], TOOL_ENV,
-                                 file_actions=[(D, dn, 0), (D, w_out, 1), (D, w_out, 2), (D, w_sec, 3)], setpgroup=0)
+            pid = os.posix_spawn(j["argv"][0], j["argv"], TOOL_ENV,
+                                 file_actions=[(D, dn, 0), (D, w_out, 1), (D, w_out, 2)] + ([(D, w_sec, 3)] if j["sec_fd"] else []), setpgroup=0)
         finally:
             for fd in (w_out, w_sec, dn): os.close(fd)
         rc, why, opened, end = None, None, {r_out, r_sec}, mono() + JOB_TIMEOUT
@@ -571,12 +597,179 @@ class Core:
         if j["buf"]: self._log(j, b"\n")
         return rc, why
 
+    # 수명주기: 정지·재개·삭제(요청·취소·최종)·아카이브 ─────────────────
+    def _lc_clean(self, d):
+        """member-lifecycle status --json → {id: {state, suspend_state, delete_after, days_left, due, archive, last_error}}. 알려진 필드만, 값은 형식 검증(모르는 값은 unknown/None)."""
+        rows = d.get("members", d) if isinstance(d, dict) else d
+        if isinstance(rows, list): rows = {m.get("id"): m for m in rows if isinstance(m, dict)}
+        if not isinstance(rows, dict): raise ValueError("lifecycle")
+        out = {}
+        for k, m in rows.items():
+            if not (type(k) is str and self.common.valid_user_id(k) and isinstance(m, dict)): continue
+            st, ss, da, dl, ar, le = (m.get(x) for x in ("state", "suspend_state", "delete_after", "days_left", "archive", "last_error"))
+            out[k] = {"state": st if type(st) is str and st in LC_STATES else "unknown", "suspend_state": ss if type(ss) is str and ss in LC_SUSPEND else None,
+                      "delete_after": da if type(da) is str and LC_DATE_RE.fullmatch(da) else None,
+                      "days_left": dl if type(dl) is int and -10**5 < dl < 10**5 else None, "due": m.get("due") is True,
+                      "archive": ar if type(ar) is str and ARCH_RE.fullmatch(ar) else None, "last_error": self._text(le, REASON_MAX) if type(le) is str and le.strip() else None}
+        return out
+
+    def _lc(self, fresh=False):
+        """회원별 수명주기 상태(정리됨). 60초 캐시, fresh=True 는 캐시를 쓰지 않는다(파괴적 op 의 사전 검사). 실패는 캐시하지 않는다."""
+        p = self.cfg.member_lifecycle; self._tool_ok(p)
+        st = os.stat(p); key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        with self.lclock:
+            c = self.lccache
+            if not fresh and c is not None and c[0] == key and mono() < c[1]: return c[2]
+            self.lccache = None
+            try:
+                r = subprocess.run([p, "status", "--json"], shell=False, env=TOOL_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/", timeout=30)
+                if r.returncode != 0 or len(r.stdout) > MAX_RESULT: raise OpError("tool_failed")
+                data = self._lc_clean(json.loads(r.stdout.decode("utf-8")))
+            except (OSError, ValueError, subprocess.TimeoutExpired): raise OpError("tool_failed")
+            self.lccache = (key, mono() + LC_TTL, data)
+            return data
+
+    def op_member_lifecycle(self, ctx, a):
+        return {"members": self._lc()}
+
+    def _room(self):
+        """job 을 시작할 수 있는지 미리 본다(step-up 코드를 헛되이 쓰지 않게). 권위 있는 검사는 _enqueue 가 락 안에서 다시 한다."""
+        with self.lock:
+            if self.running is not None and self.queue: raise OpError("busy", why="queue")
+            if self._maint_busy(): raise OpError("busy", why="maint")
+
+    def gate(self, a, tool, lc=None, states=(), due=False):
+        """파괴적 op 의 사전 검사(step-up 소비 전): 실제 회원·확인 ID·아카이브 소유·도구·상태·바쁨. lc='strict' 는 상태를 읽을 수 없거나 states 밖이면 거부,
+        'soft' 는 읽을 수 있고 삭제 예정이면 거부(수명주기 도구가 없는 설치에서는 정지·재개가 그대로 동작)."""
+        id_ = a["id"]; self._member(id_)
+        r = a.get("reason")
+        if r is not None and (len(r) > REASON_MAX or CTRL_RE.search(r)): raise OpError("bad_request")
+        if a.get("confirm", id_) != id_: raise OpError("confirm_mismatch")
+        if "archive" in a and a["archive"].rsplit("-", 2)[0] != id_: raise OpError("arch_mismatch")
+        self._tool_ok(tool)
+        if lc:
+            try: rec = self._lc(fresh=True).get(id_)
+            except OpError as e:
+                if lc == "strict" or e.code != "tool_missing": raise
+                rec = None
+            if lc == "strict" and (rec is None or rec["state"] not in states or (due and not rec["due"])) or lc == "soft" and rec and rec["state"] == "pending_delete": raise OpError("wrong_state")
+        self._room()
+
+    def op_life(self, ctx, a, op, kind, tool, tail):
+        """회원 한 명에게 정지·재개·삭제 도구 한 번을 job 으로. 정지 사유는 명령줄에 싣지 않고 0600 임시 파일로 넘긴다(job 이 끝나면 지움)."""
+        id_ = a["id"]; self._member(id_); self._tool_ok(tool)
+        argv, cleanup = [tool] + [x.replace("{id}", id_) for x in tail], None
+        if a.get("reason"):
+            cleanup = tempfile.mkdtemp(prefix="reason-")
+            try:
+                fd = os.open(os.path.join(cleanup, "reason"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try: os.write(fd, a["reason"].encode("utf-8"))
+                finally: os.close(fd)
+            except OSError: shutil.rmtree(cleanup, ignore_errors=True); raise OpError("tool_failed")
+            argv += ["--reason-file", os.path.join(cleanup, "reason")]
+        if "archive" in a: argv += ["--archive", a["archive"], "--confirm", a["confirm"]]
+        return self._enqueue(ctx, op, kind, id_, argv, {k: a[k] for k in ("id", "archive") if k in a}, cleanup=cleanup)
+
+    def op_archive_list(self, ctx, a):
+        rc, out, _ = self._tool(self.cfg.member_archive, ["list", "--json"], timeout=60)
+        if rc != 0: raise OpError("tool_failed")
+        try:
+            rows = json.loads(out).get("archives"); res = []
+            for r in rows:
+                n, m, cr, b, comps, sk = (r.get(x) for x in ("archive", "member", "created", "bytes", "components", "skipped"))
+                if not (type(n) is str and ARCH_RE.fullmatch(n) and type(m) is str and self.common.valid_user_id(m)): raise ValueError("archive")
+                lst = lambda v: [self._text(x, REASON_MAX) for x in v[:50] if type(x) is str] if isinstance(v, list) else []
+                res.append({"archive": n, "member": m, "created": self._text(cr, 40) if type(cr) is str else None, "bytes": b if type(b) is int and b >= 0 else None,
+                            "components": lst(comps), "complete": r.get("complete") is True, "skipped": lst(sk)})
+        except (AttributeError, TypeError, ValueError): raise OpError("tool_failed")
+        return {"archives": res}
+
+    def gate_verify(self, a):
+        self._tool_ok(self.cfg.member_archive); self._room()
+
+    def op_archive_verify(self, ctx, a):
+        self._tool_ok(self.cfg.member_archive); arch = a["archive"]
+        return self._enqueue(ctx, "archive.verify", "verify", arch.rsplit("-", 2)[0], [self.cfg.member_archive, "verify", arch], {"archive": arch})
+
+    # 내려받기(§D.3): 허가(step-up) → 열기(허가 필요, fd 하나를 SCM_RIGHTS 로 넘김). 허가는 세션 dict 안에만 있어 로그아웃·세션 폐기 때 함께 사라진다
+    def _arch_open(self, arch, rel, flags=0):
+        """archive-root/<arch>/<rel> 을 디렉터리 fd 체인 + O_NOFOLLOW 로 연다(어느 단계든 심볼릭 링크면 실패). 실패는 no_archive."""
+        fds = []
+        try:
+            fds.append(os.open(self.cfg.archive_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+            parts = [arch] + rel.split("/")
+            for i, n in enumerate(parts):
+                last = i == len(parts) - 1
+                fds.append(os.open(n, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | (0 if last else os.O_DIRECTORY), dir_fd=fds[-1]))
+            return fds.pop()
+        except OSError: raise OpError("no_archive")
+        finally:
+            for f in fds: os.close(f)
+
+    def _dl_size(self, arch, file):
+        """MANIFEST.json 에 있는 구성요소(이름이 file)의 기록된 크기. 아카이브·MANIFEST·구성요소가 없거나 어긋나면 no_archive."""
+        fd = self._arch_open(arch, "MANIFEST.json")
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_size > (4 << 20): raise OpError("no_archive")
+            with os.fdopen(os.dup(fd), "rb") as f: man = json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError): raise OpError("no_archive")
+        finally: os.close(fd)
+        if not isinstance(man, dict) or man.get("archive", arch) != arch or man.get("member", arch.rsplit("-", 2)[0]) != arch.rsplit("-", 2)[0]: raise OpError("no_archive")
+        for c in man.get("components") if isinstance(man.get("components"), list) else []:
+            if isinstance(c, dict) and c.get("name") == file and type(c.get("bytes")) is int and c["bytes"] >= 0: return c["bytes"]
+        raise OpError("no_archive")
+
+    def gate_dl(self, a):      # step-up 소비 전 사전 검사: MANIFEST 에 있는 구성요소만
+        self._dl_size(a["arch"], a["file"])
+
+    def op_dl_grant(self, ctx, a):
+        now = clock()
+        with self.lock:
+            g = ctx["sess"].setdefault("dl", {})
+            for k in [k for k, t in g.items() if t <= now]: del g[k]
+            while len(g) >= DL_MAX: del g[min(g, key=g.get)]
+            g[(a["arch"], a["file"])] = now + DL_TTL
+        return {"ttl": DL_TTL}      # 토큰은 없다 — 세션이 곧 자격
+
+    @staticmethod
+    def _dl_range(rng, size):
+        """'bytes=a-b'·'a-'·'-n' 한 개 → (시작, 끝(포함)). 그 밖·범위 밖은 range_invalid(size 동봉). rng 가 없으면 전체."""
+        if rng is None: return 0, size - 1
+        m = re.fullmatch(r"bytes=([0-9]{0,15})-([0-9]{0,15})", rng)
+        if not m or not (m[1] or m[2]) or size == 0: raise OpError("range_invalid", size=size)
+        if not m[1]:
+            if int(m[2]) == 0: raise OpError("range_invalid", size=size)
+            return max(0, size - int(m[2])), size - 1
+        start = int(m[1]); end = size - 1 if not m[2] else min(int(m[2]), size - 1)
+        if start >= size or end < start: raise OpError("range_invalid", size=size)
+        return start, end
+
+    def op_dl_open(self, ctx, a):
+        arch, file, rng = a["arch"], a["file"], a.get("range")
+        who = {"user": ctx["sess"]["user"], "sid8": ctx["sid8"], "src_ip": ctx["src_ip"], "via": ctx["via"], "op": "archive.download.open"}
+        with self.lock: ok = ctx["sess"].get("dl", {}).get((arch, file), 0) > clock()
+        if not ok:
+            self.audit(dict(who, event="op_denied", args={"arch": arch, "file": file}, reason="no_grant"), throttle=True)
+            raise OpError("no_grant")
+        size = self._dl_size(arch, file); fd = self._arch_open(arch, file)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size != size: raise OpError("file_bad")
+            try: start, end = self._dl_range(rng, size)
+            except OpError as e:
+                self.audit(dict(who, event="op", args={"arch": arch, "file": file, "range": rng}, result="fail", reason=e.code), critical=True); raise
+            # 시작 기록만 남긴다(보낸 바이트는 도우미가 알 수 없음). 기록 실패면 fd 를 내주지 않는다
+            self.audit(dict(who, event="op", args={"arch": arch, "file": file, "range": rng or "", "start": start, "end": end, "size": size}, result="ok"), critical=True)
+        except BaseException:
+            os.close(fd); raise
+        return {"size": size, "start": start, "end": end, "partial": rng is not None, "_fd": fd}      # _fd 는 serve_conn 이 떼어 SCM_RIGHTS 로 보낸다
+
     def op_job_status(self, ctx, a):
         self.jobs_gc()
         with self.lock:
             j = self.jobs.get(a["job"])
             if j is None: raise OpError("not_found")
-            return {"state": j["state"], "log": "".join(j["log"]), "rc": j["rc"], "why": j["why"], "secret_ready": j["secret"] is not None, "kind": j["kind"]}
+            return {"state": j["state"], "log": "".join(j["log"]), "rc": j["rc"], "why": j["why"], "secret_ready": j["secret"] is not None, "kind": j["kind"], "op": j["op"], "member": j["id_"]}
 
     def op_job_secret(self, ctx, a):
         """비밀을 «한 번만» 돌려주고 즉시 지운다. 기록(감사)이 먼저 — 기록 실패면 비밀을 꺼내지 않는다."""
@@ -604,6 +797,23 @@ def register_builtin(ops):
     ops["member.link.issue"] = OpSpec(lambda c, x, a: c.op_link_issue(x, a), {"id": Arg(str)}, event=None)
     ops["member.seal"] = OpSpec(lambda c, x, a: c.op_member_tool(x, a, c.cfg.onboarding_seal, ["{id}"], True), {"id": Arg(str)})
     ops["member.pair.refresh"] = OpSpec(lambda c, x, a: c.op_member_tool(x, a, c.cfg.pair_create, ["{id}"], False), {"id": Arg(str)})
+    # 수명주기(설계서 §E): 정지는 step-up 없음, 재개·삭제 요청·취소·최종은 step-up(최종은 확인 ID 도). 도구 경로는 실제 파일(심볼릭 링크 불가)
+    G = lambda tool, lc=None, st=(), due=False: (lambda c, a: c.gate(a, getattr(c.cfg, tool), lc, st, due))
+    L = lambda op, kind, tool, tail: (lambda c, x, a: c.op_life(x, a, op, kind, getattr(c.cfg, tool), tail))
+    ID = {"id": Arg(str)}
+    for op, kind, tool, tail, extra, lc, st, due, su in (
+            ("member.suspend", "suspend", "member_suspend", ["suspend", "{id}"], {"reason": Arg(str, secret=True, required=False)}, "soft", (), False, False),
+            ("member.resume", "resume", "member_suspend", ["resume", "{id}"], {}, "soft", (), False, True),
+            ("member.delete.request", "delete-request", "member_lifecycle", ["request-delete", "{id}"], {}, "strict", ("active", "suspended"), False, True),
+            ("member.delete.cancel", "delete-cancel", "member_lifecycle", ["cancel", "{id}"], {}, "strict", ("pending_delete",), False, True),
+            ("member.delete.final", "delete-final", "member_lifecycle", ["final-delete", "{id}"], {"archive": Arg(str, ARCH_RE), "confirm": Arg(str)}, "strict", ("pending_delete",), True, True)):
+        ops[op] = OpSpec(L(op, kind, tool, tail), dict(ID, **extra), stepup=su, check=G(tool, lc, st, due))
+    ops["member.lifecycle"] = OpSpec(lambda c, x, a: c.op_member_lifecycle(x, a), event="view")
+    ops["archive.list"] = OpSpec(lambda c, x, a: c.op_archive_list(x, a), event="view")
+    ops["archive.verify"] = OpSpec(lambda c, x, a: c.op_archive_verify(x, a), {"archive": Arg(str, ARCH_RE)}, check=lambda c, a: c.gate_verify(a))
+    # 내려받기: 허가만 step-up(사전 검사가 소비 앞). 열기는 허가가 곧 자격 — 핸들러가 직접 감사한다(event=None)
+    ops["archive.download.grant"] = OpSpec(lambda c, x, a: c.op_dl_grant(x, a), {"arch": Arg(str, ARCH_RE), "file": Arg(str, FILE_RE)}, stepup=True, check=lambda c, a: c.gate_dl(a))
+    ops["archive.download.open"] = OpSpec(lambda c, x, a: c.op_dl_open(x, a), {"arch": Arg(str, ARCH_RE), "file": Arg(str, FILE_RE), "range": Arg(str, re.compile(r"[ -~]{1,64}"), required=False)}, event=None)
     ops["job.status"] = OpSpec(lambda c, x, a: c.op_job_status(x, a), {"job": Arg(str, JOB_RE)}, event="view")
     ops["job.secret"] = OpSpec(lambda c, x, a: c.op_job_secret(x, a), {"job": Arg(str, JOB_RE)}, event=None)
 
@@ -634,9 +844,12 @@ def read_line(conn, deadline_secs):
     if len(line) > MAX_MSG: raise OpError("bad_request")
     return line
 
-def reply(conn, body):
+def reply(conn, body, fd=None):
+    """응답 한 줄. fd 가 있으면(archive.download.open 만) 같은 sendmsg 에 SCM_RIGHTS 로 하나 싣는다."""
     try:
-        conn.settimeout(5); conn.sendall(dumps(body).encode("ascii") + b"\n")
+        conn.settimeout(5); data = dumps(body).encode("ascii") + b"\n"
+        n = socket.send_fds(conn, [data], [fd]) if fd is not None else 0
+        conn.sendall(data[n:])
     except OSError: pass
 
 def serve_conn(core, conn, sem):
@@ -648,7 +861,11 @@ def serve_conn(core, conn, sem):
         except OpError as e: body = err_body(e.code)
         except Exception as e:
             core.audit({"event": "internal_error", "reason": type(e).__name__}, throttle=True); body = err_body("internal_error")
-        reply(conn, body)
+        res = body.get("result") if body.get("ok") else None
+        fd = res.pop("_fd", None) if isinstance(res, dict) else None
+        try: reply(conn, body, fd)
+        finally:
+            if fd is not None: os.close(fd)
     finally:
         sem.release()
         try: conn.close()
@@ -696,9 +913,13 @@ def parse_args(argv):
     ap.add_argument("--member-list", default="/usr/local/sbin/@@PFX@@-member-list")
     ap.add_argument("--member-add", default="/opt/@@PFX@@/scripts/@@PFX@@-member-add", help="심볼릭 링크(/usr/local/bin)는 신뢰 검사에서 거부되므로 실제 파일 경로")
     ap.add_argument("--member-link", default="/usr/local/sbin/@@PFX@@-member-link")
+    ap.add_argument("--member-suspend", default="/usr/local/sbin/@@PFX@@-member-suspend")
+    ap.add_argument("--member-archive", default="/usr/local/sbin/@@PFX@@-member-archive")
+    ap.add_argument("--member-lifecycle", default="/usr/local/sbin/@@PFX@@-member-lifecycle")
     ap.add_argument("--onboarding-seal", default="/opt/@@PFX@@/scripts/@@PFX@@-onboarding-seal")
     ap.add_argument("--pair-create", default="/opt/@@PFX@@/scripts/@@PFX@@-paseo-pair-create")
     ap.add_argument("--reserved-ids", help="예약 ID 목록 파일(없으면 member.add 는 닫힘)")
+    ap.add_argument("--archive-root", default="/srv/@@PFX@@/archives/members", help="아카이브 폴더(root 0700) — 내려받기가 여기서 파일을 연다")
     ap.add_argument("--maint-lock", default="/run/@@PFX@@-maintenance.lock")
     ap.add_argument("--pam-service", default="@@PFX@@-admin")
     ap.add_argument("--max-conn", type=int, default=32)

@@ -2,7 +2,7 @@
 # @@PFX@@-admin-web — 웹 관리 화면(T4 뼈대). 파이썬 표준 라이브러리만, 127.0.0.1 에서만 듣고 비특권 계정으로 돈다. 공개는 Caddy 가 한다.
 # 구조(설계서 §A.1 B안): 인증·세션·step-up 은 root 도우미(@@PFX@@-admin-helper)가 판단한다. 이 프로그램은 화면과 중계만 하고,
 # 세션이 유효한지 스스로 판단하지 않는다(쿠키 값을 도우미에 보내 그 답을 따른다). 비밀번호·코드·세션 ID 는 로그·오류 화면에 남기지 않는다.
-import argparse, hashlib, hmac, html, ipaddress, json, re, secrets, socket, sys, threading, time
+import argparse, hashlib, hmac, html, ipaddress, json, os, re, secrets, socket, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -15,6 +15,8 @@ JOB_PATH = re.compile(r"/jobs/([A-Za-z0-9_-]{22})(|/status|/secret)")
 PRE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 VIA = ("public", "lan", "local")
 MAX_BODY, MAX_CONN, MAX_REPLY = 4096, 32, 8 * 1024 * 1024
+DL_CHUNK, DL_MAX = 256 * 1024, 2      # 내려받기: 한 번에 읽어 보내는 크기 · 동시 내려받기 상한
+DL_SEM = threading.BoundedSemaphore(DL_MAX)
 HELPER_WAIT = 135        # 도우미 응답 대기(프로토콜 §1: 130초 이상)
 KEY = secrets.token_bytes(32)   # CSRF 토큰 서명키(재시작하면 열려 있던 폼만 무효)
 CFG = {"socket": "/run/@@PFX@@-admin/helper.sock", "hosts": (), "deadline": 15.0}
@@ -25,25 +27,39 @@ def log(msg):
 # ── 도우미 호출 ──
 class HelperDown(Exception): pass
 
-def helper(op, ip, via, sid=None, args=None):
+def _call(op, ip, via, sid, args, fd_ok):
+    """-> (응답 dict, 받은 fd 목록). fd_ok 일 때만 SCM_RIGHTS 를 받는다(archive.download.open). 오류면 받은 fd 는 닫는다."""
     o = {"op": op, "src_ip": ip, "via": via}
     if sid: o["sid"] = sid
     if args is not None: o["args"] = args
-    s = socket.socket(socket.AF_UNIX); s.settimeout(HELPER_WAIT)
+    s = socket.socket(socket.AF_UNIX); s.settimeout(HELPER_WAIT); fds = []
     try:
         s.connect(CFG["socket"]); s.sendall(json.dumps(o).encode() + b"\n")
         buf = b""
         while b"\n" not in buf and len(buf) <= MAX_REPLY:
-            c = s.recv(65536)
+            if fd_ok: c, f, _, _ = socket.recv_fds(s, 65536, 1); fds += f
+            else: c = s.recv(65536)
             if not c: break
             buf += c
         r = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
         if not isinstance(r, dict) or not isinstance(r.get("ok"), bool): raise ValueError
-        return r
+        return r, fds
     except (OSError, ValueError):
+        for f in fds: os.close(f)
         raise HelperDown()
     finally:
         s.close()
+
+def helper(op, ip, via, sid=None, args=None):
+    return _call(op, ip, via, sid, args, False)[0]
+
+def helper_fd(op, ip, via, sid, args):
+    """-> (응답, fd 또는 None). fd 는 성공 응답에 정확히 하나만 있어야 한다(아니면 모두 닫고 HelperDown)."""
+    r, fds = _call(op, ip, via, sid, args, True)
+    if len(fds) > 1 or (fds and not r["ok"]):
+        for f in fds: os.close(f)
+        raise HelperDown()
+    return r, (fds[0] if fds else None)
 
 # ── CSRF: 세션 ID(또는 로그인 전 임의 쿠키)에 묶인 서명. 서버는 세션 상태를 갖지 않는다 ──
 def csrf_for(cookie_value): return hmac.new(KEY, cookie_value.encode(), hashlib.sha256).hexdigest()[:40]
@@ -72,9 +88,9 @@ h2{font-size:1.05rem;font-weight:650;margin:1.8rem 0 .6rem;letter-spacing:-.02em
 .card{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 4px);padding:1.6rem;max-width:26rem;margin:3.5rem auto;box-shadow:0 1px 2px hsl(240 10% 4%/.05),0 8px 24px -12px hsl(240 10% 4%/.12)}
 .card h1{font-size:1.35rem;margin-bottom:.4rem}
 label{display:block;font-weight:500;font-size:.875rem;margin:1rem 0 .4rem}
-input{width:100%;height:2.5rem;font:inherit;font-size:.9rem;padding:0 .75rem;color:inherit;background:transparent;border:1px solid hsl(var(--input));border-radius:calc(var(--radius) - 2px);box-shadow:0 1px 2px hsl(240 10% 4%/.04);transition:border-color .15s,box-shadow .15s}
-input:hover{border-color:hsl(var(--muted-foreground)/.6)}
-input:focus-visible{outline:0;border-color:hsl(var(--ring));box-shadow:0 0 0 3px hsl(var(--ring)/.18)}
+input,select{width:100%;height:2.5rem;font:inherit;font-size:.9rem;padding:0 .75rem;color:inherit;background:transparent;border:1px solid hsl(var(--input));border-radius:calc(var(--radius) - 2px);box-shadow:0 1px 2px hsl(240 10% 4%/.04);transition:border-color .15s,box-shadow .15s}
+input:hover,select:hover{border-color:hsl(var(--muted-foreground)/.6)}
+input:focus-visible,select:focus-visible{outline:0;border-color:hsl(var(--ring));box-shadow:0 0 0 3px hsl(var(--ring)/.18)}
 button{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;height:2.5rem;font:inherit;font-size:.9rem;font-weight:550;padding:0 1.1rem;cursor:pointer;white-space:nowrap;color:hsl(var(--primary-foreground));background:hsl(var(--primary));border:1px solid transparent;border-radius:calc(var(--radius) - 2px);box-shadow:0 1px 2px hsl(240 10% 4%/.12);transition:background-color .15s,box-shadow .15s,transform .08s,opacity .15s}
 button:hover{background:hsl(var(--primary)/.9)}
 button:active{transform:translateY(1px) scale(.985);box-shadow:none}
@@ -91,6 +107,7 @@ button.icon svg{width:1.1rem;height:1.1rem}
 header nav button{height:2.25rem;padding:0 .8rem}
 form.inline{display:inline}form.narrow{max-width:26rem;padding:1.4rem;background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 4px);box-shadow:0 1px 2px hsl(240 10% 4%/.05)}form.narrow label:first-of-type{margin-top:0}.mt{margin-top:1rem}.card button[type=submit]{width:100%;margin-top:1.3rem}
 .msg{padding:.7rem .9rem;border-radius:calc(var(--radius) - 2px);background:hsl(var(--muted));border:1px solid hsl(var(--border));margin:0 0 1rem;font-size:.9rem}
+.msg.warn{border-color:hsl(var(--warn)/.5);background:hsl(var(--warn)/.09)}
 .msg.err{border-color:hsl(var(--destructive)/.5);background:hsl(var(--destructive)/.07);color:hsl(var(--destructive))}
 .hint{color:hsl(var(--muted-foreground));font-size:.85rem;margin:.4rem 0 0}
 .scroll{overflow-x:auto;border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);background:hsl(var(--card))}
@@ -105,7 +122,12 @@ td a{font-weight:600;text-decoration:none}td a:hover{text-decoration:underline}
 dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:0;margin:0 0 1rem;border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);background:hsl(var(--card));overflow:hidden}
 dl.kv dt,dl.kv dd{margin:0;padding:.65rem 1rem;border-bottom:1px solid hsl(var(--border))}dl.kv dt{color:hsl(var(--muted-foreground));font-size:.85rem;background:hsl(var(--muted)/.4)}dl.kv dd{word-break:break-all}
 dl.kv dt:nth-last-of-type(1),dl.kv dd:nth-last-of-type(1){border-bottom:0}
-.actions{display:flex;flex-wrap:wrap;gap:.6rem}
+.actions{display:flex;flex-wrap:wrap;gap:.6rem;align-items:flex-start}
+details.act{border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);background:hsl(var(--card));min-width:12rem}
+details.act summary{display:flex;align-items:center;height:2.5rem;padding:0 1.1rem;cursor:pointer;font-weight:550;font-size:.9rem;list-style:none}
+details.act summary::-webkit-details-marker{display:none}details.act[open] summary{border-bottom:1px solid hsl(var(--border))}
+details.act form{padding:.2rem 1rem 1rem;max-width:30rem}details.act.danger summary{color:hsl(var(--destructive))}
+.badge.bad{color:hsl(var(--destructive));border-color:hsl(var(--destructive)/.4);background:hsl(var(--destructive)/.08)}
 .term{border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 2px);overflow:hidden;background:hsl(var(--term-bg));box-shadow:0 8px 24px -14px hsl(240 10% 4%/.35)}
 .term-bar{display:flex;align-items:center;gap:.4rem;padding:.5rem .8rem;border-bottom:1px solid hsl(0 0% 100%/.08);background:hsl(0 0% 100%/.04);font:.75rem ui-monospace,monospace;color:hsl(var(--term-dim))}
 .term-bar i{width:.65rem;height:.65rem;border-radius:50%;background:hsl(0 0% 100%/.18)}.term-bar i:nth-child(1){background:#ff5f57}.term-bar i:nth-child(2){background:#febc2e}.term-bar i:nth-child(3){background:#28c840}
@@ -175,7 +197,15 @@ def nav_html(token):
 # member.list 의 JSON 은 member-list 도구가 정한다. 목록에는 이메일을 보이지 않는다(상세에서만) — 열을 이름으로 골라 쓰므로 email 은 애초에 읽지 않는다.
 MID = re.compile(r"[a-z][a-z0-9_-]{1,31}")
 ACTS = {"link-issue": "member.link.issue", "link-revoke": "member.link.revoke", "link-status": "member.link.status", "seal": "member.seal", "pair-refresh": "member.pair.refresh"}
-MEMBER_PATH = re.compile(r"/member/([a-z][a-z0-9_-]{1,31})(|/link-issue|/link-revoke|/link-status|/seal|/pair-refresh)")
+# 수명주기(정지·재개·삭제·아카이브 검증): 파괴적인 것은 같은 폼의 «인증 코드» 로 step-up 한 뒤 op 를 부른다
+LIFE_ACTS = {"suspend": "member.suspend", "resume": "member.resume", "delete-request": "member.delete.request", "delete-cancel": "member.delete.cancel",
+             "delete-final": "member.delete.final", "archive-verify": "archive.verify"}
+STEP_ACTS = ("resume", "delete-request", "delete-cancel", "delete-final")
+ARCH_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}-[0-9]{8}-[0-9]{6}")
+DL_FILE = re.compile(r"(?:data|home)\.tar\.zst|db-[A-Za-z0-9_]{1,63}\.dump|meta/(?!\.{1,2}$)(?!.*\.\.)[A-Za-z0-9._-]{1,100}")      # 도우미·member-archive 의 구성요소 이름 규칙
+ARCH_PATH = re.compile(r"/archive/(" + ARCH_RE.pattern + r")/(" + DL_FILE.pattern + ")")
+TOTP_RE = re.compile(r"[0-9]{6}")
+MEMBER_PATH = re.compile(r"/member/([a-z][a-z0-9_-]{1,31})(|/link-issue|/link-revoke|/link-status|/seal|/pair-refresh|/suspend|/resume|/delete-request|/delete-cancel|/delete-final|/archive-verify|/archive-dl)")
 def badge(text, cls=""): return f'<span class="badge {cls}">{E(text)}</span>'
 def state_badge(m):
     st = m.get("state")
@@ -188,20 +218,34 @@ def limits_text(v):
     if not isinstance(v, dict) or not v: return "기본값"
     return " · ".join(f"{n} {v[k]}" for k, n in (("memory", "메모리"), ("swap", "스왑"), ("cpus", "CPU")) if isinstance(v.get(k), str))
 def susp_badge(m): return badge("일시정지", "warn") if m.get("suspended") is True else "-"
+def life_of(life, mid): return life.get(mid) if isinstance(life, dict) and isinstance(mid, str) and isinstance(life.get(mid), dict) else None
+def life_badge(m, rec):
+    """수명주기 배지: 삭제 가능 / 삭제 예정 D-n / 부분 정지 / 정지. 수명주기 정보가 없으면 member-list 의 suspended 만 본다."""
+    if rec and rec.get("state") == "pending_delete":
+        n = rec.get("days_left")
+        return badge("삭제 가능", "bad") if rec.get("due") is True else badge(f"삭제 예정 D-{n}" if type(n) is int else "삭제 예정", "warn")
+    if rec and rec.get("suspend_state") == "partial": return badge("부분 정지", "warn")
+    if (rec and (rec.get("suspend_state") == "suspended" or rec.get("state") == "suspended")) or m.get("suspended") is True: return badge("정지", "warn")
+    return "-"
+def banner(life):
+    """삭제 가능(기한이 지난 삭제 예정) 회원이 있으면 목록·상세 공통 안내."""
+    due = sorted(k for k, v in life.items() if isinstance(v, dict) and v.get("state") == "pending_delete" and v.get("due") is True and MID.fullmatch(k)) if isinstance(life, dict) else []
+    if not due: return ""
+    return f'<p class="msg warn" role="alert"><b>삭제 가능 {len(due)}명</b> — ' + ", ".join(f'<a href="/member/{E(k)}">{E(k)}</a>' for k in due) + ' · 보관 기한이 지났습니다. 상세 화면에서 아카이브를 확인한 뒤 최종 삭제하세요.</p>'
 def num(v): return str(v) if type(v) is int else "-"
 def day(v): return v[:10] if isinstance(v, str) else "-"
 
-def members_body(data):
+def members_body(data, life=None):
     rows = data.get("members") if isinstance(data, dict) else data
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows): return msg("회원 목록 형식을 알 수 없습니다.", True)
-    if not rows: return "<h1>회원</h1><p>등록된 회원이 없습니다.</p>"
+    if not rows: return banner(life) + "<h1>회원</h1><p>등록된 회원이 없습니다.</p>"
     def idcell(r):
         v = r.get("id")
         return f'<a href="/member/{E(v)}">{E(v)}</a>' if isinstance(v, str) and MID.fullmatch(v) else E(v)      # 형식이 틀린 값은 링크로 만들지 않는다
-    head = "".join(f"<th>{h}</th>" for h in ("ID", "생성일", "상태", "컨테이너", "이미지", "tmux", "한도", "정지 표시"))
+    head = "".join(f"<th>{h}</th>" for h in ("ID", "생성일", "상태", "컨테이너", "이미지", "tmux", "한도", "정지 표시", "수명주기"))
     body = "".join(f'<tr><td>{idcell(r)}</td><td>{E(day(r.get("created")))}</td><td>{state_badge(r)}</td><td>{E(r.get("container") or "-")}</td><td>{image_badge(r)}</td>'
-                   f'<td>{E(num(r.get("tmux")))}</td><td>{E(limits_text(r.get("limits")))}</td><td>{susp_badge(r)}</td></tr>' for r in rows)
-    return (f'<h1>회원 ({len(rows)}명)</h1><div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+                   f'<td>{E(num(r.get("tmux")))}</td><td>{E(limits_text(r.get("limits")))}</td><td>{susp_badge(r)}</td><td>{life_badge(r, life_of(life, r.get("id")))}</td></tr>' for r in rows)
+    return (banner(life) + f'<h1>회원 ({len(rows)}명)</h1><div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
             '<p class="hint">ID 를 누르면 상세 화면(안내 링크·봉인·페어링)으로 갑니다. 목록은 최대 60초 전 값일 수 있습니다.</p>')
 
 def act_form(token, mid, act, label, ghost=False):
@@ -220,14 +264,82 @@ def onboarding_badges(m):
           else '<span class="badge ok">없음</span> <span class="hint">서버에 파일이 없습니다(전달을 마쳤거나, 변경·재부팅으로 지워짐)</span>')
     return files, pw
 
-def detail_body(token, m, note=""):
-    mid = m.get("id", "")
+def size_text(b): return f"{b / 1048576:.1f} MB" if type(b) is int else "-"
+
+def life_form(token, mid, act, label, hint, fields="", step=True, cls="", btn="destructive", uid=""):
+    """눌러서 여는 확인 상자(JavaScript 없이 details). 안에서 설명·입력·인증 코드를 받고 한 번의 POST 로 보낸다."""
+    code = (f'<label for="{act}{uid}-code">인증 코드</label><input id="{act}{uid}-code" name="code" required maxlength="6" inputmode="numeric" pattern="[0-9]{{6}}" autocomplete="one-time-code">'
+            '<p class="hint">인증 앱의 새 6자리 코드(방금 로그인에 쓴 코드는 다음 코드가 나올 때까지 쓸 수 없습니다)</p>') if step else ""
+    return (f'<details class="act{cls}"><summary>{E(label)}</summary><form method="post" action="/member/{E(mid)}/{act}" autocomplete="off">'
+            f'<input type="hidden" name="csrf" value="{E(token)}"><p class="hint">{E(hint)}</p>{fields}{code}<button type="submit" class="{btn} mt">{E(label)}</button></form></details>')
+
+def archive_rows(archives):
+    if not archives: return ""
+    out = ""
+    for a in archives:
+        warn = "".join(f'<li>{E(x)}</li>' for x in a.get("skipped") or [])
+        out += (f'<tr><td class="mono">{E(a.get("archive"))}</td><td>{E(day(a.get("created")))}</td><td>{E(size_text(a.get("bytes")))}</td><td>{E(len(a.get("components") or []))}개</td>'
+                f'<td>{badge("완전", "ok") if a.get("complete") else badge("불완전", "warn")}{"<ul class=hint>" + warn + "</ul>" if warn else ""}</td></tr>')
+    return ('<div class="scroll"><table><thead><tr><th>아카이브</th><th>생성일</th><th>크기</th><th>구성요소</th><th>상태·건너뛴 항목</th></tr></thead>'
+            f'<tbody>{out}</tbody></table></div>')
+
+def dl_section(token, mid, archives):
+    """아카이브 구성요소별 «내려받기»(step-up 코드 칸이 있는 확인 상자). 구성요소 이름은 형식 검증을 통과한 것만."""
+    out = ""
+    for n, a in enumerate(x for x in archives or [] if x.get("member") == mid and isinstance(x.get("archive"), str) and ARCH_RE.fullmatch(x["archive"])):
+        forms = "".join(life_form(token, mid, "archive-dl", "내려받기 " + c, "이 파일을 내려받습니다. 코드를 확인하면 바로 시작되며, 1시간 안에는 같은 주소로 이어받을 수 있습니다.",
+                                  f'<input type="hidden" name="archive" value="{E(a["archive"])}"><input type="hidden" name="file" value="{E(c)}">', btn="secondary", uid=f"{n}-{k}")
+                        for k, c in enumerate(a.get("components") or []) if isinstance(c, str) and DL_FILE.fullmatch(c))
+        if forms: out += f'<p class="mono">{E(a["archive"])}</p><div class="actions">{forms}</div>'
+    if not out: return ""
+    return ('<h2>아카이브 내려받기</h2>' + out + '<p class="hint">파일마다 새 인증 코드가 필요합니다. 허가는 이 로그인 세션에서 1시간 유효하고(로그아웃하면 사라짐) 암호화하지 않은 원본 파일입니다 — 서버 밖으로 나가면 안전하게 보관하세요.</p>')
+
+def life_section(token, mid, m, rec, archives):
+    """정지·재개·삭제 버튼. 상태에 따라 보이는 것이 다르다(버튼이 보여도 도우미가 상태를 다시 검사한다)."""
+    state = rec.get("state") if rec else None
+    ss = rec.get("suspend_state") if rec else ("suspended" if m.get("suspended") is True else None)
+    f, extra = [], ""
+    if state == "pending_delete":
+        f.append(life_form(token, mid, "delete-cancel", "삭제 취소", "삭제 예정을 취소하고 회원을 다시 사용할 수 있게 합니다(재개).", btn="secondary"))
+        mine = [a for a in archives or [] if a.get("member") == mid]
+        opts = {a["archive"] for a in mine if isinstance(a.get("archive"), str) and ARCH_RE.fullmatch(a["archive"])}
+        if rec.get("archive"): opts.add(rec["archive"])
+        extra = "<h2>최종 삭제</h2>" + (msg("보관 기한이 지났습니다. 아카이브를 확인한 뒤 삭제하세요. 최종 삭제는 되돌릴 수 없습니다.", True) if rec.get("due") is True
+                else msg(f"삭제 가능까지 D-{rec['days_left']}" + (f" ({day(rec.get('delete_after'))})" if rec.get("delete_after") else "") + " 남았습니다. 기한이 지나기 전에는 최종 삭제를 할 수 없습니다." if type(rec.get("days_left")) is int else "아직 삭제 가능 기한이 아닙니다."))
+        if archives is None and rec.get("due") is True: extra += msg("아카이브 목록을 읽지 못했습니다. 아래 선택지는 수명주기 상태에 기록된 아카이브뿐입니다.", True)
+        if mine: extra += archive_rows(mine)
+        if rec.get("due") is True and opts:
+            ver = "".join(f'<form class="inline" method="post" action="/member/{E(mid)}/archive-verify"><input type="hidden" name="csrf" value="{E(token)}"><input type="hidden" name="archive" value="{E(a)}">'
+                          f'<button type="submit" class="ghost">검증: {E(a)}</button></form> ' for a in sorted(opts))
+            sel = "".join(f'<option value="{E(a)}"{" selected" if a == rec.get("archive") else ""}>{E(a)}</option>' for a in sorted(opts))
+            fields = (f'<label for="fa">삭제에 쓸 아카이브</label><select id="fa" name="archive" required>{sel}</select>'
+                      f'<label for="fc">삭제 대상 ID 를 그대로 입력</label><input id="fc" name="confirm" required maxlength="32" autocomplete="off" placeholder="{E(mid)}">')
+            extra += ('<p class="hint">먼저 아카이브를 검증하세요(진행 화면에서 결과 확인).</p><div class="actions">' + ver + "</div>"
+                      + '<div class="actions mt">' + life_form(token, mid, "delete-final", "최종 삭제", "계정·컨테이너·데이터를 삭제합니다. 되돌릴 수 없고 아카이브만 남습니다.", fields, cls=" danger") + "</div>")
+        elif rec.get("due") is True: extra += msg("사용할 수 있는 아카이브가 없어 최종 삭제를 할 수 없습니다.", True)
+        else: extra += '<div class="actions"><button type="button" disabled>최종 삭제(기한 전)</button></div>'
+    elif state in ("active", "suspended", None) or ss in ("suspended", "partial"):
+        if ss != "suspended":
+            f.append(life_form(token, mid, "suspend", "정지 다시 시도" if ss == "partial" else "일시 정지", "계정·컨테이너·공개 서비스 접근을 막습니다. 재개로 되돌릴 수 있습니다.",
+                               '<label for="rs">사유(선택, 200자 이하)</label><input id="rs" name="reason" maxlength="200">', step=False, btn="secondary"))
+        if ss in ("suspended", "partial") or state == "suspended": f.append(life_form(token, mid, "resume", "재개", "정지 전 상태로 되돌립니다.", btn="secondary"))
+        if state in ("active", "suspended"): f.append(life_form(token, mid, "delete-request", "삭제 요청", "정지 → 아카이브 → 7일 보관 후 관리자가 최종 삭제, 그 전에는 취소 가능", cls=" danger"))
+    return f'<h2>정지·삭제</h2><div class="actions">{"".join(f)}</div>' + extra
+
+def detail_body(token, m, note="", life=None, archives=None):
+    mid = m.get("id", ""); rec = life_of(life, mid)
     kv = [("ID", E(mid)), ("이메일", E(m.get("email") or "-")), ("생성일", E(str(m.get("created") or "-").replace("T", " "))), ("상태", state_badge(m)), ("컨테이너", E(m.get("container") or "-")),
-          ("이미지", image_badge(m)), ("tmux 세션 수", E(num(m.get("tmux")))), ("한도", E(limits_text(m.get("limits")))), ("정지 표시", susp_badge(m)), ("온보딩 파일", onboarding_badges(m)[0]), ("초기 비밀번호", onboarding_badges(m)[1])]
+          ("이미지", image_badge(m)), ("tmux 세션 수", E(num(m.get("tmux")))), ("한도", E(limits_text(m.get("limits")))), ("정지 표시", susp_badge(m)), ("수명주기", life_badge(m, rec))]
+    if rec:
+        if rec.get("delete_after"): kv.append(("삭제 예정일", E(day(rec["delete_after"])) + (f" (D-{rec['days_left']})" if type(rec.get("days_left")) is int else "")))
+        if rec.get("archive"): kv.append(("아카이브", f'<span class="mono">{E(rec["archive"])}</span>'))
+        if rec.get("last_error"): kv.append(("마지막 오류", E(rec["last_error"])))
+    kv += [("온보딩 파일", onboarding_badges(m)[0]), ("초기 비밀번호", onboarding_badges(m)[1])]
     dl = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in kv)
     acts = "".join((act_form(token, mid, "link-issue", "안내 링크 발급"), act_form(token, mid, "link-status", "링크 상태", True), act_form(token, mid, "link-revoke", "링크 폐기", True),
                     act_form(token, mid, "seal", "봉인", True), act_form(token, mid, "pair-refresh", "페어링 갱신", True)))
-    return (f'<h1>회원 {E(mid)}</h1>{note}<dl class="kv">{dl}</dl><h2>온보딩</h2><div class="actions">{acts}</div>'
+    lifebox = life_section(token, mid, m, rec, archives) if life is not None else msg("수명주기 정보를 읽지 못해 정지·삭제 버튼을 숨겼습니다(도구가 없거나 응답 오류).")
+    return (banner(life) + f'<h1>회원 {E(mid)}</h1>{note}<dl class="kv">{dl}</dl>{lifebox}{dl_section(token, mid, archives)}<h2>온보딩</h2><div class="actions">{acts}</div>'
             '<p class="hint">안내 링크: 1회 열람 링크를 새로 만듭니다(이전 링크는 폐기, 링크는 한 번만 표시). 봉인: 온보딩 폴더의 페어링 파일과 링크를 지웁니다. '
             '페어링 갱신: 같은 페어링 링크를 온보딩 파일로 다시 만듭니다(링크가 무효화되지는 않으며 이 화면에는 표시하지 않습니다).</p>'
             '<p><a href="/members">회원 목록</a></p>')
@@ -261,8 +373,30 @@ def new_body(token, note="", id_="", email=""):
             '<p class="hint">초기 안내가 이 주소로 전달됩니다. 등록에는 수십 초에서 몇 분이 걸립니다.</p>'
             '<button type="submit" class="mt">등록 시작</button></form>')
 
+JOBS = {"member.suspend": ("일시 정지", "member-suspend suspend <id>"), "member.resume": ("재개", "member-suspend resume <id>"),
+        "member.delete.request": ("삭제 요청", "member-lifecycle request-delete <id>"), "member.delete.cancel": ("삭제 취소", "member-lifecycle cancel <id>"),
+        "member.delete.final": ("최종 삭제", "member-lifecycle final-delete <id> --archive <arch>"), "archive.verify": ("아카이브 검증", "member-archive verify <arch>")}
+JOB_FAIL = {"member.suspend": "일부 단계가 실패해 «부분 정지» 일 수 있습니다. 같은 작업을 다시 실행하면 실패한 단계만 다시 시도합니다. 상세 화면에서 상태를 확인하세요.",
+            "member.resume": "일부 단계가 실패했습니다. 같은 작업을 다시 실행하면 실패한 단계만 다시 시도합니다.",
+            "member.delete.request": "삭제 요청이 끝나지 않았습니다. 회원은 정지 상태로 남고 삭제 예정으로 바뀌지 않았을 수 있습니다. 아래 로그와 상세 화면의 오류를 확인하세요.",
+            "member.delete.cancel": "삭제 취소에 실패했습니다. 아래 로그를 확인하세요.", "member.delete.final": "최종 삭제에 실패했습니다. 일부만 지워졌을 수 있으니 아래 로그를 확인하세요.",
+            "archive.verify": "아카이브 검증에 실패했습니다. 이 아카이브로는 최종 삭제를 하지 마세요."}
+def life_job_body(r):
+    """정지·재개·삭제·검증 job 화면(터미널 로그). 끝나면 상세로 돌아가는 링크."""
+    op, st = r.get("op"), r.get("state"); title, cmd = JOBS[op]
+    mem = r.get("member") if isinstance(r.get("member"), str) and MID.fullmatch(r.get("member")) else None
+    back = (f'<p><a href="/member/{E(mem)}">회원 {E(mem)} 상세로 돌아가기</a> · ' if mem and not (op == "member.delete.final" and st == "done") else "<p>") + '<a href="/members">회원 목록</a></p>'
+    logbox = term(cmd.split()[0], f'<pre id="joblog" class="log{" cursor" if st in ("queued", "running") else ""}">{E(r.get("log", ""))}</pre>', "@@PFX@@-" + cmd)
+    if st in ("queued", "running"):
+        return (f'<h1>{E(title)} 진행 중</h1><div data-job="/jobs/{E(r.get("id", ""))}/status"></div><p class="msg">{"앞선 작업이 끝나기를 기다리는 중입니다." if st == "queued" else "진행 중입니다. 이 화면은 자동으로 갱신됩니다(JavaScript 를 쓸 수 없으면 새로고침하세요)."}</p>{logbox}')
+    if st == "failed":
+        why = {"maint": "정비 작업이 실행 중이라 시작하지 못했습니다. 끝난 뒤 다시 하세요.", "timeout": "시간이 너무 오래 걸려 중단했습니다."}.get(r.get("why"), JOB_FAIL[op])
+        return f'<h1>{E(title)} 실패</h1>{msg(why, True)}{logbox}{back}'
+    return f'<h1>{E(title)} 완료</h1>{msg("완료했습니다.")}{logbox}{back}'
+
 def job_body(token, jid, r):
     st, log = r.get("state"), E(r.get("log", ""))
+    if r.get("op") in JOBS: return life_job_body(dict(r, id=jid))
     if r.get("kind") == "link":      # 안내 링크 발급 job(이미 끝난 상태로 만들어진다)
         if r.get("secret_ready"):
             return (f'<h1>안내 링크 발급 완료</h1><form method="post" action="/jobs/{E(jid)}/secret"><input type="hidden" name="csrf" value="{E(token)}">'
@@ -297,7 +431,11 @@ ERR_TEXT = {"bad_request": "입력 형식이 올바르지 않습니다.", "unkno
             "totp_not_enrolled": "인증 앱(TOTP)이 아직 등록되지 않았습니다. 서버에서 등록을 먼저 해야 합니다.", "internal_error": "내부 오류입니다. 관리자에게 알리세요.",
             "stepup_required": "재확인이 필요합니다.", "reserved_id": "예약된 ID 라서 회원 ID 로 쓸 수 없습니다. 다른 ID 를 고르세요.", "bad_email": "이메일 주소 형식이 올바르지 않습니다.",
             "not_found": "작업을 찾을 수 없습니다(끝난 지 오래되었거나 서버가 다시 시작되었습니다).", "no_secret": "표시할 비밀이 없습니다. 이미 확인했거나 10분이 지났습니다. 다시 볼 수 없습니다.",
-            "no_member": "해당 회원을 찾을 수 없습니다.", "bad_id": "회원 ID 형식이 올바르지 않습니다.", "link_failed": "안내 링크를 만들지 못했습니다."}
+            "no_member": "해당 회원을 찾을 수 없습니다.", "bad_id": "회원 ID 형식이 올바르지 않습니다.", "link_failed": "안내 링크를 만들지 못했습니다.",
+            "wrong_state": "현재 상태에서는 할 수 없는 작업입니다. 화면을 새로고침해 상태를 확인하세요.", "confirm_mismatch": "삭제 대상 ID 를 정확히 입력하세요.", "arch_mismatch": "선택한 아카이브가 이 회원의 것이 아닙니다.",
+            "no_archive": "그런 아카이브 또는 구성요소가 없습니다.", "no_grant": "내려받기 허가가 없거나 1시간이 지났습니다. 회원 상세 화면에서 인증 코드로 다시 허가를 받으세요.",
+            "file_bad": "아카이브 파일 상태가 MANIFEST 와 다릅니다. 검증을 먼저 실행하세요.",
+            "stepup_failed": "인증 코드가 틀렸습니다. 방금 쓴 코드는 다시 쓸 수 없습니다. 3번 틀리면 로그아웃됩니다."}
 def err_text(r):
     e = r.get("error"); return ERR_TEXT.get(e, "처리하지 못했습니다.")
 
@@ -331,9 +469,9 @@ class H(BaseHTTPRequestHandler):
         if w in VIA: via = w
         return ip, via
 
-    def send(self, code, body=b"", ctype="text/html; charset=utf-8", cookies=(), extra=None):
+    def head(self, code, ctype, length, cookies=(), extra=None):
         self.send_response(code)
-        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "public, max-age=86400" if ctype.startswith("font/") else "no-store")
         if not ctype.startswith("font/"): self.send_header("Pragma", "no-cache")
         self.send_header("Referrer-Policy", "same-origin")
@@ -342,6 +480,9 @@ class H(BaseHTTPRequestHandler):
         for c in cookies: self.send_header("Set-Cookie", c)
         for k, v in (extra or {}).items(): self.send_header(k, v)
         self.send_header("Connection", "close"); self.end_headers()
+
+    def send(self, code, body=b"", ctype="text/html; charset=utf-8", cookies=(), extra=None):
+        self.head(code, ctype, len(body), cookies, extra)
         if self.command != "HEAD": self.wfile.write(body)
         self.close_connection = True
 
@@ -410,6 +551,8 @@ class H(BaseHTTPRequestHandler):
             if post and m.group(2) != "/secret" or not post and m.group(2) == "/secret": return self.other()
             fn = {"": self.job_get, "/status": self.job_json, "/secret": self.job_secret}[m.group(2)]
             return self.run(fn, post, m.group(1))
+        m = ARCH_PATH.fullmatch(path)
+        if m: return self.other() if post else self.run(self.archive_get, False, m.group(1), m.group(2))
         m = MEMBER_PATH.fullmatch(path)
         if m:      # 상세는 GET, 버튼(발급·폐기·상태·봉인·페어링)은 POST
             act = m.group(2)[1:]
@@ -475,9 +618,15 @@ class H(BaseHTTPRequestHandler):
         if not r["ok"]:
             if r.get("error") == "no_session": return self.to_login()
             return self.send(502, page("회원", msg(err_text(r), True), nav_html(csrf_for(sid))))
-        self.send(200, page("회원", members_body(r.get("result", {}).get("data")), nav_html(csrf_for(sid))))
+        self.send(200, page("회원", members_body(r.get("result", {}).get("data"), self.life(ip, via, sid) or {}), nav_html(csrf_for(sid))))
 
-    def member_get(self, ip, via, form, mid, note=""):
+    def life(self, ip, via, sid):
+        """member.lifecycle → {id: 상태}. 읽지 못하면 None(목록·상세는 수명주기 없이 보인다)."""
+        r = helper("member.lifecycle", ip, via, sid)
+        d = r["result"].get("members") if r["ok"] and isinstance(r.get("result"), dict) else None
+        return d if isinstance(d, dict) else None
+
+    def member_get(self, ip, via, form, mid, note="", code=200):
         sid = self.cookie(SID_COOKIE, SID_RE)
         if not sid: return self.to_login()
         r = helper("member.detail", ip, via, sid, {"id": mid}); t = csrf_for(sid)
@@ -485,12 +634,17 @@ class H(BaseHTTPRequestHandler):
         if not isinstance(m, dict) or m.get("id") != mid:
             if r.get("error") == "no_session": return self.to_login()
             return self.send(404 if r.get("error") in ("no_member", "bad_id") else 502, page("회원", msg(err_text(r) if not r["ok"] else "회원 정보 형식을 알 수 없습니다.", True), nav_html(t)))
-        self.send(200, page("회원 " + mid, detail_body(t, m, note), nav_html(t)))
+        life = self.life(ip, via, sid); rec = life_of(life, mid)
+        a = helper("archive.list", ip, via, sid); rows = a["result"].get("archives") if a["ok"] and isinstance(a.get("result"), dict) else None      # 최종 삭제 화면과 «내려받기» 에 필요하다
+        arch = [x for x in rows if isinstance(x, dict)] if isinstance(rows, list) else None
+        self.send(code, page("회원 " + mid, detail_body(t, m, note, life, arch), nav_html(t)))
 
     def member_act(self, ip, via, form, mid, act):
         sid = self.cookie(SID_COOKIE, SID_RE)
         if not sid: return self.to_login()
         if not csrf_ok(sid, form.get("csrf", "")): return self.simple(403, "거부됨", "화면이 오래되었습니다. 새로 열어 다시 하세요.")
+        if act == "archive-dl": return self.dl_grant(ip, via, form, mid, sid)
+        if act in LIFE_ACTS: return self.life_act(ip, via, form, mid, act, sid)
         r = helper(ACTS[act], ip, via, sid, {"id": mid}); t = csrf_for(sid); res = r.get("result") if r["ok"] and isinstance(r.get("result"), dict) else {}
         if act == "link-issue" and JOB_ID.fullmatch(str(res.get("job", ""))):
             log("안내 링크 발급"); return self.redirect("/jobs/" + res["job"])      # 링크는 job.secret 한 번 표시 경로로만 보인다(이 응답·로그에는 없다)
@@ -509,6 +663,91 @@ class H(BaseHTTPRequestHandler):
         if "링크 서비스 계정" in detail: note += msg("이 서버는 1회 열람 링크 서비스를 켜지 않고 설치되었습니다(전달 채널에 link 없음). 켜려면 설치 설정의 ONBOARD_CHANNELS 에 link 를 넣고 53 단계를 다시 실행하세요(docs/ONBOARDING.md). 그때까지는 화면(screen) 전달을 쓰세요.")
         code = 404 if e in ("no_member", "bad_id") else 409 if e == "busy" else 400 if e in ("link_failed", "stepup_required") else 502
         self.send(code, page(title, result_body(mid, title, note, detail), nav_html(t)))
+
+    def life_act(self, ip, via, form, mid, act, sid):
+        """정지·재개·삭제·검증: 입력 검사 → (필요하면) 같은 폼의 코드로 step-up → op. 코드가 틀리거나 입력이 틀리면 op 는 부르지 않고 상세 화면으로 돌아가 오류를 보인다.
+        인증 코드·정지 사유는 로그에 남기지 않고 화면에도 되돌려 쓰지 않는다."""
+        def back(text, code=400): return self.member_get(ip, via, None, mid, msg(text, True), code)
+        args = {"id": mid}
+        if act == "suspend":
+            reason = form.get("reason", "").strip()
+            if len(reason) > 200 or re.search(r"[\x00-\x1f\x7f-\x9f]", reason): return back("사유는 200자 이하이고 줄바꿈 등 제어문자가 없어야 합니다.")
+            if reason: args["reason"] = reason
+        elif act in ("delete-final", "archive-verify"):
+            arch = form.get("archive", "")
+            if not ARCH_RE.fullmatch(arch) or arch.rsplit("-", 2)[0] != mid: return back("아카이브를 올바르게 선택하세요.")
+            if act == "archive-verify": args = {"archive": arch}
+            else:
+                if form.get("confirm", "") != mid: return back("삭제 대상 ID 를 정확히 입력하세요.")
+                args.update(archive=arch, confirm=mid)
+        if act in STEP_ACTS:
+            code = form.get("code", "")
+            if not TOTP_RE.fullmatch(code): return back("인증 코드는 6자리 숫자입니다.")
+            r = helper("stepup", ip, via, sid, {"code": code})
+            if not r["ok"]:
+                if r.get("error") == "no_session" or r.get("session_ended"): return self.to_login()
+                return back(err_text(r), 401 if r.get("error") == "stepup_failed" else 400)
+        r = helper(LIFE_ACTS[act], ip, via, sid, args)
+        res = r.get("result") if r["ok"] and isinstance(r.get("result"), dict) else {}
+        if JOB_ID.fullmatch(str(res.get("job", ""))):
+            log(f"회원 작업 {act}"); return self.redirect("/jobs/" + res["job"])
+        e = r.get("error")
+        if e == "no_session": return self.to_login()
+        text = err_text(r) + (" 재확인이 만료되었을 수 있습니다. 새 코드로 다시 하세요." if e == "stepup_required" else "")
+        if e == "busy": text = "정비 작업이 실행 중입니다. 끝난 뒤 다시 하세요." if r.get("why") == "maint" else "다른 작업이 실행 중이고 대기 중인 작업도 있습니다. 끝난 뒤 다시 하세요."
+        back(text, 404 if e in ("no_member", "bad_id") else 409 if e in ("busy", "wrong_state") else 400 if e in ("bad_request", "confirm_mismatch", "arch_mismatch", "stepup_required") else 502)
+
+    def dl_grant(self, ip, via, form, mid, sid):
+        """«내려받기» 폼: 입력 검사 → 같은 폼의 코드로 step-up → 허가 → 성공하면 GET /archive/<ARCH>/<파일> 로 보내 바로 시작. 코드는 로그·화면에 남기지 않는다."""
+        def back(text, code=400): return self.member_get(ip, via, None, mid, msg(text, True), code)
+        arch, file, code = form.get("archive", ""), form.get("file", ""), form.get("code", "")
+        if not ARCH_RE.fullmatch(arch) or arch.rsplit("-", 2)[0] != mid or not DL_FILE.fullmatch(file): return back("내려받을 파일을 올바르게 선택하세요.")
+        if not TOTP_RE.fullmatch(code): return back("인증 코드는 6자리 숫자입니다.")
+        r = helper("stepup", ip, via, sid, {"code": code})
+        if not r["ok"]:
+            if r.get("error") == "no_session" or r.get("session_ended"): return self.to_login()
+            return back(err_text(r), 401 if r.get("error") == "stepup_failed" else 400)
+        r = helper("archive.download.grant", ip, via, sid, {"arch": arch, "file": file})
+        if r["ok"]: log("내려받기 허가"); return self.redirect(f"/archive/{arch}/{file}")
+        e = r.get("error")
+        if e == "no_session": return self.to_login()
+        back(err_text(r) + (" 재확인이 만료되었을 수 있습니다. 새 코드로 다시 하세요." if e == "stepup_required" else ""), 404 if e == "no_archive" else 400 if e in ("bad_request", "stepup_required") else 502)
+
+    def archive_get(self, ip, via, form, arch, file):
+        """GET /archive/<ARCH>/<파일>: 세션 쿠키 + 허가. 도우미가 연 fd 를 받아 256KB 씩 흘려 보낸다(메모리에 통째로 올리지 않는다). Range 한 개만 지원."""
+        sid = self.cookie(SID_COOKIE, SID_RE)
+        if not sid: return self.to_login()
+        rngs = self.headers.get_all("Range") or []; rng = rngs[0].strip() if len(rngs) == 1 else None
+        def deny(code, text, extra=None): self.send(code, page("내려받기", msg(text, True) + '<p><a href="/members">회원 목록</a></p>', nav_html(csrf_for(sid))), extra=extra)
+        if len(rngs) > 1 or (rng is not None and not re.fullmatch(r"[ -~]{1,64}", rng)): return deny(416, "요청한 범위를 처리할 수 없습니다.")
+        if not DL_SEM.acquire(blocking=False): return deny(503, "내려받기가 이미 진행 중입니다. 끝난 뒤 다시 하세요.", {"Retry-After": "10"})
+        fd = None
+        try:
+            r, fd = helper_fd("archive.download.open", ip, via, sid, dict({"arch": arch, "file": file}, **({"range": rng} if rng is not None else {})))
+            res = r.get("result") if r["ok"] and isinstance(r.get("result"), dict) else None
+            if res is None or fd is None:
+                if fd is not None: os.close(fd); fd = None
+                e = r.get("error")
+                if e == "no_session": return self.to_login()
+                if e == "range_invalid" and type(r.get("size")) is int: return deny(416, err_text(r), {"Content-Range": f"bytes */{r['size']}"})
+                return deny(416 if e == "range_invalid" else 403 if e == "no_grant" else 404 if e == "no_archive" else 400 if e == "bad_request" else 502, err_text(r))
+            size, a, b = res.get("size"), res.get("start"), res.get("end")
+            if not all(type(v) is int for v in (size, a, b)) or not (0 <= a <= b + 1 <= size): return deny(502, "도우미 응답을 해석하지 못했습니다.")
+            n, part = b - a + 1, res.get("partial") is True
+            ex = {"Accept-Ranges": "bytes", "Content-Disposition": f'attachment; filename="{arch}-{file.replace("/", "_")}"'}
+            if part: ex["Content-Range"] = f"bytes {a}-{b}/{size}"
+            log(f"내려받기 시작 ip={ip}"); sent = 0
+            try:
+                self.head(206 if part else 200, "application/octet-stream", n, extra=ex); self.connection.settimeout(60)     # 느린 회선은 청크마다 60초까지 기다린다
+                while sent < n:
+                    c = os.pread(fd, min(DL_CHUNK, n - sent), a + sent)
+                    if not c: break          # 파일이 줄었다 — 짧게 끊어 클라이언트가 실패를 알게 한다
+                    self.wfile.write(c); sent += len(c)
+            finally: log(f"내려받기 종료 보냄={sent}/{n}")      # 클라이언트가 끊어도 여기로 온다(OSError 는 route 가 처리)
+            self.close_connection = True
+        finally:
+            if fd is not None: os.close(fd)
+            DL_SEM.release()
 
     def stepup_get(self, ip, via, form, note=""):
         sid = self.cookie(SID_COOKIE, SID_RE)
@@ -561,8 +800,8 @@ class H(BaseHTTPRequestHandler):
         t = csrf_for(sid)
         if not r["ok"]:
             if r.get("error") == "no_session": return self.to_login()
-            return self.send(404 if r.get("error") == "not_found" else 502, page("회원 등록", msg(err_text(r), True), nav_html(t)))
-        self.send(200, page("회원 등록", job_body(t, jid, r.get("result", {})), nav_html(t)))
+            return self.send(404 if r.get("error") == "not_found" else 502, page("작업", msg(err_text(r), True), nav_html(t)))
+        res = r.get("result", {}); self.send(200, page(JOBS.get(res.get("op"), ("회원 등록",))[0], job_body(t, jid, res), nav_html(t)))
 
     def job_json(self, ip, via, form, jid):
         sid = self.cookie(SID_COOKIE, SID_RE)

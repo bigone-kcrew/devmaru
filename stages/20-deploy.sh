@@ -31,6 +31,7 @@ cp_tree host/systemd /etc/systemd/system; cp_tree host/libexec /usr/local/libexe
 [ -d "$R/host/profile.d" ] && install -m 0644 "$R"/host/profile.d/* /etc/profile.d/
 for f in "$R"/host/sudoers/*; do [ -f "$f" ] || continue; d=/etc/sudoers.d/$(basename "$f"); install -m 0440 "$f" "$d"; visudo -cf "$d" >/dev/null || { rm -f "$d"; echo "실패: sudoers 검증 실패 — $d"; exit 1; }; done
 for f in "$R"/host/sshd/*; do [ -f "$f" ] || continue; d=/etc/ssh/sshd_config.d/$(basename "$f"); install -m 0644 "$f" "$d"; install -d -m 0755 /run/sshd; sshd -t || { rm -f "$d"; echo "실패: sshd 설정 검증 실패 — $d 를 되돌렸습니다"; exit 1; }; done
+systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null 2>&1 || echo "경고: ssh 서비스를 켜지 못했습니다 — 회원이 SSH 로 접속할 수 없을 수 있습니다(systemctl status ssh)"
 systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
 # SSH 비밀번호 변경 → 파일 서비스(SFTPGo)·Samba 비밀번호 동기화(PAM)
 if [ -d "$R/host/pam" ]; then install -m 0644 "$R"/host/pam/* /usr/share/pam-configs/; pam-auth-update --package >/dev/null 2>&1 || echo "경고: pam-auth-update 실패 — 비밀번호 동기화가 꺼져 있을 수 있음"; fi

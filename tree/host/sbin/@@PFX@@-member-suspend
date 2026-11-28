@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+# @@PFX@@-member-suspend (root) — 회원 일시 정지·재개(파이썬 표준 라이브러리만). 웹 관리 도우미와 셸이 같은 도구를 쓴다.
+#   @@PFX@@-member-suspend suspend <ID> [--reason-file <경로>]   정지. 사유는 명령줄이 아니라 «파일» 로만(200자 이하·제어문자 없음·일반 파일)
+#   @@PFX@@-member-suspend resume <ID>                           재개 — 정지 전 상태(prev)에 있던 것만 되돌린다(원래 꺼져 있던 것은 켜지 않는다)
+#   @@PFX@@-member-suspend status <ID> [--json]                  상태 조회(읽기 전용: 상태 파일과 표시 파일만 본다)
+# 정지 순서: 표시 파일 → 계정(잠금·만료) → 열린 세션 종료 → 컨테이너 정지 → 서비스 계정(SFTPGo·Samba·DB·rootless) → 공개(Paseo 직접·정적 사이트·앱) → 안내 링크 폐기.
+#   각 단계 결과를 상태 파일에 적고 «실패해도 계속» 한다. 하나라도 실패하면 state=partial·종료 코드 1(같은 명령을 다시 실행하면 실패한 단계만 재시도, prev 는 최초 값을 지킨다).
+# 재개 순서: 컨테이너 → 서비스 계정 → 공개 → 계정 → 표시 파일(마지막). 앞 단계가 실패하면 표시 파일을 남겨 갱신 도구가 계속 건너뛰게 한다.
+# 상태 파일: /var/lib/@@PFX@@/admin/members/<ID>.json (root 0600, 원자 교체). 비밀(SFTPGo API 키)은 argv·환경변수·로그에 싣지 않는다(curl -K - 로 표준입력 전달).
+# 선택 기능이 없는 설치(SFTPGo 키·Samba 설정·Paseo 직접 연결·rootless·DB 가 없음)는 «없음» 으로 건너뛴다.
+# 종료 코드: 0 성공 · 1 일부 실패(또는 내부 오류) · 2 사용법·검증 거부(아무 것도 바꾸지 않음)
+import fcntl, json, os, re, subprocess, sys, time
+
+PFX = "@@PFX@@"
+# --- 환경 의존 경로(시험은 이 값을 바꿔 가짜 root·가짜 명령으로 돌린다) ---
+DOCKER, USERMOD, LOGINCTL, PKILL = "/usr/bin/docker", "/usr/sbin/usermod", "/usr/bin/loginctl", "/usr/bin/pkill"
+CURL, SMBPASSWD, PDBEDIT, SYSTEMCTL = "/usr/bin/curl", "/usr/bin/smbpasswd", "/usr/bin/pdbedit", "/usr/bin/systemctl"
+FLOCK, GETENT, ID_BIN = "/usr/bin/flock", "/usr/bin/getent", "/usr/bin/id"
+PASEO_CADDY, SITE_CADDY, APP_SYNC = "/usr/local/sbin/@@PFX@@-paseo-caddy", "/usr/local/sbin/@@PFX@@-site-caddy", "/usr/local/sbin/@@PFX@@-app-sync"
+MEMBER_LINK = "/usr/local/sbin/@@PFX@@-member-link"
+STATE_DIR, META_DIR, ENV_FILE = "/var/lib/@@PFX@@/admin/members", "/opt/@@PFX@@/config/members", "/opt/@@PFX@@/config/dev-container.env"
+PASEO_LOCK, CADDY_DIR = "/run/@@PFX@@-paseo-caddy.lock", "/etc/caddy"
+SFTPGO_KEY_FILE, SFTPGO_API = "/etc/@@PFX@@/secrets/sftpgo-provisioner-api-key", "http://127.0.0.1:8080/api/v2"
+SAMBA_CONF, LINGER_DIR, PG_CONTAINER = "/srv/@@PFX@@/samba/smb.conf", "/var/lib/systemd/linger", "postgres"
+DB_PROTECTED = "postgres n8n mem0 mem0_app".split()   # 서비스 role 보호(슈퍼유저·retired 는 별도로 건너뜀)
+
+ID_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+APP_RE = re.compile(r"[a-z][a-z0-9-]{1,30}")
+REASON_RE = re.compile(r"[^\x00-\x1f\x7f]{0,200}")
+KEY_RE = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]{8,256}")          # 공백·큰따옴표·역슬래시 제외(curl 설정 파일 인용 안전)
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "LANG": "C"}
+
+
+class Fail(Exception):
+    pass
+
+
+def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def run(argv, inp=None, timeout=180):
+    try:
+        r = subprocess.run(argv, shell=False, env=ENV, input=inp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd="/", timeout=timeout)
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired: return 124, "시간 초과"
+    except OSError as e: return 127, e.strerror or "실행 실패"
+
+
+def sh(argv, ok=(0,), inp=None, show=True):
+    rc, out = run(argv, inp)
+    if rc not in ok:
+        line = (out.strip().splitlines() or [""])[-1][:80] if show else ""
+        raise Fail(f"{os.path.basename(argv[0])} 실패(rc={rc}){': ' + line if line else ''}")
+    return out
+
+
+def tool(path): return os.access(path, os.X_OK)
+
+
+def read_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            k, s, v = line.strip().partition("=")
+            if s and re.fullmatch(r"[A-Z_][A-Z0-9_]*", k):
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"": v = v[1:-1]
+                out[k] = v
+    except OSError: pass
+    return out
+
+
+# ---------- 상태 파일 ----------
+def state_path(id_): return os.path.join(STATE_DIR, id_ + ".json")
+def marker_path(id_): return os.path.join(META_DIR, id_ + ".suspended")
+
+
+def load_state(id_):
+    try: return json.load(open(state_path(id_), encoding="utf-8"))
+    except FileNotFoundError: return None
+    except (OSError, ValueError): raise Fail("상태 파일을 읽을 수 없습니다(손상?) — 덮어쓰지 않고 중단합니다")
+
+
+def save_state(st):
+    st["updated"] = now(); p = state_path(st["id"]); tmp = f"{p}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1); f.flush(); os.fsync(f.fileno())
+    os.rename(tmp, p)
+
+
+# ---------- 정지 전 상태(prev) 읽기 — 값 None = «없음»(해당 선택 기능이 없음) ----------
+def sftpgo(method, path, body=None):
+    try: key = open(SFTPGO_KEY_FILE, encoding="utf-8").read().strip()
+    except OSError: raise Fail("SFTPGo API 키를 읽을 수 없습니다")
+    if not KEY_RE.fullmatch(key): raise Fail("SFTPGo API 키 형식이 올바르지 않습니다")
+    cfg = f'header = "X-SFTPGO-API-KEY: {key}"\n'
+    if body is not None:
+        j = json.dumps(body, separators=(",", ":")).replace("\\", "\\\\").replace('"', '\\"')
+        cfg += f'header = "Content-Type: application/json"\ndata = "{j}"\n'
+    rc, out = run([CURL, "-sS", "-m", "20", "-K", "-", "-X", method, "-w", "\n%{http_code}", SFTPGO_API + path], inp=cfg.encode())   # 키는 표준입력으로만
+    body_txt, _, code = out.rpartition("\n")
+    if rc != 0 or not code.strip().isdigit(): raise Fail(f"SFTPGo API 호출 실패(curl rc={rc})")
+    return int(code), body_txt
+
+
+def cap_account(id_):
+    out = sh([GETENT, "shadow", id_], show=False).strip().split(":")
+    if len(out) < 2: raise Fail("계정 정보를 읽을 수 없습니다")
+    return {"locked": out[1].startswith("!"), "expire": out[7] if len(out) > 7 else ""}
+
+
+def cap_container(id_):
+    rc, out = run([DOCKER, "container", "inspect", "-f", "{{.State.Running}}", "dev-" + id_])
+    if rc == 0 and out.strip() in ("true", "false"): return out.strip() == "true"
+    if run([DOCKER, "version", "-f", "{{.Server.Version}}"])[0] != 0: raise Fail("docker 에 연결할 수 없습니다")
+    return None
+
+
+def cap_sftpgo(id_):
+    if not os.path.exists(SFTPGO_KEY_FILE): return None
+    code, body = sftpgo("GET", "/users/" + id_)
+    if code == 404: return None
+    if code != 200: raise Fail(f"SFTPGo 조회 실패(HTTP {code})")
+    try: return {"status": int(json.loads(body)["status"])}
+    except (ValueError, KeyError, TypeError): raise Fail("SFTPGo 응답을 해석할 수 없습니다")
+
+
+def cap_samba(id_):
+    if not (os.path.exists(SAMBA_CONF) and tool(PDBEDIT)): return None
+    rc, out = run([PDBEDIT, "-s", SAMBA_CONF, "-L", "-v", "-u", id_])
+    if rc != 0: return None            # 사용자 없음
+    m = re.search(r"^Account Flags:\s*\[([^\]]*)\]", out, re.M)
+    if not m: raise Fail("Samba 계정 플래그를 읽을 수 없습니다")
+    return {"enabled": "D" not in m.group(1)}
+
+
+def pg(sql): return sh([DOCKER, "exec", PG_CONTAINER, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-tAc", sql]).strip()
+
+
+def cap_db(id_):
+    if not re.fullmatch(r"[a-z0-9_]+", id_) or id_ in DB_PROTECTED: return None      # 하이픈 ID 는 DB 없음(db-retire 와 같음)
+    rc, out = run([DOCKER, "container", "inspect", "-f", "{{.State.Running}}", PG_CONTAINER])
+    if rc != 0: return None            # postgres 모듈 없음
+    if out.strip() != "true": raise Fail("postgres 컨테이너가 꺼져 있습니다")
+    row = pg(f"select rolcanlogin::text||'|'||rolsuper::text||'|'||coalesce(shobj_description(oid,'pg_authid'),'') from pg_roles where rolname='{id_}'")
+    if not row: return None
+    login, sup, comment = (row.split("|", 2) + ["", ""])[:3]
+    if sup == "true" or comment.startswith("retired:"): return None
+    return {"login": login == "true", "comment": comment}
+
+
+def cap_rootless(id_):
+    if not os.path.exists(os.path.join(LINGER_DIR, id_)): return None
+    return {"active": run([SYSTEMCTL, "--user", "-M", id_ + "@", "is-active", "docker.service"])[0] == 0}
+
+
+def cap_paseo(id_): return True if os.path.exists(os.path.join(CADDY_DIR, "members.d", id_ + ".caddy")) else None
+def cap_site(id_): return True if os.path.exists(os.path.join(CADDY_DIR, "sites.d", id_ + ".caddy")) else None
+
+
+def app_rows():
+    out = sh([APP_SYNC, "--list"])
+    return [f for f in (l.split() for l in out.splitlines()) if len(f) >= 3 and APP_RE.fullmatch(f[0])]
+
+
+def cap_apps(id_):
+    if not tool(APP_SYNC): return None
+    return [f[0] for f in app_rows() if f[1] == id_ and f[2] == "active"]
+
+
+CAPS = {"account": cap_account, "container": cap_container, "sftpgo": cap_sftpgo, "samba": cap_samba, "db": cap_db,
+        "rootless": cap_rootless, "paseo": cap_paseo, "site": cap_site, "apps": cap_apps}
+
+
+def getprev(st, name):
+    """prev 에 이미 있으면(최초 값) 그대로, 없으면 지금 읽는다(읽기에 실패하면 Fail — 그 단계는 실패로 기록되고 다음 실행에 재시도)."""
+    if name not in st["prev"]: st["prev"][name] = CAPS[name](st["id"])
+    return st["prev"][name]
+
+
+# ---------- 정지 단계: (결과, 메모) 를 돌려주거나 Fail ----------
+def s_marker(st):
+    os.makedirs(META_DIR, exist_ok=True)
+    with open(marker_path(st["id"]), "w", encoding="utf-8") as f: f.write(st["suspended_at"] + "\n")
+    return "ok", ""
+
+
+def s_account(st):
+    a = getprev(st, "account")
+    if not a["locked"]: sh([USERMOD, "-L", st["id"]])
+    sh([USERMOD, "-e", "1", st["id"]])
+    return "ok", ""
+
+
+def s_sessions(st):
+    run([LOGINCTL, "terminate-user", st["id"]])                       # 로그인 중이 아니면 실패해도 정상
+    rc, out = run([PKILL, "-KILL", "-u", st["id"]])
+    if rc not in (0, 1): raise Fail(f"pkill 실패(rc={rc})")          # 1 = 남은 프로세스 없음
+    return "ok", ""
+
+
+def s_container(st):
+    c = getprev(st, "container")
+    if c is None: return "skip", "컨테이너 없음"
+    if not c: return "skip", "원래 꺼져 있음"
+    sh([DOCKER, "stop", "dev-" + st["id"]]); return "ok", ""
+
+
+def s_sftpgo(st):
+    p = getprev(st, "sftpgo")
+    if p is None: return "skip", "SFTPGo 없음"
+    code, body = sftpgo("GET", "/users/" + st["id"])
+    if code != 200: raise Fail(f"SFTPGo 조회 실패(HTTP {code})")
+    u = json.loads(body); u["status"] = 0
+    code, _ = sftpgo("PUT", "/users/" + st["id"], u)
+    if code not in (200, 204): raise Fail(f"SFTPGo 비활성 실패(HTTP {code})")
+    note = ""
+    code, body = sftpgo("GET", "/connections")
+    if code == 404: note = "연결 목록 API 없음 — 열린 연결은 끊지 못함"
+    elif code != 200: raise Fail(f"SFTPGo 연결 조회 실패(HTTP {code})")
+    else:
+        try: ids = [c["connection_id"] for c in json.loads(body or "[]") if c.get("username") == st["id"]]
+        except (ValueError, KeyError, TypeError, AttributeError): raise Fail("SFTPGo 연결 목록을 해석할 수 없습니다")
+        for cid in ids:
+            if not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,128}", str(cid)): raise Fail("SFTPGo 연결 ID 형식 이상")
+            code, _ = sftpgo("DELETE", "/connections/" + cid)
+            if code not in (200, 204, 404): raise Fail(f"SFTPGo 연결 종료 실패(HTTP {code})")
+    return "ok", note
+
+
+def s_samba(st):
+    p = getprev(st, "samba")
+    if p is None: return "skip", "Samba 없음"
+    if not p["enabled"]: return "skip", "원래 비활성"
+    sh([SMBPASSWD, "-d", "-c", SAMBA_CONF, st["id"]]); return "ok", ""
+
+
+def s_db(st):
+    p = getprev(st, "db")
+    if p is None: return "skip", "DB 역할 없음"
+    i = st["id"]
+    if p["login"]:
+        sh([DOCKER, "exec", PG_CONTAINER, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", f'ALTER ROLE "{i}" NOLOGIN'])
+    pg(f"select count(pg_terminate_backend(pid)) from pg_stat_activity where usename='{i}'")
+    sh([DOCKER, "exec", PG_CONTAINER, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", f"COMMENT ON ROLE \"{i}\" IS 'suspended:{time.strftime('%Y-%m-%d')}'"])
+    return "ok", ""
+
+
+def s_rootless(st):
+    if getprev(st, "rootless") is None: return "skip", "rootless 없음"
+    i = st["id"]; run([SYSTEMCTL, "--user", "-M", i + "@", "stop", "docker.service"])    # 세션 종료로 이미 내려갔으면 실패해도 정상
+    sh([LOGINCTL, "disable-linger", i]); return "ok", ""
+
+
+def s_paseo(st):
+    if getprev(st, "paseo") is None: return "skip", "직접 연결 블록 없음"
+    if not tool(PASEO_CADDY): raise Fail("paseo-caddy 도구가 없습니다")
+    sh([FLOCK, "-w", "120", PASEO_LOCK, PASEO_CADDY, "remove", st["id"]]); return "ok", ""
+
+
+def s_site(st):
+    if getprev(st, "site") is None: return "skip", "정적 공개 블록 없음"
+    if not tool(SITE_CADDY): raise Fail("site-caddy 도구가 없습니다")
+    sh([SITE_CADDY, "remove", st["id"]]); return "ok", ""      # 스스로 공용 락을 잡는다 — flock 으로 감싸지 않는다
+
+
+def s_apps(st):
+    a = getprev(st, "apps")
+    if not a: return "skip", "앱 없음"
+    for n in a: sh([APP_SYNC, "--kill", n])
+    return "ok", ""
+
+
+def s_links(st):
+    sh([MEMBER_LINK, "revoke", st["id"], "--quiet"]); return "ok", ""
+
+
+SUSPEND = [("marker", s_marker), ("account", s_account), ("sessions", s_sessions), ("container", s_container), ("sftpgo", s_sftpgo),
+           ("samba", s_samba), ("db", s_db), ("rootless", s_rootless), ("paseo", s_paseo), ("site", s_site), ("apps", s_apps), ("links", s_links)]
+
+
+# ---------- 재개 단계: prev 에 있던 것만 ----------
+def r_container(st):
+    if st["prev"].get("container") is not True: return "skip", "원래 꺼져 있었거나 없음"
+    sh([DOCKER, "start", "dev-" + st["id"]]); return "ok", ""
+
+
+def r_sftpgo(st):
+    p = st["prev"].get("sftpgo")
+    if not p or p["status"] == 0: return "skip", "원래 비활성이거나 없음"
+    code, body = sftpgo("GET", "/users/" + st["id"])
+    if code != 200: raise Fail(f"SFTPGo 조회 실패(HTTP {code})")
+    u = json.loads(body); u["status"] = p["status"]
+    code, _ = sftpgo("PUT", "/users/" + st["id"], u)
+    if code not in (200, 204): raise Fail(f"SFTPGo 활성 실패(HTTP {code})")
+    return "ok", ""
+
+
+def r_samba(st):
+    p = st["prev"].get("samba")
+    if not p or not p["enabled"]: return "skip", "원래 비활성이거나 없음"
+    sh([SMBPASSWD, "-e", "-c", SAMBA_CONF, st["id"]]); return "ok", ""
+
+
+def r_db(st):
+    p = st["prev"].get("db"); i = st["id"]
+    if not p: return "skip", "DB 역할 없음"
+    if p["login"]: sh([DOCKER, "exec", PG_CONTAINER, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", f'ALTER ROLE "{i}" LOGIN'])
+    if pg(f"select coalesce(shobj_description(oid,'pg_authid'),'') from pg_roles where rolname='{i}'").startswith("suspended:"):   # 우리가 붙인 표시일 때만 되돌린다
+        lit = "NULL" if not p["comment"] else "'" + p["comment"].replace("'", "''") + "'"
+        sh([DOCKER, "exec", PG_CONTAINER, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", f'COMMENT ON ROLE "{i}" IS {lit}'])
+    return "ok", ""
+
+
+def r_rootless(st):
+    p = st["prev"].get("rootless"); i = st["id"]
+    if not p: return "skip", "rootless 없음"
+    sh([LOGINCTL, "enable-linger", i])
+    if p["active"]: sh([SYSTEMCTL, "--user", "-M", i + "@", "start", "docker.service"])
+    return "ok", ""
+
+
+def r_paseo(st):
+    if not st["prev"].get("paseo"): return "skip", "원래 블록 없음"
+    sh([FLOCK, "-w", "120", PASEO_LOCK, PASEO_CADDY, "add", st["id"]]); return "ok", ""
+
+
+def r_site(st):
+    if not st["prev"].get("site"): return "skip", "원래 블록 없음"
+    sh([SITE_CADDY, "add", st["id"]]); return "ok", ""
+
+
+def r_apps(st):
+    names = st["prev"].get("apps") or []
+    if not names: return "skip", "앱 없음"
+    killed = {f[0] for f in app_rows() if f[2] == "killed"}
+    for n in names:
+        if n in killed: sh([APP_SYNC, "--unkill", n])
+    return "ok", ""
+
+
+def r_account(st):
+    a = st["prev"].get("account") or {}; i = st["id"]
+    exp = a.get("expire", "")
+    if re.fullmatch(r"[0-9]{1,6}", exp):      # 셰도 파일은 «1970-01-01 부터 일수» — usermod 는 날짜를 받는다
+        exp = time.strftime("%Y-%m-%d", time.gmtime(int(exp) * 86400))
+    elif exp: raise Fail("만료일 값 형식 이상")
+    sh([USERMOD, "-e", exp, i])
+    if a and not a.get("locked"): sh([USERMOD, "-U", i])
+    return "ok", ""
+
+
+def r_links(st): return "skip", "되돌리지 않음(안내 링크 재발급은 별도)"
+def r_marker(st):
+    try: os.unlink(marker_path(st["id"]))
+    except FileNotFoundError: pass
+    return "ok", ""
+
+
+RESUME = [("container", r_container), ("sftpgo", r_sftpgo), ("samba", r_samba), ("db", r_db), ("rootless", r_rootless),
+          ("paseo", r_paseo), ("site", r_site), ("apps", r_apps), ("account", r_account), ("links", r_links), ("marker", r_marker)]
+
+
+def go(st, plan, key, notes_key):
+    """단계를 차례로 실행. 이미 ok/skip 인 단계는 다시 하지 않고, 실패해도 다음으로 간다. 재개의 표시 파일 삭제는 앞 단계가 모두 성공했을 때만."""
+    res, notes = st[key], st[notes_key]
+    for name, fn in plan:
+        if res.get(name) in ("ok", "skip"):
+            print(f"  [이미 완료] {name}", flush=True); continue
+        if key == "resume" and name == "marker" and any(v == "fail" for k, v in res.items() if k != name):
+            res[name] = "fail"; notes[name] = "앞 단계 실패로 보류(표시 파일 유지)"; print(f"  [보류] {name}", flush=True); save_state(st); continue
+        try: r, n = fn(st)
+        except Fail as e: r, n = "fail", str(e)
+        except Exception as e: r, n = "fail", f"내부 오류({type(e).__name__})"
+        res[name] = r
+        if n: notes[name] = n
+        else: notes.pop(name, None)
+        print(f"  [{r}] {name}" + (f" — {n}" if n else ""), flush=True)
+        save_state(st)
+    return [n for n, _ in plan if res.get(n) == "fail"]
+
+
+# ---------- 명령 ----------
+def new_state(id_): return {"id": id_, "state": "active", "phase": None, "suspended_at": None, "reason": None, "prev": {}, "steps": {}, "notes": {}, "resume": {}, "resume_notes": {}}
+
+
+def do_suspend(id_, reason):
+    st = load_state(id_)
+    if st is None or st.get("state") == "active": st = new_state(id_); st["suspended_at"] = now()
+    if st.get("phase") == "resuming": st["steps"], st["notes"] = {}, {}      # 재개가 덜 끝난 상태에서 다시 정지 — 모든 단계를 다시(prev 는 그대로)
+    st.update(phase="suspending", state="partial", resume={}, resume_notes={})
+    if reason is not None: st["reason"] = reason
+    save_state(st)
+    for name in CAPS:                      # 아무 것도 바꾸기 전에 정지 전 상태를 먼저 읽어 둔다(읽기에 실패한 항목은 해당 단계가 재시도)
+        try: getprev(st, name)
+        except Fail: pass
+    save_state(st)
+    print(f"정지: {id_}", flush=True)
+    failed = go(st, SUSPEND, "steps", "notes")
+    st["state"] = "partial" if failed else "suspended"; save_state(st)
+    if failed:
+        print(f"부분 정지: 실패 단계 {', '.join(failed)} — 같은 명령을 다시 실행하면 실패한 단계만 재시도합니다", file=sys.stderr); return 1
+    print("정지 완료"); return 0
+
+
+def do_resume(id_):
+    st = load_state(id_)
+    if st is None or st.get("state") == "active":
+        if os.path.exists(marker_path(id_)):
+            print("실패: 상태 파일이 없는데 정지 표시 파일만 있습니다 — 정지 전 상태를 몰라 되돌릴 수 없습니다(수동 확인 필요)", file=sys.stderr); return 1
+        print("이미 활성 상태입니다(정지 아님)"); return 0
+    if st.get("phase") != "resuming": st["steps"], st["notes"], st["resume"], st["resume_notes"] = {}, {}, {}, {}
+    st["phase"] = "resuming"; st["state"] = "partial"; save_state(st)
+    print(f"재개: {id_}", flush=True)
+    failed = go(st, RESUME, "resume", "resume_notes")
+    if failed:
+        print(f"부분 재개: 실패 단계 {', '.join(failed)} — 같은 명령을 다시 실행하면 실패한 단계만 재시도합니다", file=sys.stderr); return 1
+    st.update(state="active", phase=None, suspended_at=None, reason=None, prev={}, steps={}, notes={}, resume={}, resume_notes={}); save_state(st)
+    print("재개 완료"); return 0
+
+
+def do_status(id_, as_json):
+    st = load_state(id_) or new_state(id_)
+    st["marker"] = os.path.exists(marker_path(id_))
+    if as_json: print(json.dumps(st, ensure_ascii=False, sort_keys=True)); return 0
+    print(f"{id_}: {st['state']}" + (f" ({st['phase']})" if st.get("phase") else "") + (f" · 정지 {st['suspended_at']}" if st.get("suspended_at") else "") + (" · 표시 파일 있음" if st["marker"] else ""))
+    if st.get("reason"): print(f"  사유: {st['reason']}")
+    for k, v in (st["steps"] if st.get("phase") != "resuming" else st["resume"]).items():
+        n = (st["notes"] if st.get("phase") != "resuming" else st["resume_notes"]).get(k)
+        print(f"  [{v}] {k}" + (f" — {n}" if n else ""))
+    return 0
+
+
+def read_reason(path):
+    try: fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError: raise Fail("사유 파일을 열 수 없습니다(없거나 심볼릭 링크)")
+    try:
+        if (os.fstat(fd).st_mode & 0o170000) != 0o100000: raise Fail("사유 파일이 일반 파일이 아닙니다")
+        raw = os.read(fd, 4097)
+    finally: os.close(fd)
+    if len(raw) > 4096: raise Fail("사유 파일이 너무 큽니다")
+    try: txt = raw.decode("utf-8")
+    except UnicodeDecodeError: raise Fail("사유는 UTF-8 이어야 합니다")
+    if txt.endswith("\n"): txt = txt[:-1]
+    if not REASON_RE.fullmatch(txt): raise Fail("사유는 200자 이하이고 제어문자·줄바꿈이 없어야 합니다")
+    return txt
+
+
+def is_member(id_):
+    root = read_env(ENV_FILE).get("USER_ROOT_BASE") or f"/srv/{PFX}/users"
+    if not os.path.isdir(os.path.join(root, id_)): return False
+    return all(run([ID_BIN, f, id_])[0] == 0 for f in ("-u", "-g"))
+
+
+def usage():
+    print(f"사용: {PFX}-member-suspend suspend <ID> [--reason-file <경로>] | resume <ID> | status <ID> [--json]", file=sys.stderr); return 2
+
+
+def main(argv):
+    if len(argv) < 2 or argv[0] not in ("suspend", "resume", "status"): return usage()
+    cmd, id_, rest = argv[0], argv[1], argv[2:]
+    opts = {"suspend": ("--reason-file",), "resume": (), "status": ("--json",)}[cmd]
+    reason_file, as_json, i = None, False, 0
+    while i < len(rest):
+        if rest[i] == "--json" and "--json" in opts: as_json = True
+        elif rest[i] == "--reason-file" and "--reason-file" in opts and i + 1 < len(rest) and reason_file is None: reason_file = rest[i + 1]; i += 1
+        else: return usage()
+        i += 1
+    if not ID_RE.fullmatch(id_): print("실패: 회원 ID 형식이 올바르지 않습니다", file=sys.stderr); return 2
+    if os.geteuid() != 0: print("실패: root 로 실행해야 합니다", file=sys.stderr); return 2
+    try:
+        reason = read_reason(reason_file) if reason_file else None
+        if not is_member(id_): print("실패: 존재하는 회원이 아닙니다", file=sys.stderr); return 2
+        if cmd == "status": return do_status(id_, as_json)
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        lk = os.open(os.path.join(STATE_DIR, id_ + ".lock"), os.O_CREAT | os.O_RDWR, 0o600); fcntl.flock(lk, fcntl.LOCK_EX)
+        return do_suspend(id_, reason) if cmd == "suspend" else do_resume(id_)
+    except Fail as e:
+        print("실패: " + str(e), file=sys.stderr); return 2 if "사유" in str(e) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

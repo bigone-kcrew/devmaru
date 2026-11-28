@@ -183,6 +183,7 @@ def ch_link(c):
 def include_link(env): return env.get("ONBOARD_WEBHOOK_INCLUDE_LINK", "0") == "1"
 
 def webhook_text(c):
+    if getattr(c, "notice", None): return c.notice   # 관리자 알림(회원 삭제 수명주기): 호출자가 넘긴 문구만(비밀 없음)
     t = f"[{BRAND}] 회원 계정이 만들어졌습니다: {c.user}"
     if c.link and include_link(c.env): return t + f"\n1회 열람 링크(한 번만 열림): {c.link}"
     return t + "\n초기 비밀번호·접속 안내는 관리자에게 받으세요(이 알림에는 비밀이 없습니다)."
@@ -200,7 +201,7 @@ def ch_webhook(c):
         else:
             url = open(secret_path(env, "ONBOARD_WEBHOOK_URL_FILE", "onboard-webhook-url"), encoding="utf-8").read().strip().splitlines()[0]; check_url(url, env)
             body = {"slack": {"text": text}, "discord": {"content": text}}.get(fmt) or {
-                "event": "member.created", "member": c.user, "brand": BRAND, "message": text, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "event": "member.notice" if getattr(c, "notice", None) else "member.created", "member": c.user, "brand": BRAND, "message": text, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 **({"link_url": c.link} if c.link and include_link(env) else {})}
     except (ValueError, IndexError) as e: raise RuntimeError(str(e) or "webhook 주소 파일이 비어 있습니다") from None
     http_post(url, body)
@@ -312,7 +313,7 @@ def check(env):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", nargs="?", choices=["deliver"]); ap.add_argument("--user"); ap.add_argument("--email", default=""); ap.add_argument("--password-file")
+    ap.add_argument("action", nargs="?", choices=["deliver", "notice"]); ap.add_argument("--user"); ap.add_argument("--email", default=""); ap.add_argument("--password-file")
     ap.add_argument("--secret-fd", type=int, default=1); ap.add_argument("--check", action="store_true"); ap.add_argument("--test-webhook", action="store_true")
     a = ap.parse_args()
     if os.geteuid() != 0: print("실패: root 로 실행하세요(sudo)", file=sys.stderr); sys.exit(1)
@@ -321,6 +322,14 @@ def main():
     if a.test_webhook:
         c = Ctx(argparse.Namespace(user="test-member", email="", password_file=""), env, sys.stdout)
         if include_link(env): print("경고: ONBOARD_WEBHOOK_INCLUDE_LINK=1 — 이 채널의 모든 구성원이 1회 열람 링크(= 초기 비밀번호와 같은 가치의 자격증명)를 볼 수 있습니다")
+        try: print("성공: " + ch_webhook(c))
+        except Exception as e: print("실패: " + str(e), file=sys.stderr); sys.exit(1)
+        return
+    if a.action == "notice":   # webhook 채널이 설정돼 있을 때만 보낸다(본문은 표준입력 2000자까지, 비밀 없음). 종료 코드 3 = webhook 채널 없음
+        if "webhook" not in channel_list(env)[0]: print("webhook 채널이 설정되어 있지 않습니다", file=sys.stderr); sys.exit(3)
+        text = sys.stdin.read(2001)
+        if not text.strip() or len(text) > 2000: print("실패: 본문(표준입력)이 비었거나 2000자를 넘습니다", file=sys.stderr); sys.exit(1)
+        c = Ctx(argparse.Namespace(user="", email="", password_file=""), env, sys.stdout); c.notice = text.strip()
         try: print("성공: " + ch_webhook(c))
         except Exception as e: print("실패: " + str(e), file=sys.stderr); sys.exit(1)
         return

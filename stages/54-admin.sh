@@ -5,7 +5,7 @@
 set -uo pipefail
 has(){ case " ${DEVMARU_MODULES:-} " in *" $1 "*) return 0;; esac; return 1; }
 C=/etc/caddy; WU=$PFX-admin-web; HU=$PFX-admin-helper; WS=$PFX-admin-web
-UD=/etc/systemd/system; PAMF=/etc/pam.d/$PFX-admin; RUNDIR=/run/$PFX-admin; LOGD=/var/log/$PFX; SECD=/etc/$PFX/secrets; TMPF=/etc/tmpfiles.d/$PFX-admin.conf; LRF=/etc/logrotate.d/$PFX-admin-audit
+LC=$PFX-member-lifecycle; UD=/etc/systemd/system; PAMF=/etc/pam.d/$PFX-admin; RUNDIR=/run/$PFX-admin; LOGD=/var/log/$PFX; SECD=/etc/$PFX/secrets; TMPF=/etc/tmpfiles.d/$PFX-admin.conf; LRF=/etc/logrotate.d/$PFX-admin-audit
 PORT="${ADMIN_WEB_PORT:-8433}"; LPORT="${ADMIN_LOCAL_PORT:-8444}"; LAN="${ADMIN_LAN_ADDR:-}"
 echo "== 웹 관리 화면"
 reload_caddy(){ command -v caddy >/dev/null 2>&1 || return 0
@@ -17,6 +17,7 @@ if ! has admin; then
   for u in "$WS" "$HU"; do
     if [ -e "$UD/$u.service" ]; then systemctl disable --now "$u.service" >/dev/null 2>&1; rm -f "$UD/$u.service"; gone=1; fi
   done
+  if [ -e "$UD/$LC.timer" ] || [ -e "$UD/$LC.service" ]; then systemctl disable --now "$LC.timer" >/dev/null 2>&1; rm -f "$UD/$LC.timer" "$UD/$LC.service"; gone=1; fi   # 삭제 수명주기 타이머(상태 파일 <ID>.lifecycle.json 은 보존)
   [ "$gone" = 1 ] && systemctl daemon-reload
   for f in "$PAMF" "$TMPF" "$LRF"; do [ -e "$f" ] && { rm -f "$f"; gone=1; }; done
   [ -d "$RUNDIR" ] && { rm -f "$RUNDIR/helper.sock"; rmdir "$RUNDIR" 2>/dev/null; }
@@ -32,7 +33,7 @@ if ! has admin; then
 fi
 
 # ── 켜져 있다 ──
-for f in /usr/local/sbin/$PFX-admin-helper /usr/local/sbin/$PFX-admin-web /usr/local/sbin/$PFX-member-list /usr/local/libexec/$PFX-admin/admin_common.py /usr/local/libexec/$PFX-admin/admin_pam.py; do
+for f in /usr/local/sbin/$PFX-admin-helper /usr/local/sbin/$PFX-admin-web /usr/local/sbin/$PFX-member-list /usr/local/sbin/$PFX-member-suspend /usr/local/sbin/$PFX-member-archive /usr/local/sbin/$PFX-member-lifecycle /usr/local/libexec/$PFX-admin/admin_common.py /usr/local/libexec/$PFX-admin/admin_pam.py; do
   [ -e "$f" ] || { echo "경고: $f 가 없습니다(20 단계를 먼저 실행하세요) — admin 을 켜지 못했습니다"; echo "결과: 통과"; exit 0; }
 done
 for p in "$PORT" "$LPORT"; do case "$p" in ''|*[!0-9]*) echo "경고: ADMIN_WEB_PORT·ADMIN_LOCAL_PORT 는 숫자여야 합니다($p) — admin 을 켜지 못했습니다"; echo "결과: 통과"; exit 0;; esac
@@ -69,8 +70,8 @@ echo "성공: PAM 서비스 파일 $PAMF (pam_unix 만)"
 # 도우미 유닛은 member-add(useradd·docker·메일·Caddy reload 를 root 로 실행)를 돌리므로 ProtectSystem·주소 제한·시스템콜/capability 제한을 걸지 않는다(설계서 §E 의 완화 세트). 웹 유닛은 엄격하게 유지. VM 에서 실제 member-add 로 확인할 것.
 HOSTS="--allow-host ${ADMIN_HOST:-admin.$DOMAIN} --allow-host localhost:$LPORT"; [ -n "$LAN" ] && HOSTS="$HOSTS --allow-host $LAN"
 write_unit(){ # <이름> — 표준입력을 유닛 파일로. 내용이 바뀌었으면 changed=1
-  local t; t=$(mktemp); cat > "$t"
-  if cmp -s "$t" "$UD/$1.service" 2>/dev/null; then rm -f "$t"; else install -m 0644 -o root -g root "$t" "$UD/$1.service"; rm -f "$t"; changed=1; fi; }
+  local t f="$1"; case $f in *.timer|*.service) ;; *) f=$f.service;; esac; t=$(mktemp); cat > "$t"
+  if cmp -s "$t" "$UD/$f" 2>/dev/null; then rm -f "$t"; else install -m 0644 -o root -g root "$t" "$UD/$f"; rm -f "$t"; changed=1; fi; }
 changed=0
 write_unit "$HU" <<UNIT
 [Unit]
@@ -147,9 +148,46 @@ TasksMax=64
 [Install]
 WantedBy=multi-user.target
 UNIT
+# 회원 삭제 수명주기: 하루 한 번 tick(기한 1일 전·도래 알림, ADMIN_AUTO_DELETE=1 일 때만 자동 삭제, 보관 기간이 지난 아카이브 정리). 자동 삭제 기본은 꺼짐
+lc_before=$changed; changed=0
+write_unit "$LC.service" <<UNIT
+[Unit]
+Description=$BRAND 회원 삭제 수명주기 점검(알림·보관 기간이 지난 아카이브 정리)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/$LC tick
+Nice=10
+TimeoutStartSec=2h
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+UMask=0077
+UNIT
+write_unit "$LC.timer" <<UNIT
+[Unit]
+Description=$BRAND 회원 삭제 수명주기 점검(매일)
+
+[Timer]
+OnCalendar=*-*-* 04:20:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+lc_changed=$changed; changed=$lc_before
 systemd-tmpfiles --create "$TMPF" >/dev/null 2>&1
 systemctl daemon-reload
 for u in "$HU" "$WS"; do systemctl enable "$u.service" >/dev/null 2>&1; done
+systemctl enable "$LC.timer" >/dev/null 2>&1
+if [ "$lc_changed" = 1 ] || ! systemctl is-active --quiet "$LC.timer"; then systemctl restart "$LC.timer" >/dev/null 2>&1; fi
+systemctl is-active --quiet "$LC.timer" && echo "성공: 회원 삭제 수명주기 타이머 동작(매일 · 자동 삭제 $([ "${ADMIN_AUTO_DELETE:-0}" = 1 ] && echo 켬 || echo 꺼짐))" || echo "경고: 회원 삭제 수명주기 타이머가 올라오지 않았습니다 — journalctl -u $LC"
 # 유닛이 바뀌었거나 멈춰 있을 때만 (재)시작한다 — 다시 실행해도 로그인 세션이 끊기지 않게
 for u in "$HU" "$WS"; do
   if [ "$changed" = 1 ] || ! systemctl is-active --quiet "$u.service"; then systemctl restart "$u.service"; fi

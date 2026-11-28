@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+# @@PFX@@-member-archive (root) — 회원 데이터 아카이브 생성·검증·목록·삭제(파이썬 표준 라이브러리만).
+#   create <ID>     정비 락 `member-archive` → 용량 검사(추정치 + 20GB) → 구성요소별 아카이브 → 곧바로 verify(실패하면 폴더 삭제·종료 코드 1)
+#   verify <ARCH>   MANIFEST 의 크기·sha256 + `zstd -t` + `tar -t`(dump 는 `pg_restore -l`). 한 바이트라도 다르면 실패
+#   list [--json]   아카이브 목록(--json 은 한 줄 JSON)
+#   delete <ARCH>   그 폴더만 지운다(ARCH 정규식·실제 archives 하위 디렉터리 확인)
+# 위치: /srv/@@PFX@@/archives/members/<ID>-<YYYYmmdd-HHMMSS>/ (root 0700). 암호화 안 함(설계 D.3).
+# 넣는 것: data.tar.zst · home.tar.zst · db-<이름>.dump · meta/ · MANIFEST.json.
+# 넣지 않는 것: 온보딩 폴더 · /run/@@PFX@@/member-secrets · SFTPGo 비밀번호 해시 · 앱 레지스트리 비밀번호 해시 · rootless Docker 데이터(크기만 기록).
+# 비밀(SFTPGo API 키)은 파일에서 읽어 `curl -K -` 의 표준 입력으로만 넘긴다 — argv·환경변수·로그에 싣지 않는다.
+# 종료 코드: 0 성공 · 1 실패 · 75 정비 락 사용 중.
+import fcntl, hashlib, json, os, re, shutil, subprocess, sys, time
+
+PFX = "@@PFX@@"
+# ── 경로·외부 명령(전부 절대 경로 상수 — 시험은 이 줄들을 바꿔 가짜로 돌린다) ──
+NEED_ROOT_UID = 0
+ETC, OPT, SRV, VARLIB = "/etc/@@PFX@@", "/opt/@@PFX@@", "/srv/@@PFX@@", "/var/lib/@@PFX@@"
+ENV_FILE = f"{OPT}/config/dev-container.env"
+META_DIR = f"{OPT}/config/members"
+ARCH_ROOT = f"{SRV}/archives/members"
+NVME_BASE = f"{SRV}/nvme/members"
+HOME_BASE = "/home"
+CADDY_DIRS = ("/etc/caddy/sites.d", "/etc/caddy/members.d")
+REGISTRY = f"{ETC}/apps/registry.json"
+LIFECYCLE_DIR = f"{VARLIB}/admin/members"
+SFTPGO_KEY_FILE = f"{ETC}/secrets/sftpgo-provisioner-api-key"
+SFTPGO_API = "http://127.0.0.1:8080/api/v2"
+KIT_VERSION_FILE = "/opt/devmaru-kit/VERSION"
+MAINT_LOCK = "/run/@@PFX@@-maintenance.lock"
+PG_CONTAINER = "postgres"
+TAR, ZSTD, DU, DF = "/usr/bin/tar", "/usr/bin/zstd", "/usr/bin/du", "/usr/bin/df"
+DOCKER, CURL, IDBIN = "/usr/bin/docker", "/usr/bin/curl", "/usr/bin/id"
+PRIO = ["/usr/bin/nice", "-n", "10", "/usr/bin/ionice", "-c", "3"]      # du·tar·zstd 앞에 붙는다
+# ── 설정값 ──
+MARGIN_BYTES = 20 * 1024**3                              # doctor 의 여유 용량 기준(20GB)
+HOME_EXCLUDES = (".cache", ".npm", "node_modules", ".paseo/models")      # 홈에서 뺄 이름(어느 깊이든)
+DATA_EXCLUDES = ("tmp", "home-cache/paseo-models")       # 회원 데이터 폴더 기준 상대 경로
+ID_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}")
+ARCH_RE = re.compile(r"[a-z][a-z0-9_-]{1,31}-[0-9]{8}-[0-9]{6}")
+DBNAME_RE = re.compile(r"[A-Za-z0-9_]{1,63}")
+ENVX = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"}
+FILE_RE = re.compile(r"(data|home)\.tar\.zst|db-[A-Za-z0-9_]{1,63}\.dump|meta/[A-Za-z0-9._-]{1,100}")
+
+
+class Fail(Exception):
+    pass
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def run(argv, stdin=None, stdout=subprocess.PIPE, timeout=None):
+    try:
+        return subprocess.run(argv, shell=False, env=ENVX, stdin=stdin or subprocess.DEVNULL, stdout=stdout,
+                              stderr=subprocess.DEVNULL, cwd="/", timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def read_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            k, s, v = line.strip().partition("=")
+            if s and re.fullmatch(r"[A-Z_][A-Z0-9_]*", k):
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def maint_lock(name):
+    """정비 락(@@PFX@@-maint-lib.sh 와 같은 파일·형식). 잡은 쪽이 환경변수로 알리면 재진입(하위 명령용)."""
+    if os.environ.get(f"{PFX.upper().replace('-', '_')}_MAINT_HELD"):
+        return None
+    try:
+        fd = os.open(MAINT_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        print(f"경고: 정비 락 파일을 열 수 없어 락 없이 진행합니다: {MAINT_LOCK}", file=sys.stderr)
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = os.pread(fd, 200, 0).replace(b"\0", b"").split(b"\n")[0].decode("utf-8", "replace")
+        print(f"실패: 다른 정비 작업이 실행 중이라 '{name}' 을 시작하지 않습니다" + (f" — 실행 중: {holder}" if holder else ""), file=sys.stderr)
+        sys.exit(75)
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, f"{name} pid={os.getpid()} since={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode(), 0)
+    return fd      # 프로세스가 끝나면 풀린다
+
+
+def du_bytes(path, excludes=()):
+    argv = PRIO + [DU, "-sb"] + [f"--exclude={e}" for e in excludes] + ["--", path]
+    r = run(argv)
+    if r is None or r.returncode not in (0, 1):      # 1 = 일부 읽기 실패(추정에는 충분)
+        raise Fail(f"크기 추정 실패: {path}")
+    try:
+        return int(r.stdout.split()[0])
+    except (IndexError, ValueError):
+        raise Fail(f"크기 추정 결과를 읽을 수 없음: {path}")
+
+
+def free_bytes(path):
+    r = run([DF, "-B1", "--output=avail", path])
+    try:
+        return int(r.stdout.decode().split()[-1])
+    except (AttributeError, IndexError, ValueError):
+        raise Fail(f"여유 용량을 확인할 수 없음: {path}")
+
+
+def tar_zst(base, name, out, excludes, anchored):
+    """tar --numeric-owner -C base name | zstd -T0 -10 -> out. tar 종료 코드 1(읽는 중 바뀐 파일)은 경고로 본다."""
+    tar = PRIO + [TAR, "--numeric-owner", "--one-file-system", "-C", base, "-cf", "-"]
+    if anchored:
+        tar.append("--anchored")
+    tar += [f"--exclude={name}/{e}" if anchored else f"--exclude={e}" for e in excludes] + ["--", name]
+    with open(out, "wb") as o:
+        p = subprocess.Popen(tar, shell=False, env=ENVX, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/")
+        z = subprocess.Popen(PRIO + [ZSTD, "-T0", "-10", "-q", "-c"], shell=False, env=ENVX, stdin=p.stdout, stdout=o, stderr=subprocess.DEVNULL, cwd="/")
+        p.stdout.close()
+        zr, tr = z.wait(), p.wait()
+    if zr != 0 or tr not in (0, 1):
+        raise Fail(f"{os.path.basename(out)} 생성 실패(tar {tr}, zstd {zr})")
+
+
+def pg_list_ok(path):
+    with open(path, "rb") as f:
+        r = run([DOCKER, "exec", "-i", "-u", "postgres", PG_CONTAINER, "pg_restore", "-l"], stdin=f)
+    return r is not None and r.returncode == 0
+
+
+def member_dbs(id_):
+    """회원 role(=ID)이 소유한 DB 이름 목록. psql·DB 가 없으면 []. 이름 규칙 밖의 DB 는 (이름, False)로 돌려준다."""
+    q = f"select datname from pg_database where not datistemplate and datdba=(select oid from pg_roles where rolname='{id_}')"      # ID 는 정규식 통과분
+    r = run([DOCKER, "exec", "-u", "postgres", PG_CONTAINER, "psql", "-U", "postgres", "-At", "-c", q], timeout=60)
+    if r is None or r.returncode != 0:
+        return None
+    return [l for l in r.stdout.decode("utf-8", "replace").splitlines() if l]
+
+
+def sftpgo_user(id_, dest):
+    """-> 기록할 skip 사유 또는 None(성공). password 필드는 버린다."""
+    try:
+        key = open(SFTPGO_KEY_FILE, encoding="utf-8").read().strip()
+    except OSError:
+        return "SFTPGo 키 파일 없음(SFTPGo 꺼짐)"
+    if not key or "\n" in key or '"' in key or "\\" in key:
+        return "SFTPGo 키 형식 이상"
+    tmp = dest + ".part"
+    # curl -K - 는 표준 입력으로 헤더를 받는다(키가 ps 에 보이지 않게). 입력을 직접 넘긴다.
+    try:
+        p = subprocess.run([CURL, "-sS", "--max-time", "20", "-K", "-", "-o", tmp, "-w", "%{http_code}", f"{SFTPGO_API}/users/{id_}"],
+                           shell=False, env=ENVX, input=f'header = "X-SFTPGO-API-KEY: {key}"\n'.encode(),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/", timeout=40)
+    except (OSError, subprocess.SubprocessError):
+        _rm(tmp); return "SFTPGo 에 연결할 수 없음"
+    code = p.stdout.decode().strip()
+    try:
+        if p.returncode != 0:
+            return "SFTPGo 에 연결할 수 없음"
+        if code == "404":
+            return "SFTPGo 사용자 없음"
+        if code != "200":
+            return f"SFTPGo 응답 {code}"
+        d = json.load(open(tmp, encoding="utf-8"))
+        if not isinstance(d, dict):
+            return "SFTPGo 응답 형식 이상"
+        d.pop("password", None)
+        write_json(dest, d)
+        return None
+    except (OSError, ValueError):
+        return "SFTPGo 응답을 읽을 수 없음"
+    finally:
+        _rm(tmp)
+
+
+def _rm(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def write_json(path, obj):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1, sort_keys=True)
+        f.write("\n")
+
+
+def copy_file(src, dst):
+    """일반 파일(심볼릭 링크 아님)만 복사해 0600 으로 둔다. 있으면 True."""
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as f:
+        import stat
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return False
+        o = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(o, "wb") as g:
+            shutil.copyfileobj(f, g)
+    return True
+
+
+def collect_meta(id_, mdir):
+    """meta/ 를 채우고 (파일 이름 목록, skip 사유 목록)을 돌려준다. 온보딩·member-secrets 는 아예 읽지 않는다."""
+    names, skipped = [], []
+    srcs = [(f"{META_DIR}/{id_}.json", "member.json"), (f"{META_DIR}/{id_}.limits", "member.limits"), (f"{META_DIR}/{id_}.suspended", "member.suspended"),
+            (f"{CADDY_DIRS[0]}/{id_}.caddy", "caddy-site.caddy"), (f"{CADDY_DIRS[1]}/{id_}.caddy", "caddy-members.caddy"),
+            (f"{LIFECYCLE_DIR}/{id_}.json", "lifecycle.json")]
+    for src, nm in srcs:
+        if copy_file(src, f"{mdir}/{nm}"):
+            names.append(nm)
+        else:
+            skipped.append(f"meta/{nm}: 원본 없음")
+    try:      # 앱 레지스트리: 이 회원의 항목만, 비밀번호 해시(pwhash)는 뺀다
+        reg = json.load(open(REGISTRY, encoding="utf-8"))
+        apps = {n: {k: v for k, v in a.items() if k != "pwhash"} for n, a in reg.get("apps", {}).items() if isinstance(a, dict) and a.get("member") == id_}
+        if apps:
+            write_json(f"{mdir}/app-registry.json", {"apps": apps}); names.append("app-registry.json")
+        else:
+            skipped.append("meta/app-registry.json: 항목 없음")
+    except (OSError, ValueError, AttributeError):
+        skipped.append("meta/app-registry.json: 레지스트리 없음")
+    why = sftpgo_user(id_, f"{mdir}/sftpgo-user.json")
+    if why:
+        skipped.append(f"meta/sftpgo-user.json: {why}")
+    else:
+        names.append("sftpgo-user.json")
+    return names, skipped
+
+
+def component(adir, rel, kind):
+    p = f"{adir}/{rel}"
+    return {"name": rel, "kind": kind, "bytes": os.path.getsize(p), "sha256": sha256(p)}
+
+
+# ── verify ──
+def verify_dir(adir):
+    """아카이브 폴더 하나를 검증한다. 실패하면 Fail."""
+    try:
+        man = json.load(open(f"{adir}/MANIFEST.json", encoding="utf-8"))
+        comps = man["components"]
+        assert isinstance(comps, list)
+    except (OSError, ValueError, KeyError, AssertionError):
+        raise Fail("MANIFEST.json 이 없거나 읽을 수 없음")
+    listed = set()
+    for c in comps:
+        rel = c.get("name") if isinstance(c, dict) else None
+        if not isinstance(rel, str) or not FILE_RE.fullmatch(rel) or ".." in rel:
+            raise Fail(f"MANIFEST 에 허용되지 않는 구성요소 이름: {rel!r}")
+        p = f"{adir}/{rel}"
+        if os.path.islink(p) or not os.path.isfile(p):
+            raise Fail(f"구성요소 파일 없음: {rel}")
+        if os.path.getsize(p) != c.get("bytes") or sha256(p) != c.get("sha256"):
+            raise Fail(f"크기 또는 sha256 불일치: {rel}")
+        listed.add(rel)
+        if rel.endswith(".tar.zst"):
+            r = run(PRIO + [ZSTD, "-t", "-q", p])
+            if r is None or r.returncode != 0:
+                raise Fail(f"zstd -t 실패: {rel}")
+            z = subprocess.Popen([ZSTD, "-dc", "-q", p], shell=False, env=ENVX, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/")
+            t = subprocess.run([TAR, "-t"], shell=False, env=ENVX, stdin=z.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/")
+            z.stdout.close(); zr = z.wait()
+            if t.returncode != 0 or zr != 0:
+                raise Fail(f"tar -t 실패: {rel}")
+        elif rel.endswith(".dump") and not pg_list_ok(p):
+            raise Fail(f"pg_restore -l 실패: {rel}")
+    found = {"MANIFEST.json"}
+    for root, _, files in os.walk(adir):
+        for f in files:
+            found.add(os.path.relpath(os.path.join(root, f), adir))
+    extra = found - listed - {"MANIFEST.json"}
+    if extra:
+        raise Fail("MANIFEST 에 없는 파일: " + ", ".join(sorted(extra)[:5]))
+    return man
+
+
+def arch_path(arch):
+    """ARCH → 실제 archives 하위 디렉터리 경로. 규칙 밖·심볼릭 링크·없는 폴더면 Fail."""
+    if not isinstance(arch, str) or not ARCH_RE.fullmatch(arch):
+        raise Fail("아카이브 ID 형식이 올바르지 않습니다")
+    p = os.path.join(ARCH_ROOT, arch)
+    if os.path.islink(p) or not os.path.isdir(p) or os.path.dirname(os.path.realpath(p)) != os.path.realpath(ARCH_ROOT):
+        raise Fail("그런 아카이브가 없습니다")
+    return p
+
+
+# ── 서브커맨드 ──
+def cmd_create(id_):
+    if not isinstance(id_, str) or not ID_RE.fullmatch(id_):
+        raise Fail("회원 ID 형식이 올바르지 않습니다")
+    env = read_env(ENV_FILE)
+    users = env.get("USER_ROOT_BASE") or f"{SRV}/users"
+    data = os.path.join(users, id_)
+    if os.path.islink(data) or not os.path.isdir(data):
+        raise Fail(f"회원 데이터 폴더가 없습니다: {id_}")
+    ids = [run([IDBIN, flag, id_]) for flag in ("-u", "-g")]
+    if any(r is None or r.returncode != 0 or not re.fullmatch(r"[0-9]{1,10}", r.stdout.decode().strip()) for r in ids):
+        raise Fail(f"리눅스 계정이 없습니다: {id_}")
+    uid, gid = (int(r.stdout) for r in ids)
+    home = os.path.join(HOME_BASE, id_)
+    has_home = os.path.isdir(home) and not os.path.islink(home)
+    maint_lock("member-archive")
+    est = du_bytes(data, DATA_EXCLUDES) + (du_bytes(home, [f for f in HOME_EXCLUDES]) if has_home else 0)
+    free = free_bytes(SRV)
+    if free < est + MARGIN_BYTES:
+        raise Fail(f"여유 용량 부족: 필요 {est + MARGIN_BYTES} 바이트(추정 {est} + 여유 {MARGIN_BYTES}), 남은 {free} — 아무것도 만들지 않았습니다")
+    now = time.time()
+    arch = f"{id_}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime(now))}"
+    os.makedirs(ARCH_ROOT, mode=0o700, exist_ok=True)
+    adir = os.path.join(ARCH_ROOT, arch)
+    os.mkdir(adir, 0o700); os.chmod(adir, 0o700)
+    try:
+        comps, skipped = [], []
+        log(f"[1/4] 회원 데이터(추정 {est} 바이트)")
+        tar_zst(users, id_, f"{adir}/data.tar.zst", DATA_EXCLUDES, True); comps.append(component(adir, "data.tar.zst", "data"))
+        if has_home:
+            log("[2/4] 홈")
+            tar_zst(HOME_BASE, id_, f"{adir}/home.tar.zst", HOME_EXCLUDES, False); comps.append(component(adir, "home.tar.zst", "home"))
+        else:
+            skipped.append("home: 홈 폴더 없음")
+        log("[3/4] DB")
+        dbs = member_dbs(id_)
+        if dbs is None:
+            skipped.append("db: psql 을 쓸 수 없음(docker·postgres 컨테이너 없음)")
+        elif not dbs:
+            skipped.append("db: 회원이 소유한 DB 없음")
+        for db in dbs or []:
+            if not DBNAME_RE.fullmatch(db):
+                raise Fail("이름 규칙 밖의 DB 가 있어 아카이브를 만들 수 없습니다(관리자 확인 필요)")
+            out = f"{adir}/db-{db}.dump"
+            with open(out, "wb") as o:
+                r = run([DOCKER, "exec", "-u", "postgres", PG_CONTAINER, "pg_dump", "-U", "postgres", "-Fc", "-d", db], stdout=o)
+            if r is None or r.returncode != 0 or not os.path.getsize(out) or not pg_list_ok(out):
+                raise Fail(f"DB 덤프 실패: {db}")
+            os.chmod(out, 0o600); comps.append(component(adir, f"db-{db}.dump", "db"))
+        log("[4/4] 메타")
+        mdir = f"{adir}/meta"; os.mkdir(mdir, 0o700)
+        names, sk = collect_meta(id_, mdir); skipped += sk
+        comps += [component(adir, f"meta/{n}", "meta") for n in names]
+        dd = f"{NVME_BASE}/{id_}/docker"
+        try:
+            docker_bytes = du_bytes(dd) if os.path.isdir(dd) else None
+        except Fail:
+            docker_bytes = None
+        try:
+            kit = open(KIT_VERSION_FILE, encoding="utf-8").read().strip()[:40]
+        except OSError:
+            kit = "unknown"
+        write_json(f"{adir}/MANIFEST.json", {"version": 1, "archive": arch, "member": id_, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                                              "kit_version": kit, "uid": uid, "gid": gid, "components": comps, "skipped": skipped,
+                                              "excluded_docker_bytes": docker_bytes})
+        verify_dir(adir)
+    except BaseException:
+        shutil.rmtree(adir, ignore_errors=True)
+        raise
+    log(f"성공: {arch} ({sum(c['bytes'] for c in comps)} 바이트, 구성요소 {len(comps)}개)")
+    return 0
+
+
+def cmd_verify(arch):
+    verify_dir(arch_path(arch))
+    log(f"성공: {arch} 검증 통과")
+    return 0
+
+
+def cmd_list(as_json):
+    rows = []
+    try:
+        names = sorted(os.listdir(ARCH_ROOT))
+    except OSError:
+        names = []
+    for n in names:
+        p = os.path.join(ARCH_ROOT, n)
+        if not ARCH_RE.fullmatch(n) or os.path.islink(p) or not os.path.isdir(p):
+            continue
+        row = {"archive": n, "member": n.rsplit("-", 2)[0], "created": None, "bytes": None, "components": [], "skipped": [], "complete": False}
+        try:
+            m = json.load(open(f"{p}/MANIFEST.json", encoding="utf-8"))
+            row.update(created=m.get("created"), bytes=sum(c["bytes"] for c in m["components"]), components=[c["name"] for c in m["components"]], skipped=[str(x) for x in (m.get("skipped") or [])], complete=True)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        rows.append(row)
+    if as_json:
+        print(json.dumps({"archives": rows}, ensure_ascii=True, separators=(",", ":")))
+    else:
+        for r in rows:
+            print(f"{r['archive']}  {r['created'] or '-'}  {r['bytes'] if r['bytes'] is not None else '-'} 바이트  " + (",".join(r["components"]) if r["complete"] else "(불완전 — MANIFEST 없음)"))
+        if not rows:
+            print("아카이브 없음")
+    return 0
+
+
+def cmd_delete(arch):
+    shutil.rmtree(arch_path(arch))
+    log(f"삭제: {arch}")
+    return 0
+
+
+def main(argv):
+    usage = f"Usage: {PFX}-member-archive create <ID> | verify <ARCH> | list [--json] | delete <ARCH>"
+    if os.geteuid() != NEED_ROOT_UID:
+        print("실패: root 로 실행해야 합니다", file=sys.stderr); return 1
+    os.umask(0o077)
+    c, a = (argv[0] if argv else ""), argv[1:]
+    try:
+        if c == "create" and len(a) == 1: return cmd_create(a[0])
+        if c == "verify" and len(a) == 1: return cmd_verify(a[0])
+        if c == "delete" and len(a) == 1: return cmd_delete(a[0])
+        if c == "list" and a in ([], ["--json"]): return cmd_list(bool(a))
+    except Fail as e:
+        print(f"실패: {e}", file=sys.stderr); return 1
+    except OSError as e:
+        print(f"실패: {type(e).__name__}", file=sys.stderr); return 1
+    print(usage, file=sys.stderr); return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
